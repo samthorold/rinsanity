@@ -74,6 +74,32 @@ impl Tower {
     }
 }
 
+/// One draw from a Pareto-style severity law, `x_m · U^(−1/α)` with `U` uniform
+/// on `(0, 1]`, clamped into `[0, 1]`. The shared kernel of the true cat
+/// process's severity and any cat-model belief's severity: a heavy body with
+/// bounded support (`GUL ≤ sum_insured` survives). Consumes one uniform draw.
+fn pareto_damage_fraction(min_damage_fraction: f64, tail_alpha: f64, rng: &mut Rng) -> f64 {
+    // 1 − uniform() lands in (0, 1], avoiding a divide-by-zero blow-up.
+    let u = 1.0 - rng.uniform();
+    (min_damage_fraction * u.powf(-1.0 / tail_alpha)).clamp(0.0, 1.0)
+}
+
+/// A Poisson count with the given `mean`, drawn by Knuth's algorithm from the
+/// in-crate uniform stream. The shared kernel of the true cat process's and a
+/// cat-model belief's annual event count.
+fn poisson_count(mean: f64, rng: &mut Rng) -> usize {
+    let threshold = (-mean).exp();
+    let mut count = 0usize;
+    let mut product = 1.0;
+    loop {
+        product *= rng.uniform();
+        if product <= threshold {
+            return count;
+        }
+        count += 1;
+    }
+}
+
 /// A geographic / peril zone. The market spans multiple territories; each
 /// carries its own peril processes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -143,26 +169,13 @@ impl CatastrophePeril {
     /// result has a heavy body but bounded support, so `GUL ≤ sum_insured`
     /// holds while the tail stays empirically fat.
     pub fn draw_damage_fraction(&self, rng: &mut Rng) -> f64 {
-        // 1 − uniform() lands in (0, 1], avoiding a divide-by-zero blow-up.
-        let u = 1.0 - rng.uniform();
-        let pareto = self.min_damage_fraction * u.powf(-1.0 / self.tail_alpha);
-        pareto.clamp(0.0, 1.0)
+        pareto_damage_fraction(self.min_damage_fraction, self.tail_alpha, rng)
     }
 
     /// The number of catastrophe events arriving in one year, a Poisson count
-    /// with mean [`annual_frequency`](Self::annual_frequency), drawn by Knuth's
-    /// algorithm from the in-crate uniform stream.
+    /// with mean [`annual_frequency`](Self::annual_frequency).
     fn annual_event_count(&self, rng: &mut Rng) -> usize {
-        let threshold = (-self.annual_frequency).exp();
-        let mut count = 0usize;
-        let mut product = 1.0;
-        loop {
-            product *= rng.uniform();
-            if product <= threshold {
-                return count;
-            }
-            count += 1;
-        }
+        poisson_count(self.annual_frequency, rng)
     }
 
     /// Draw this year's catastrophe events for the territory: a Poisson number
@@ -527,9 +540,396 @@ pub fn settle_placed_tower(
     settlements
 }
 
+/// A syndicate's **cat model**: its *belief* about the true cat process, used to
+/// estimate its catastrophe ELF and its portfolio tail measure. Structurally it
+/// mirrors the substrate's [`CatastrophePeril`] (frequency, heavy-tailed
+/// severity), but it is a **distinct type** precisely so the truth/belief
+/// separation is enforced at compile time: the portfolio tail measure consumes a
+/// `CatModel`, never a `CatastrophePeril`, so no agent can read the true process.
+/// A cat model is an estimate and may be systematically wrong.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CatModel {
+    /// The syndicate's believed expected number of catastrophe events per year
+    /// in a zone (mean of a Poisson arrival count).
+    pub annual_frequency: f64,
+    /// The believed Pareto scale `x_m`: the minimum (most probable) damage fraction.
+    pub min_damage_fraction: f64,
+    /// The believed Pareto tail index `α`. Smaller is heavier.
+    pub tail_alpha: f64,
+}
+
+impl CatModel {
+    /// Draw one event's believed damage fraction from the model's Pareto law,
+    /// `x_m · U^(−1/α)` with `U` uniform on `(0, 1]`, clamped into `[0, 1]`.
+    pub fn draw_damage_fraction(&self, rng: &mut Rng) -> f64 {
+        pareto_damage_fraction(self.min_damage_fraction, self.tail_alpha, rng)
+    }
+
+    /// The believed number of catastrophe events in one year for a zone: a
+    /// Poisson count with mean [`annual_frequency`](Self::annual_frequency).
+    fn annual_event_count(&self, rng: &mut Rng) -> usize {
+        poisson_count(self.annual_frequency, rng)
+    }
+}
+
+/// A single **net retained line** the syndicate holds: the most it can lose on
+/// one risk after outward reinsurance, sitting in a `territory`. For a
+/// catastrophe the whole net line is exposed to the zone's shared occurrence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NetLine {
+    pub territory: Territory,
+    pub net_limit: f64,
+}
+
+/// A syndicate's **net book**: the net retained lines it currently holds. The
+/// object the portfolio tail measure is computed over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetBook {
+    pub lines: Vec<NetLine>,
+}
+
+impl NetBook {
+    /// The distinct territories the book has exposure in, in first-seen order.
+    pub fn zones(&self) -> Vec<Territory> {
+        let mut zones: Vec<Territory> = Vec::new();
+        for line in &self.lines {
+            if !zones.contains(&line.territory) {
+                zones.push(line.territory);
+            }
+        }
+        zones
+    }
+
+    /// The total net retained exposure the book carries in one zone — the sum of
+    /// its net lines there. A catastrophe's shared occurrence strikes this whole
+    /// aggregate at once, so within-zone exposure adds.
+    pub fn zone_exposure(&self, territory: Territory) -> f64 {
+        self.lines
+            .iter()
+            .filter(|l| l.territory == territory)
+            .map(|l| l.net_limit)
+            .sum()
+    }
+}
+
+/// The syndicate's **portfolio tail measure**: its estimate of the net aggregate
+/// catastrophe loss at a chosen `return_period` (e.g. 200 for 1-in-200) over its
+/// current net `book`, computed from its OWN [`CatModel`] belief — never the true
+/// process — and accounting for **zone correlation**.
+///
+/// Within a zone a catastrophe is one shared occurrence, so the year's events
+/// each strike the zone's whole aggregate exposure and the losses **add**; across
+/// zones the cat processes are independent, so their losses **diversify**. The
+/// measure Monte-Carlo simulates `trials` independent years (each zone drawing
+/// its own believed events) and returns the `1 − 1/return_period` quantile of the
+/// aggregate net loss. Deterministic given a seeded `rng`.
+pub fn portfolio_tail_loss(
+    book: &NetBook,
+    model: &CatModel,
+    return_period: f64,
+    trials: usize,
+    rng: &mut Rng,
+) -> f64 {
+    let zones: Vec<f64> = book.zones().iter().map(|&z| book.zone_exposure(z)).collect();
+    if zones.is_empty() || trials == 0 {
+        return 0.0;
+    }
+    let mut aggregates: Vec<f64> = (0..trials)
+        .map(|_| {
+            zones
+                .iter()
+                .map(|&exposure| {
+                    // One year's believed events in this zone. Each event is a
+                    // single shared occurrence striking the whole zone aggregate;
+                    // within-zone losses add. Net loss per event is capped at the
+                    // zone's exposure (damage fraction ≤ 1, per the physical cap).
+                    let count = model.annual_event_count(rng);
+                    (0..count)
+                        .map(|_| model.draw_damage_fraction(rng) * exposure)
+                        .sum::<f64>()
+                })
+                .sum::<f64>() // cross-zone: independent draws diversify
+        })
+        .collect();
+    aggregates.sort_by(|a, b| a.partial_cmp(b).expect("losses are finite"));
+    let rank = ((trials as f64) * (1.0 - 1.0 / return_period)).ceil() as usize;
+    let index = rank.saturating_sub(1).min(trials - 1);
+    aggregates[index]
+}
+
+/// Why a syndicate **declined** a risk under its exposure limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The syndicate has no loss-absorbing capital (it is in runoff).
+    Insolvent,
+    /// The net line exceeds the per-risk line limit (`line_fraction × capital`).
+    PerRiskLine,
+    /// Adding the risk would push the portfolio return-period net loss beyond the
+    /// coverable cat aggregate (`solvency_fraction × capital`).
+    CatAggregate,
+}
+
+/// A syndicate's quote-time underwriting decision under its exposure limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnderwritingDecision {
+    Accept,
+    Decline(DeclineReason),
+}
+
+/// A syndicate's **exposure policy**: the calibration of its two capital-linked
+/// limits, both recomputed from *current* capital at quote time. Because both
+/// scale with capital, a post-cat drawdown tightens them together — the capacity
+/// crunch and the hardening are two faces of one depletion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExposurePolicy {
+    /// The return period the portfolio tail measure is read at (e.g. 200).
+    pub return_period: f64,
+    /// The fraction of capital the return-period net loss must stay within (the
+    /// cat-aggregate coverability test).
+    pub solvency_fraction: f64,
+    /// The fraction of capital a single net line may not exceed (per-risk line).
+    pub line_fraction: f64,
+    /// Monte-Carlo trials used to estimate the portfolio tail measure.
+    pub tail_trials: usize,
+}
+
+impl ExposurePolicy {
+    /// Assess a candidate net line against the syndicate's limits, recomputed
+    /// from its *current* capital and its OWN cat-model belief over its current
+    /// net `book`. Declines an insolvent syndicate; declines a net line above the
+    /// per-risk line limit; declines when the post-addition portfolio
+    /// return-period net loss would exceed the coverable cat aggregate. Otherwise
+    /// accepts. The substrate's true cat process is never consulted.
+    pub fn assess(
+        &self,
+        syndicate: &Syndicate,
+        book: &NetBook,
+        model: &CatModel,
+        candidate: NetLine,
+        rng: &mut Rng,
+    ) -> UnderwritingDecision {
+        if !syndicate.is_solvent() {
+            return UnderwritingDecision::Decline(DeclineReason::Insolvent);
+        }
+        let capital = syndicate.capital();
+        if candidate.net_limit > self.line_fraction * capital {
+            return UnderwritingDecision::Decline(DeclineReason::PerRiskLine);
+        }
+        let mut post_addition = book.clone();
+        post_addition.lines.push(candidate);
+        let tail = portfolio_tail_loss(&post_addition, model, self.return_period, self.tail_trials, rng);
+        if tail > self.solvency_fraction * capital {
+            return UnderwritingDecision::Decline(DeclineReason::CatAggregate);
+        }
+        UnderwritingDecision::Accept
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_net_book_has_zero_portfolio_tail_loss() {
+        // Tracer: a syndicate's cat MODEL (its belief, distinct from the
+        // substrate's true cat process) drives the portfolio tail measure over
+        // its net book. With nothing on the book there is no exposure, so the
+        // return-period net loss is zero regardless of the belief.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let book = NetBook { lines: vec![] };
+        let mut rng = Rng::seeded(2024);
+        let tail = portfolio_tail_loss(&book, &model, 200.0, 2_000, &mut rng);
+        assert_eq!(tail, 0.0);
+    }
+
+    #[test]
+    fn the_portfolio_tail_measure_diversifies_when_exposure_is_spread_across_zones() {
+        // The portfolio tail measure accounts for zone correlation: the SAME
+        // total net exposure concentrated in one zone (one shared occurrence)
+        // produces a far heavier 1-in-200 net loss than the same exposure spread
+        // across uncorrelated zones, whose independent cat processes diversify.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let total = 16.0;
+        let return_period = 200.0;
+        let trials = 8_000;
+
+        let concentrated = NetBook {
+            lines: vec![NetLine { territory: Territory(0), net_limit: total }],
+        };
+        let spread = NetBook {
+            lines: (0..16)
+                .map(|z| NetLine { territory: Territory(z), net_limit: total / 16.0 })
+                .collect(),
+        };
+
+        let mut rng = Rng::seeded(7);
+        let tail_concentrated = portfolio_tail_loss(&concentrated, &model, return_period, trials, &mut rng);
+        let mut rng = Rng::seeded(7);
+        let tail_spread = portfolio_tail_loss(&spread, &model, return_period, trials, &mut rng);
+
+        assert!(tail_concentrated > 0.0, "concentrated tail should be positive");
+        // Diversification is real and material: spreading the book sharply cuts
+        // the return-period loss.
+        assert!(
+            tail_spread < 0.6 * tail_concentrated,
+            "spread tail {tail_spread} not materially below concentrated {tail_concentrated}"
+        );
+        // The within-zone loss cannot exceed the zone aggregate per event; with a
+        // single dominant event the concentrated 1-in-200 stays within total TIV.
+        assert!(tail_concentrated <= total, "concentrated tail {tail_concentrated} exceeded total exposure");
+    }
+
+    fn lenient_policy() -> ExposurePolicy {
+        // A policy with effectively non-binding cat aggregate, to isolate the
+        // per-risk line limit.
+        ExposurePolicy {
+            return_period: 200.0,
+            solvency_fraction: 1_000.0, // huge: cat aggregate never binds here
+            line_fraction: 0.1,
+            tail_trials: 2_000,
+        }
+    }
+
+    #[test]
+    fn a_net_line_above_the_per_risk_line_limit_is_declined() {
+        // The per-risk line limit is recomputed from CURRENT capital at quote
+        // time: net line ≤ line_fraction × capital. A line above it declines; a
+        // line at or below it is accepted (cat aggregate left non-binding here).
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let policy = lenient_policy();
+        let syndicate = Syndicate::with_capital(1_000.0); // line cap = 0.1 × 1000 = 100
+        let book = NetBook { lines: vec![] };
+        let mut rng = Rng::seeded(1);
+
+        let too_big = NetLine { territory: Territory(0), net_limit: 150.0 };
+        assert_eq!(
+            policy.assess(&syndicate, &book, &model, too_big, &mut rng),
+            UnderwritingDecision::Decline(DeclineReason::PerRiskLine)
+        );
+
+        let within = NetLine { territory: Territory(0), net_limit: 80.0 };
+        assert_eq!(
+            policy.assess(&syndicate, &book, &model, within, &mut rng),
+            UnderwritingDecision::Accept
+        );
+    }
+
+    #[test]
+    fn an_insolvent_syndicate_declines_every_risk() {
+        // An insolvent syndicate is in runoff: it writes no new business, so any
+        // candidate declines with Insolvent — even a trivially small line that
+        // would clear both limits for a solvent syndicate.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let policy = lenient_policy();
+        let syndicate = Syndicate::with_capital(0.0); // in runoff
+        let book = NetBook { lines: vec![] };
+        let mut rng = Rng::seeded(1);
+
+        let tiny = NetLine { territory: Territory(0), net_limit: 0.001 };
+        assert_eq!(
+            policy.assess(&syndicate, &book, &model, tiny, &mut rng),
+            UnderwritingDecision::Decline(DeclineReason::Insolvent)
+        );
+    }
+
+    #[test]
+    fn writing_into_one_zone_trips_the_cat_aggregate_while_a_spread_book_does_not() {
+        // Geographic accumulation pressure (#8) emerges from the cat-aggregate
+        // limit, not a hardcoded goal. Repeatedly writing comparable lines into
+        // ONE zone accumulates one shared occurrence, driving the return-period
+        // net loss up until further risks there are declined; spreading the same
+        // lines across many uncorrelated zones diversifies, so the same total
+        // exposure stays under the limit and keeps clearing.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let policy = ExposurePolicy {
+            return_period: 200.0,
+            solvency_fraction: 0.5,
+            line_fraction: 0.5, // generous per-risk cap, so the cat aggregate binds first
+            tail_trials: 4_000,
+        };
+        let syndicate = Syndicate::with_capital(100.0); // cat budget = 0.5 × 100 = 50
+        let line_size = 1.0;
+        let max_lines = 300;
+
+        // --- Concentrated: everything into Territory(0) ---
+        let mut book = NetBook { lines: vec![] };
+        let mut declined_at: Option<usize> = None;
+        for i in 0..max_lines {
+            let mut rng = Rng::seeded(100 + i as u64);
+            let candidate = NetLine { territory: Territory(0), net_limit: line_size };
+            match policy.assess(&syndicate, &book, &model, candidate, &mut rng) {
+                UnderwritingDecision::Accept => book.lines.push(candidate),
+                UnderwritingDecision::Decline(DeclineReason::CatAggregate) => {
+                    declined_at = Some(i);
+                    break;
+                }
+                other => panic!("unexpected decline while concentrating: {other:?}"),
+            }
+        }
+        let concentrated_written = book.lines.len();
+        assert!(
+            declined_at.is_some(),
+            "concentrating in one zone never tripped the cat aggregate in {max_lines} lines"
+        );
+
+        // --- Spread: the SAME number of lines round-robined across 20 zones ---
+        let zones = 20u32;
+        let mut spread = NetBook { lines: vec![] };
+        for i in 0..concentrated_written {
+            let mut rng = Rng::seeded(100 + i as u64);
+            let candidate = NetLine { territory: Territory(i as u32 % zones), net_limit: line_size };
+            let decision = policy.assess(&syndicate, &spread, &model, candidate, &mut rng);
+            assert_eq!(
+                decision,
+                UnderwritingDecision::Accept,
+                "spread book declined at line {i} (total exposure {}) — diversification should keep it under the limit",
+                spread.lines.len() as f64 * line_size
+            );
+            spread.lines.push(candidate);
+        }
+        // The spread book carries the full comparable total exposure with no
+        // cat-aggregate breach.
+        assert_eq!(spread.lines.len(), concentrated_written);
+    }
+
+    #[test]
+    fn the_tail_measure_reads_the_syndicates_cat_model_belief_not_the_true_process() {
+        // Truth/belief separation: the portfolio tail measure is computed from a
+        // CatModel (the syndicate's belief), never from the substrate's true
+        // CatastrophePeril. The substrate's true process below is constructed to
+        // be wildly more severe than either belief, yet there is NO API to feed
+        // it to the measure — the type system forbids it (portfolio_tail_loss
+        // takes &CatModel). The measure therefore tracks belief alone: an
+        // optimistic belief yields a lower tail than a pessimistic one over the
+        // same book.
+        let _true_process = CatastrophePeril {
+            annual_frequency: 50.0, // catastrophically worse than any belief
+            min_damage_fraction: 0.5,
+            tail_alpha: 1.1,
+        };
+
+        let book = NetBook {
+            lines: vec![NetLine { territory: Territory(0), net_limit: 10.0 }],
+        };
+        let optimistic = CatModel { annual_frequency: 0.3, min_damage_fraction: 0.02, tail_alpha: 1.6 };
+        let pessimistic = CatModel { annual_frequency: 1.2, min_damage_fraction: 0.05, tail_alpha: 1.2 };
+
+        let mut rng = Rng::seeded(2024);
+        let tail_optimistic = portfolio_tail_loss(&book, &optimistic, 200.0, 8_000, &mut rng);
+        let mut rng = Rng::seeded(2024);
+        let tail_pessimistic = portfolio_tail_loss(&book, &pessimistic, 200.0, 8_000, &mut rng);
+
+        // The belief drives the measure: a heavier-tailed, more frequent belief
+        // estimates a larger return-period loss than an optimistic one.
+        assert!(
+            tail_pessimistic > tail_optimistic,
+            "pessimistic belief {tail_pessimistic} should exceed optimistic {tail_optimistic}"
+        );
+        // Both are finite, bounded by the zone exposure per dominant event, and
+        // entirely independent of the (far worse) true process, which could not
+        // even be passed in.
+        assert!(tail_optimistic > 0.0);
+    }
 
     #[test]
     fn ground_up_loss_is_damage_fraction_times_sum_insured() {

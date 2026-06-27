@@ -520,6 +520,37 @@ pub fn available_for_new_business(syndicates: &[Syndicate]) -> Vec<SyndicateId> 
         .collect()
 }
 
+/// The per-syndicate **distribution rule** (part of the genome): how a syndicate
+/// releases profit to its capital providers at year-end. `payout_fraction` is the
+/// share of the year's underwriting profit it pays out; `solvency_floor` is the
+/// capital level below which it distributes nothing and rebuilds first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DistributionParams {
+    /// Fraction of a profitable year's result released to capital providers.
+    pub payout_fraction: f64,
+    /// Capital level below which distributions are suppressed (rebuild first).
+    pub solvency_floor: f64,
+}
+
+/// The **year-end distribution**: the amount of capital a syndicate releases to its
+/// providers. Profit is released only when the year was profitable and capital sits
+/// at or above the [`solvency_floor`](DistributionParams::solvency_floor); the
+/// release is the [`payout_fraction`](DistributionParams::payout_fraction) of the
+/// year's `year_result`, **capped so it never drives capital below the floor**.
+///
+/// Distributions are **suppressed in loss years and while impaired** — an impaired
+/// syndicate rebuilds before it pays out. This is the only check on unbounded
+/// capital accumulation: releasing recovered capital is exactly what competes AvT
+/// back down and lets a hard market re-soften, closing the loop from hard to soft.
+pub fn distribution(capital: f64, year_result: f64, params: &DistributionParams) -> f64 {
+    if year_result <= 0.0 || capital < params.solvency_floor {
+        return 0.0;
+    }
+    let desired = params.payout_fraction * year_result;
+    let above_floor = (capital - params.solvency_floor).max(0.0);
+    desired.min(above_floor)
+}
+
 /// A placed layer: a layer bound to a subscription panel for an annual term with
 /// explicit per-policy inception and expiry dates. A tower is a stack of these.
 /// The substrate honours whatever dates a policy carries; it never decides them.
@@ -904,6 +935,33 @@ impl ExposurePolicy {
             return UnderwritingDecision::Decline(DeclineReason::CatAggregate);
         }
         UnderwritingDecision::Accept
+    }
+
+    /// The syndicate's **capacity headroom**: the free cat-aggregate budget as a
+    /// fraction of the whole budget, in `[0, 1]`. The budget is the coverable cat
+    /// aggregate `solvency_fraction × capital` (the same figure the cat-aggregate
+    /// limit binds on in [`assess`](Self::assess)); the consumed portion is the
+    /// current book's [`portfolio_tail_loss`] under the syndicate's own cat-model
+    /// belief. `1` is an idle book (all budget free, abundant capital); `0` is a
+    /// book filled to the limit, or an insolvent syndicate with no budget at all.
+    ///
+    /// This is the local input the AvT multiplier's headroom channel reads (see
+    /// [`headroom_target`]). Because the budget scales with *current* capital, a
+    /// post-cat drawdown shrinks it — so a shared catastrophe collapses every
+    /// exposed syndicate's headroom together, and their AvT targets harden in step.
+    pub fn capacity_headroom(
+        &self,
+        syndicate: &Syndicate,
+        book: &NetBook,
+        model: &CatModel,
+        rng: &mut Rng,
+    ) -> f64 {
+        let budget = self.solvency_fraction * syndicate.capital();
+        if budget <= 0.0 {
+            return 0.0; // no loss-absorbing capital → no capacity to write
+        }
+        let consumed = portfolio_tail_loss(book, model, self.return_period, self.tail_trials, rng);
+        ((budget - consumed) / budget).clamp(0.0, 1.0)
     }
 }
 
@@ -1353,6 +1411,72 @@ impl Broker {
     }
 }
 
+/// The free-budget fraction treated as **normal** capacity utilisation, where the
+/// headroom-implied AvT target is exactly `1` — the syndicate prices at the TP
+/// floor the cycle oscillates around. Below it capacity is scarce (target above
+/// `1`, holding out); above it capacity is abundant (target below `1`, undercutting
+/// to win business). A market-level calibration constant, not a genome trait.
+pub const NORMAL_HEADROOM: f64 = 0.5;
+
+/// How far the headroom-implied AvT target swings away from `1` per unit of
+/// headroom deviation from [`NORMAL_HEADROOM`]. Calibration — it sets the *shape*
+/// of the target curve `AvT*(h)`; how fast a syndicate chases that target is its
+/// own genome [`AvtParams::headroom_responsiveness`].
+pub const HEADROOM_TARGET_SLOPE: f64 = 1.0;
+
+/// The per-syndicate **AvT genome**: how a syndicate re-prices its ask around the
+/// technical-premium floor. All three are selectable parameters market selection
+/// acts on (#12) — a syndicate that chases share too hard runs soft and is punished
+/// when the tail arrives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AvtParams {
+    /// Relaxation rate in `[0, 1]`: the fraction of the gap to the headroom-implied
+    /// target the AvT multiplier closes each year. Small → slow-moving, which is
+    /// what gives the cycle its inertia.
+    pub headroom_responsiveness: f64,
+    /// Gain on the placement-feedback channel — how sharply AvT reacts to the gap
+    /// between realised win-rate and the syndicate's share-appetite.
+    pub feedback_responsiveness: f64,
+    /// The **share-appetite**: the target win-rate the feedback loop homeostatically
+    /// seeks. Winning more than this lifts AvT (giving margin back); winning less
+    /// cuts it (to compete). An explicit, selectable target — never an implied 50%.
+    pub share_appetite: f64,
+}
+
+/// The **headroom-implied AvT target** `AvT*(h)`: the level a syndicate's capacity
+/// state alone says it should price at. Anchored so that normal headroom
+/// ([`NORMAL_HEADROOM`]) targets exactly `1` (the TP floor); abundant headroom
+/// (idle capital, low opportunity cost of writing) targets **below 1** to win
+/// business, and scarce headroom targets **above 1** to hold out. Monotone
+/// decreasing in headroom. This is the structural core of the cycle: a shared
+/// catastrophe collapses every exposed syndicate's headroom at once, lifting their
+/// targets above 1 together — market-wide hardening with no coordinator.
+pub fn headroom_target(headroom: f64) -> f64 {
+    1.0 + HEADROOM_TARGET_SLOPE * (NORMAL_HEADROOM - headroom)
+}
+
+/// The annual **AvT update**: a syndicate's slow-moving ask multiplier re-set once
+/// a year at renewal from two purely local inputs, combined **additively**:
+///
+/// 1. **Headroom channel** — AvT *relaxes toward* the [`headroom_target`] level by
+///    the genome [`headroom_responsiveness`](AvtParams::headroom_responsiveness)
+///    fraction of the gap. Targeting a *level* (not integrating a per-round nudge)
+///    anchors AvT to the TP floor: the floor is the standing attractor and the slow
+///    relaxation toward it is the multi-year hard-market persistence.
+/// 2. **Feedback channel** — a homeostatic nudge toward the syndicate's
+///    [`share_appetite`](AvtParams::share_appetite): `feedback_responsiveness ×
+///    (realised_win_rate − share_appetite)`. Winning above appetite lifts AvT to
+///    give margin back; winning below cuts it to compete.
+///
+/// Neither input is a market-phase signal — both read the syndicate's own state, so
+/// summing them double-counts nothing. The result is floored at `0` (a price can
+/// never be negative).
+pub fn updated_avt(current: f64, headroom: f64, realised_win_rate: f64, params: &AvtParams) -> f64 {
+    let headroom_channel = params.headroom_responsiveness * (headroom_target(headroom) - current);
+    let feedback_channel = params.feedback_responsiveness * (realised_win_rate - params.share_appetite);
+    (current + headroom_channel + feedback_channel).max(0.0)
+}
+
 /// A syndicate's **quote** on a layer: the syndicate and the price it offers.
 /// The unit the insured clears on and the lead the followers anchor toward.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1421,6 +1545,70 @@ pub fn follower_response(
             price: anchored_quote(own_price, lead_quote, w),
         }),
     }
+}
+
+/// A syndicate's offer to subscribe to a layer under **firm-order subscription**:
+/// its (anchored) `quote`, its own exposure `decision`, and the `offered_share` —
+/// the fraction of the layer limit it is willing to take. Followers' quotes are
+/// already anchored toward the lead (see [`anchored_quote`]); the lead's `quote`
+/// is the firm order itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubscriptionOffer {
+    pub syndicate: SyndicateId,
+    pub quote: f64,
+    pub decision: UnderwritingDecision,
+    pub offered_share: f64,
+}
+
+/// Form a subscription [`Panel`] by **firm-order subscription** (Model B). The
+/// `lead`'s quote is the layer's **firm order** — the single price the insured pays
+/// — and the lead takes the first share. Each follower offer is considered in
+/// order and **subscribes when both** its own exposure limits permit (`decision` is
+/// [`Accept`](UnderwritingDecision::Accept)) **and** its anchored `quote` sits **at
+/// or below the firm order** (it will write at the lead's terms). This is why
+/// herding is load-bearing in *formation*: a follower anchored toward a reputable
+/// lead lowers its quote and subscribes to a firm order it would otherwise reject.
+///
+/// Fill is **capacity-first**: shares accumulate in order up to the full layer, the
+/// last needed share trimmed so the panel never exceeds `1.0`; once full, later
+/// willing offers are not needed. If willing capacity falls short the layer is left
+/// **partially placed** (the panel's [`placed_portion`](Panel::placed_portion) is
+/// below `1.0`). A lead that cannot write (declines on exposure) leaves the layer
+/// entirely unplaced — an empty panel.
+pub fn form_panel(lead: SubscriptionOffer, followers: &[SubscriptionOffer]) -> Panel {
+    let mut entries: Vec<PanelEntry> = Vec::new();
+    let firm_order = lead.quote;
+    let mut placed = 0.0;
+
+    let subscribe = |offer: &SubscriptionOffer, placed: &mut f64, entries: &mut Vec<PanelEntry>| {
+        if *placed >= 1.0 {
+            return;
+        }
+        if offer.decision != UnderwritingDecision::Accept {
+            return;
+        }
+        let take = offer.offered_share.min(1.0 - *placed);
+        if take <= 0.0 {
+            return;
+        }
+        entries.push(PanelEntry { syndicate: offer.syndicate, share: take });
+        *placed += take;
+    };
+
+    // The lead sets the firm order and takes the first share. Only a lead that can
+    // write founds a panel; a declining lead leaves the layer unplaced.
+    subscribe(&lead, &mut placed, &mut entries);
+    if entries.is_empty() {
+        return Panel { entries };
+    }
+
+    for follower in followers {
+        if follower.quote <= firm_order {
+            subscribe(follower, &mut placed, &mut entries);
+        }
+    }
+
+    Panel { entries }
 }
 
 /// An **insured**: the demand-side agent seeking cover. It carries a private
@@ -3381,5 +3569,245 @@ mod tests {
         assert!((triple_cost - (premium + layer.limit)).abs() < 1e-9);
         assert!(triple_cost > 3.0 * single_cost + layer.limit);
         assert!(triple_cost > 2.0 * clustered_cost, "the third event escalates the cost again");
+    }
+
+    fn neutral_avt_params() -> AvtParams {
+        AvtParams { headroom_responsiveness: 0.25, feedback_responsiveness: 0.25, share_appetite: 0.5 }
+    }
+
+    #[test]
+    fn avt_relaxes_slowly_toward_the_headroom_implied_target() {
+        // At normal headroom the headroom-implied target is exactly 1 (price at the
+        // TP floor), and with the win-rate sitting on the syndicate's share-appetite
+        // the feedback channel is silent. A syndicate currently asking above the floor
+        // therefore relaxes DOWN toward 1 — but slowly, not in a single jump.
+        let params = neutral_avt_params();
+        let next = updated_avt(1.5, NORMAL_HEADROOM, params.share_appetite, &params);
+
+        // It moved toward 1 from 1.5 ...
+        assert!(next < 1.5, "AvT relaxes down toward the floor, got {next}");
+        // ... but did not snap to it: the multiplier is slow-moving.
+        assert!(next > 1.0, "AvT does not jump to the target in one year, got {next}");
+        // The relaxation is exactly the responsiveness fraction of the gap to target.
+        assert!((next - 1.375).abs() < 1e-9, "expected 1.5 + 0.25*(1.0-1.5) = 1.375, got {next}");
+    }
+
+    #[test]
+    fn the_placement_feedback_channel_homeostatically_chases_the_share_appetite() {
+        // Hold AvT on the floor at normal headroom so the headroom channel is silent
+        // (target 1, current 1, gap 0) and only the feedback channel moves the ask.
+        let params = neutral_avt_params(); // share_appetite = 0.5
+        let on_floor = 1.0;
+
+        // Winning MORE than appetite lifts AvT to give margin back ...
+        let winning = updated_avt(on_floor, NORMAL_HEADROOM, 0.9, &params);
+        assert!(winning > on_floor, "over-winning lifts the ask, got {winning}");
+        assert!((winning - (1.0 + 0.25 * (0.9 - 0.5))).abs() < 1e-9);
+
+        // ... winning LESS than appetite cuts it to compete ...
+        let losing = updated_avt(on_floor, NORMAL_HEADROOM, 0.1, &params);
+        assert!(losing < on_floor, "under-winning cuts the ask, got {losing}");
+
+        // ... and sitting exactly on appetite leaves the floor untouched.
+        let neutral = updated_avt(on_floor, NORMAL_HEADROOM, params.share_appetite, &params);
+        assert!((neutral - on_floor).abs() < 1e-9, "on-appetite is a rest point, got {neutral}");
+    }
+
+    #[test]
+    fn the_headroom_target_anchors_at_the_floor_and_hardens_as_capacity_tightens() {
+        // Normal capacity utilisation targets exactly the TP floor.
+        assert!((headroom_target(NORMAL_HEADROOM) - 1.0).abs() < 1e-9);
+        // Abundant headroom (idle capital) targets BELOW 1 — undercut to win business.
+        assert!(headroom_target(0.9) < 1.0, "abundant headroom softens the ask");
+        // Scarce headroom (a full book) targets ABOVE 1 — hold out for rate.
+        assert!(headroom_target(0.1) > 1.0, "scarce headroom hardens the ask");
+        // Monotone decreasing: the tighter the capacity, the higher the target.
+        assert!(headroom_target(0.1) > headroom_target(0.5));
+        assert!(headroom_target(0.5) > headroom_target(0.9));
+    }
+
+    #[test]
+    fn the_two_avt_channels_combine_additively() {
+        // With both inputs off their rest points, the year's increment is exactly the
+        // sum of the independent channels — they are separate reads (own capital state
+        // vs own price discovery), so summing double-counts nothing.
+        let params = neutral_avt_params();
+        let current = 1.2;
+        let headroom = 0.2; // scarce → headroom target above 1
+        let win_rate = 0.8; // above appetite → feedback positive
+
+        let headroom_channel = params.headroom_responsiveness * (headroom_target(headroom) - current);
+        let feedback_channel = params.feedback_responsiveness * (win_rate - params.share_appetite);
+        let expected = current + headroom_channel + feedback_channel;
+
+        let next = updated_avt(current, headroom, win_rate, &params);
+        assert!((next - expected).abs() < 1e-9, "channels must sum, got {next} vs {expected}");
+    }
+
+    #[test]
+    fn avt_is_floored_at_zero_so_the_ask_never_goes_negative() {
+        // A syndicate already on the floor, drowning in idle capacity and losing every
+        // placement, would be driven below zero by an unclamped update — a negative
+        // price is nonsense, so the multiplier floors at zero.
+        let aggressive = AvtParams { headroom_responsiveness: 2.0, feedback_responsiveness: 2.0, share_appetite: 0.9 };
+        let next = updated_avt(0.05, 1.0, 0.0, &aggressive);
+        assert!(next >= 0.0, "AvT never goes negative, got {next}");
+    }
+
+    #[test]
+    fn an_empty_book_has_full_capacity_headroom() {
+        // Headroom is the free cat-aggregate budget as a fraction of the whole
+        // budget. An idle syndicate with no book has consumed none of it, so its
+        // headroom is 1 — maximally abundant capital, the soft end of the cycle.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let policy = ExposurePolicy { return_period: 200.0, solvency_fraction: 0.5, line_fraction: 0.5, tail_trials: 4_000 };
+        let syndicate = Syndicate::with_capital(100.0); // cat budget = 0.5 × 100 = 50
+        let book = NetBook { lines: vec![] };
+        let mut rng = Rng::seeded(7);
+
+        let headroom = policy.capacity_headroom(&syndicate, &book, &model, &mut rng);
+        assert!((headroom - 1.0).abs() < 1e-9, "an empty book is all free budget, got {headroom}");
+    }
+
+    #[test]
+    fn a_capital_drawdown_collapses_capacity_headroom() {
+        // The budget scales with current capital, so holding the book fixed and
+        // depleting capital eats the free headroom — the structural channel by which
+        // a catastrophe hardens an exposed syndicate. Insolvency leaves none at all.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let policy = ExposurePolicy { return_period: 200.0, solvency_fraction: 0.5, line_fraction: 0.5, tail_trials: 4_000 };
+        let book = NetBook { lines: vec![NetLine { territory: Territory(0), net_limit: 40.0 }] };
+        let headroom_at = |capital: f64| {
+            let mut rng = Rng::seeded(11);
+            policy.capacity_headroom(&Syndicate::with_capital(capital), &book, &model, &mut rng)
+        };
+
+        let healthy = headroom_at(100.0);
+        let depleted = headroom_at(50.0);
+        let insolvent = headroom_at(0.0);
+
+        assert!(healthy > depleted, "a drawdown must shrink headroom: {healthy} !> {depleted}");
+        assert!(depleted > insolvent, "deeper depletion shrinks it further: {depleted} !> {insolvent}");
+        assert_eq!(insolvent, 0.0, "an insolvent syndicate has no capacity headroom");
+    }
+
+    fn offer(id: usize, quote: f64, share: f64) -> SubscriptionOffer {
+        SubscriptionOffer {
+            syndicate: SyndicateId(id),
+            quote,
+            decision: UnderwritingDecision::Accept,
+            offered_share: share,
+        }
+    }
+
+    #[test]
+    fn a_follower_subscribes_to_the_firm_order_only_at_or_below_it() {
+        // The lead's quote is the layer's firm order — the single price the insured
+        // pays. A follower subscribes when its anchored quote sits at or below that
+        // firm order (it will write at the lead's terms); a follower whose anchored
+        // quote exceeds the firm order will not write that cheap, and drops off.
+        let lead = offer(0, 100.0, 0.3); // firm order = 100
+        let followers = [
+            offer(1, 90.0, 0.3),  // below firm order → subscribes
+            offer(2, 100.0, 0.2), // exactly at firm order → subscribes
+            offer(3, 110.0, 0.3), // above firm order → does not subscribe
+        ];
+
+        let panel = form_panel(lead, &followers);
+        let members: Vec<usize> = panel.entries.iter().map(|e| e.syndicate.0).collect();
+
+        assert_eq!(members, vec![0, 1, 2], "only the lead and the at/below-firm followers subscribe");
+    }
+
+    #[test]
+    fn a_follower_declining_on_exposure_never_subscribes_however_cheap_the_firm_order() {
+        // Herding moves price, never capacity discipline: a follower whose own
+        // exposure limits decline the risk drops off the panel even though its
+        // anchored quote sits comfortably below the firm order.
+        let lead = offer(0, 100.0, 0.4);
+        let declined = SubscriptionOffer {
+            syndicate: SyndicateId(1),
+            quote: 50.0, // far below the firm order — would subscribe on price alone
+            decision: UnderwritingDecision::Decline(DeclineReason::CatAggregate),
+            offered_share: 0.4,
+        };
+
+        let panel = form_panel(lead, &[declined]);
+        let members: Vec<usize> = panel.entries.iter().map(|e| e.syndicate.0).collect();
+        assert_eq!(members, vec![0], "the capacity-declined follower stays off the panel");
+    }
+
+    #[test]
+    fn capacity_first_fill_caps_the_panel_at_the_full_layer() {
+        // Offers fill the layer in order; the share that completes the layer is
+        // trimmed to fit exactly, and willing offers beyond a full layer are not
+        // needed. The placed portion never exceeds the whole layer.
+        let lead = offer(0, 100.0, 0.5);
+        let followers = [
+            offer(1, 100.0, 0.4), // takes 0.4 → running total 0.9
+            offer(2, 100.0, 0.3), // only 0.1 left → trimmed to 0.1, total 1.0
+            offer(3, 100.0, 0.3), // layer already full → unused
+        ];
+
+        let panel = form_panel(lead, &followers);
+        assert!((panel.placed_portion() - 1.0).abs() < 1e-9, "a full layer places exactly 1.0");
+        let ids: Vec<usize> = panel.entries.iter().map(|e| e.syndicate.0).collect();
+        assert_eq!(ids, vec![0, 1, 2], "the surplus offer (3) is dropped once the layer fills");
+        let shares: Vec<f64> = panel.entries.iter().map(|e| e.share).collect();
+        assert!((shares[2] - 0.1).abs() < 1e-9, "the completing share is trimmed to 0.1, got {}", shares[2]);
+    }
+
+    #[test]
+    fn a_layer_with_insufficient_willing_capacity_is_left_partially_placed() {
+        // When the willing subscribers cannot fill the layer, it is partially placed
+        // — the panel's placed portion falls short of 1.0 and the insured carries the
+        // gap (restructure or retain).
+        let lead = offer(0, 100.0, 0.3);
+        let followers = [
+            offer(1, 100.0, 0.2),
+            offer(2, 130.0, 0.4), // above firm order → does not subscribe, so capacity is short
+        ];
+
+        let panel = form_panel(lead, &followers);
+        assert!((panel.placed_portion() - 0.5).abs() < 1e-9, "only 0.3 + 0.2 places, got {}", panel.placed_portion());
+        assert!(panel.placed_portion() < 1.0, "the layer is left partially placed");
+    }
+
+    #[test]
+    fn a_profitable_well_capitalised_year_distributes_a_fraction_of_the_profit() {
+        // Year-end distribution releases the genome payout fraction of the year's
+        // underwriting profit to capital providers — the only thing that stops
+        // capital accumulating without bound and lets the market re-soften.
+        let params = DistributionParams { payout_fraction: 0.6, solvency_floor: 100.0 };
+        let released = distribution(1_000.0, 200.0, &params);
+        assert!((released - 120.0).abs() < 1e-9, "0.6 × 200 profit = 120, got {released}");
+    }
+
+    #[test]
+    fn distributions_are_suppressed_in_loss_years() {
+        // A loss year releases nothing — there is no profit to distribute, and the
+        // capital must absorb the loss, not be paid out.
+        let params = DistributionParams { payout_fraction: 0.6, solvency_floor: 100.0 };
+        assert_eq!(distribution(1_000.0, -50.0, &params), 0.0, "a loss year distributes nothing");
+        assert_eq!(distribution(1_000.0, 0.0, &params), 0.0, "a break-even year distributes nothing");
+    }
+
+    #[test]
+    fn an_impaired_syndicate_below_the_solvency_floor_rebuilds_before_distributing() {
+        // Even a profitable year releases nothing while capital sits below the
+        // solvency floor: the impaired syndicate rebuilds first.
+        let params = DistributionParams { payout_fraction: 0.6, solvency_floor: 100.0 };
+        assert_eq!(distribution(80.0, 200.0, &params), 0.0, "below the floor, profit is retained to rebuild");
+    }
+
+    #[test]
+    fn a_distribution_never_drives_capital_below_the_solvency_floor() {
+        // A thin-but-solvent syndicate with a big nominal profit only releases down
+        // to the floor — the payout is capped by the capital available above it.
+        let params = DistributionParams { payout_fraction: 0.9, solvency_floor: 100.0 };
+        // 0.9 × 500 = 450 desired, but only 120 − 100 = 20 sits above the floor.
+        let released = distribution(120.0, 500.0, &params);
+        assert!((released - 20.0).abs() < 1e-9, "capped at the headroom above the floor, got {released}");
+        assert!(120.0 - released >= params.solvency_floor, "capital never falls below the floor");
     }
 }

@@ -413,6 +413,13 @@ impl Syndicate {
         self.capital -= settled;
         Settlement { settled, shortfall: claim_share - settled }
     }
+
+    /// Credit premium income to capital. The balance has no ceiling; this is the
+    /// mirror of [`settle`](Self::settle) used for reinstatement income, which
+    /// credits the panel's capital in the same year as the loss it follows.
+    pub fn credit(&mut self, amount: f64) {
+        self.capital += amount.max(0.0);
+    }
 }
 
 /// A syndicate's identity within the market's roster — an index into the slice
@@ -482,6 +489,22 @@ impl Panel {
             .map(|entry| syndicates[entry.syndicate.0].settle(entry.share * insured_loss))
             .collect()
     }
+
+    /// Credit an amount across the panel by share — the mirror of [`settle`](Self::settle).
+    /// Each subscriber's capital is credited `share × amount`; returns one credit
+    /// per entry in panel order. Reinstatement income is pro-rated by the same
+    /// shares as the loss that triggered it, so the panel's capital is credited in
+    /// the same year as the loss, consistent with the settlement cascade.
+    pub fn credit(&self, amount: f64, syndicates: &mut [Syndicate]) -> Vec<f64> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                let credit = entry.share * amount;
+                syndicates[entry.syndicate.0].credit(credit);
+                credit
+            })
+            .collect()
+    }
 }
 
 /// The syndicates available to write new business: the solvent members of the
@@ -538,6 +561,168 @@ pub fn settle_placed_tower(
         settlements.extend(placed.panel.settle(insured_loss, syndicates));
     }
     settlements
+}
+
+/// **Reinstatement terms** on a catastrophe excess-of-loss layer: how many times
+/// the eroded limit can be restored within the term (`count`) and the premium
+/// `factor` charged per full reinstatement (≈1.0 = 100% of the original layer
+/// premium), pro-rated to the fraction of limit reinstated.
+///
+/// A layer's aggregate cover over its term is therefore `(1 + count) × limit`: the
+/// original ("free") limit plus `count` reinstatements. Loss paid above the
+/// original limit consumes reinstatements and is charged pro-rata; once the
+/// aggregate is exhausted the layer stays eroded. [`none`](Self::none) is a layer
+/// with no reinstatement cover — a single limit for the term, no charge ever.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReinstatementTerms {
+    pub count: u32,
+    pub factor: f64,
+}
+
+impl ReinstatementTerms {
+    /// A layer with no reinstatement: one limit for the term, no reinstatement
+    /// premium ever charged.
+    pub fn none() -> Self {
+        ReinstatementTerms { count: 0, factor: 0.0 }
+    }
+
+    /// The expected reinstatement premium per unit of original premium, given the
+    /// expected fraction of the original limit reinstated over a year. The
+    /// dimensionless loading the quoted price folds in: `factor × reinstated_fraction`.
+    pub fn premium_loading(&self, expected_reinstated_fraction: f64) -> f64 {
+        self.factor * expected_reinstated_fraction
+    }
+}
+
+/// The outcome of a cat XoL layer absorbing one event within its term: the claim
+/// settlements across its panel; the `reinstatement_premium` the event triggered
+/// (zero while the original limit still covers it); the per-entry capital credits
+/// that reinstatement income paid the panel (pro-rata by share, in the same year);
+/// and any `uncovered` loss left once the layer's aggregate cover is exhausted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventSettlement {
+    pub claim: Vec<Settlement>,
+    pub reinstatement_premium: f64,
+    pub reinstatement_credits: Vec<f64>,
+    pub uncovered: f64,
+}
+
+/// A placed catastrophe excess-of-loss layer with **reinstatement cover**, tracking
+/// its within-year erosion state. The band sits on a `panel` for a term bounded by
+/// `inception`/`expiry`; `terms` carry the reinstatement count and factor; and
+/// `premium` is the original layer premium the reinstatement premium is a fraction
+/// of. The live `consumed` state is the cumulative layer loss paid this term.
+///
+/// The aggregate cover is `(1 + count) × limit`. The original limit is free; loss
+/// paid above it consumes reinstatements, each charged `factor × premium ×
+/// (reinstated / limit)`, **crediting the panel's capital in the same year as the
+/// loss** (see [`Panel::credit`]). Once `(1 + count) × limit` is exhausted the
+/// layer stays eroded — a later event finds reduced or zero limit. That finite,
+/// event-ordered erosion is the source of within-year hardening: a clustered
+/// second event triggers a further reinstatement (or finds the layer spent).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReinstatementLayer {
+    pub layer: Layer,
+    pub panel: Panel,
+    pub terms: ReinstatementTerms,
+    pub premium: f64,
+    pub inception: f64,
+    pub expiry: f64,
+    consumed: f64,
+}
+
+impl ReinstatementLayer {
+    /// A freshly placed cat XoL layer: full aggregate cover, nothing consumed.
+    pub fn new(
+        layer: Layer,
+        panel: Panel,
+        terms: ReinstatementTerms,
+        premium: f64,
+        inception: f64,
+        expiry: f64,
+    ) -> Self {
+        ReinstatementLayer { layer, panel, terms, premium, inception, expiry, consumed: 0.0 }
+    }
+
+    /// Whether the layer is on risk at `date`: `inception ≤ date < expiry`.
+    pub fn is_in_force(&self, date: f64) -> bool {
+        self.inception <= date && date < self.expiry
+    }
+
+    /// The layer's aggregate cover over its term: `(1 + count) × limit`.
+    pub fn aggregate_limit(&self) -> f64 {
+        (1.0 + self.terms.count as f64) * self.layer.limit
+    }
+
+    /// The cover still available this term: `aggregate_limit − consumed`.
+    pub fn remaining_limit(&self) -> f64 {
+        (self.aggregate_limit() - self.consumed).max(0.0)
+    }
+
+    /// Absorb one catastrophe event (its ground-up loss) at `date`, settling the
+    /// layer's claim on the panel and crediting any reinstatement premium back to
+    /// the panel's capital in the same year. Loss paid above the original limit
+    /// consumes reinstatements (charged pro-rata) until the aggregate cover is
+    /// exhausted, after which the excess is uncovered. An out-of-force layer
+    /// generates nothing.
+    pub fn absorb_event(
+        &mut self,
+        ground_up_loss: f64,
+        date: f64,
+        syndicates: &mut [Syndicate],
+    ) -> EventSettlement {
+        if !self.is_in_force(date) {
+            return EventSettlement {
+                claim: Vec::new(),
+                reinstatement_premium: 0.0,
+                reinstatement_credits: Vec::new(),
+                uncovered: 0.0,
+            };
+        }
+        let demand = self.layer.insured_loss(ground_up_loss);
+        let payable = demand.min(self.remaining_limit());
+
+        // The portion of this event's payable loss that falls above the original
+        // (free) limit consumes reinstatement and is charged pro-rata to the
+        // fraction of limit reinstated.
+        let limit = self.layer.limit;
+        let before = self.consumed;
+        let after = self.consumed + payable;
+        let reinstated = (after - limit).max(0.0) - (before - limit).max(0.0);
+        let reinstatement_premium = if limit > 0.0 {
+            self.terms.factor * self.premium * (reinstated / limit)
+        } else {
+            0.0
+        };
+        self.consumed = after;
+
+        let claim = self.panel.settle(payable, syndicates);
+        let reinstatement_credits = self.panel.credit(reinstatement_premium, syndicates);
+        EventSettlement {
+            claim,
+            reinstatement_premium,
+            reinstatement_credits,
+            uncovered: demand - payable,
+        }
+    }
+
+    /// Absorb a year's catastrophe `events` over a net `exposure`, **in the
+    /// chronological order they arrive** (the order [`CatastrophePeril::annual_events`]
+    /// returns). Each event's shared occurrence strikes the whole exposure
+    /// (`gul = damage_fraction × exposure`) and flows through [`absorb_event`](Self::absorb_event),
+    /// so a second event within the year triggers a further reinstatement — or
+    /// finds the layer already eroded. Returns one [`EventSettlement`] per event.
+    pub fn absorb_year(
+        &mut self,
+        events: &[CatastropheEvent],
+        exposure: f64,
+        syndicates: &mut [Syndicate],
+    ) -> Vec<EventSettlement> {
+        events
+            .iter()
+            .map(|event| self.absorb_event(event.damage_fraction * exposure, event.time, syndicates))
+            .collect()
+    }
 }
 
 /// A syndicate's **cat model**: its *belief* about the true cat process, used to
@@ -762,6 +947,48 @@ pub struct LayerExposure {
     pub layer: Layer,
     pub exposure: f64,
     pub territory: Territory,
+    /// The reinstatement terms the layer carries. [`ReinstatementTerms::none`] is a
+    /// layer with no reinstatement cover; finite terms fold an expected
+    /// reinstatement-premium credit into the quoted technical premium (see
+    /// [`technical_premium`]).
+    pub reinstatement: ReinstatementTerms,
+}
+
+/// The **expected reinstatement fraction**: the model-anchored mean fraction of a
+/// cat XoL layer's *original limit* that is reinstated in a believed year, over the
+/// syndicate's own [`CatModel`]. Each believed year's events strike the whole
+/// `exposure` as shared occurrences; their layered losses accumulate, and the
+/// portion paid above the original limit (up to the aggregate `(1 + count) × limit`)
+/// is what reinstatements restore. The fraction is `E[reinstated] / limit`.
+///
+/// It is **premium-independent** — a pure property of the layer, its terms, and the
+/// belief — so it scales any base premium into the expected reinstatement income
+/// the quoted price folds in. Like the cat ELF it is model-anchored, never
+/// experience-updated, and deterministic given a seeded `rng`.
+pub fn expected_reinstatement_fraction(
+    layer: &Layer,
+    exposure: f64,
+    terms: &ReinstatementTerms,
+    model: &CatModel,
+    trials: usize,
+    rng: &mut Rng,
+) -> f64 {
+    if trials == 0 || terms.count == 0 || layer.limit <= 0.0 {
+        return 0.0;
+    }
+    let aggregate = (1.0 + terms.count as f64) * layer.limit;
+    let total: f64 = (0..trials)
+        .map(|_| {
+            let count = model.annual_event_count(rng);
+            let annual_loss: f64 = (0..count)
+                .map(|_| layer.insured_loss(model.draw_damage_fraction(rng) * exposure))
+                .sum();
+            // The loss paid above the free original limit is what reinstatements
+            // restore, capped at the aggregate cover.
+            (annual_loss.min(aggregate) - layer.limit).max(0.0)
+        })
+        .sum();
+    (total / trials as f64) / layer.limit
 }
 
 /// The **catastrophe ELF** (expected loss cost) for the catastrophe component of
@@ -916,9 +1143,11 @@ pub struct PricingParams {
 /// The decomposed **technical premium** (TP) for a layer — the rational price
 /// floor, not the market price. Loss cost splits into an experience-updated
 /// attritional ELF and a model-anchored catastrophe ELF; the actuarial technical
-/// price loads loss cost multiplicatively by the target loss ratio; and the
+/// price loads loss cost multiplicatively by the target loss ratio; the
 /// cost-of-capital loading is the hurdle rate on the marginal tail capital the
-/// layer consumes. `TP = ATP + cost_of_capital`.
+/// layer consumes; and the **expected reinstatement credit** folds the layer's
+/// reinstatement terms into the quote.
+/// `TP = ATP + cost_of_capital − expected_reinstatement_credit`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TechnicalPremium {
     pub attritional_elf: f64,
@@ -927,6 +1156,14 @@ pub struct TechnicalPremium {
     pub actuarial_technical_price: f64,
     pub marginal_capital: f64,
     pub cost_of_capital: f64,
+    /// The expected reinstatement-premium income the layer's terms will earn,
+    /// credited against the quoted price: `factor × E[reinstated_fraction] ×
+    /// (ATP + cost_of_capital)`. Zero for a layer with no reinstatement. Because
+    /// reinstatement premiums are extra income the layer collects when losses
+    /// recur within the year, the quoted base price is lower the more reinstatement
+    /// the layer carries — the quoted ROL incorporates the expected reinstatement
+    /// cost rather than ignoring the terms.
+    pub expected_reinstatement_credit: f64,
     pub technical_premium: f64,
 }
 
@@ -961,6 +1198,24 @@ pub fn technical_premium(
     let atp = actuarial_technical_price(loss_cost, params.target_loss_ratio);
     let marginal = marginal_capital(book, risk, model, params.return_period, params.tail_trials, rng);
     let cost_of_capital = params.hurdle_rate * marginal;
+    // Fold the layer's reinstatement terms into the quote. The expected
+    // reinstatement-premium income (a fraction of the base price, model-anchored
+    // like the cat ELF) is collected when losses recur within the year, so it
+    // credits the base price — a layer carrying reinstatements quotes below an
+    // otherwise-identical layer that does not. Skipped when the terms charge
+    // nothing, so a no-reinstatement layer prices and draws RNG exactly as before.
+    let base_premium = atp + cost_of_capital;
+    let expected_reinstatement_credit = {
+        let fraction = expected_reinstatement_fraction(
+            &risk.layer,
+            risk.exposure,
+            &risk.reinstatement,
+            model,
+            params.tail_trials,
+            rng,
+        );
+        risk.reinstatement.premium_loading(fraction) * base_premium
+    };
     TechnicalPremium {
         attritional_elf: attritional,
         catastrophe_elf: catastrophe,
@@ -968,7 +1223,8 @@ pub fn technical_premium(
         actuarial_technical_price: atp,
         marginal_capital: marginal,
         cost_of_capital,
-        technical_premium: atp + cost_of_capital,
+        expected_reinstatement_credit,
+        technical_premium: (base_premium - expected_reinstatement_credit).max(0.0),
     }
 }
 
@@ -1437,7 +1693,7 @@ mod tests {
         let exposure = 1_000.0;
         let t0 = Territory(0);
 
-        let risk = LayerExposure { layer, exposure, territory: t0 };
+        let risk = LayerExposure { layer, exposure, territory: t0, reinstatement: ReinstatementTerms::none() };
         let mut rng = Rng::seeded(2024);
         let mc = marginal_capital(&empty, &risk, &model, 200.0, 8_000, &mut rng);
         assert!(mc > 0.0, "a cat-exposed working layer consumes tail capital");
@@ -1470,8 +1726,8 @@ mod tests {
         // far into the believed tail, so the 1-in-200 barely reaches it.
         let remote = Layer { attachment: 980.0, limit: 20.0 };
 
-        let working_risk = LayerExposure { layer: working, exposure, territory: t0 };
-        let remote_risk = LayerExposure { layer: remote, exposure, territory: t0 };
+        let working_risk = LayerExposure { layer: working, exposure, territory: t0, reinstatement: ReinstatementTerms::none() };
+        let remote_risk = LayerExposure { layer: remote, exposure, territory: t0, reinstatement: ReinstatementTerms::none() };
         let mut rng = Rng::seeded(2024);
         let mc_working = marginal_capital(&empty, &working_risk, &model, 200.0, 8_000, &mut rng);
         let mut rng = Rng::seeded(2024);
@@ -1500,7 +1756,7 @@ mod tests {
         // consumes.
         let model = cat_model();
         let book = NetBook { lines: vec![] };
-        let risk = LayerExposure { layer: Layer { attachment: 0.0, limit: 100.0 }, exposure: 1_000.0, territory: Territory(0) };
+        let risk = LayerExposure { layer: Layer { attachment: 0.0, limit: 100.0 }, exposure: 1_000.0, territory: Territory(0), reinstatement: ReinstatementTerms::none() };
         let experience = AttritionalExperience { own_burning_cost: 30.0, benchmark: 25.0, volume: 50.0 };
         let params = PricingParams { hurdle_rate: 0.15, credibility_k: 10.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 8_000 };
 
@@ -1559,7 +1815,7 @@ mod tests {
         let priced: Vec<TechnicalPremium> = attachments
             .iter()
             .map(|&attachment| {
-                let risk = LayerExposure { layer: Layer { attachment, limit }, exposure, territory: Territory(0) };
+                let risk = LayerExposure { layer: Layer { attachment, limit }, exposure, territory: Territory(0), reinstatement: ReinstatementTerms::none() };
                 // Common random numbers across layers: same seed isolates the
                 // layer-position effect from Monte-Carlo noise.
                 let mut rng = Rng::seeded(2024);
@@ -2538,7 +2794,7 @@ mod tests {
         // the ask multiplier is the (future) competitive lever around it.
         let model = cat_model();
         let book = NetBook { lines: vec![] };
-        let risk = LayerExposure { layer: Layer { attachment: 0.0, limit: 100.0 }, exposure: 1_000.0, territory: Territory(0) };
+        let risk = LayerExposure { layer: Layer { attachment: 0.0, limit: 100.0 }, exposure: 1_000.0, territory: Territory(0), reinstatement: ReinstatementTerms::none() };
         let experience = AttritionalExperience { own_burning_cost: 30.0, benchmark: 25.0, volume: 50.0 };
         let params = PricingParams { hurdle_rate: 0.15, credibility_k: 10.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 4_000 };
         let mut rng = Rng::seeded(2024);
@@ -2610,7 +2866,7 @@ mod tests {
         // #14). anchored_quote cannot even see the model — it takes only prices.
         let model = cat_model();
         let book = NetBook { lines: vec![] };
-        let risk = LayerExposure { layer: Layer { attachment: 0.0, limit: 100.0 }, exposure: 1_000.0, territory: Territory(0) };
+        let risk = LayerExposure { layer: Layer { attachment: 0.0, limit: 100.0 }, exposure: 1_000.0, territory: Territory(0), reinstatement: ReinstatementTerms::none() };
         let experience = AttritionalExperience { own_burning_cost: 30.0, benchmark: 25.0, volume: 50.0 };
         let params = PricingParams { hurdle_rate: 0.15, credibility_k: 10.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 4_000 };
 
@@ -2859,5 +3115,271 @@ mod tests {
         }
         // A GUL above the tower top (400) is capped at 400.
         assert_eq!(tower.aggregate_insured_loss(1_000.0), 400.0);
+    }
+
+    #[test]
+    fn a_single_event_settles_on_the_original_limit_with_no_reinstatement_premium() {
+        // A cat XoL layer carries reinstatement terms (count + factor). The
+        // original limit is "free": a single event drawing within it settles its
+        // claim across the panel and triggers no reinstatement premium, so the
+        // panel's capital is debited the claim and credited nothing.
+        let layer = Layer { attachment: 100.0, limit: 200.0 };
+        let panel = Panel::subscribe(&[SyndicateId(0), SyndicateId(1)], 1.0);
+        let terms = ReinstatementTerms { count: 1, factor: 1.0 };
+        let mut placed = ReinstatementLayer::new(layer, panel, terms, 50.0, 0.0, 1.0);
+
+        let mut syndicates =
+            vec![Syndicate::with_capital(10_000.0), Syndicate::with_capital(10_000.0)];
+        // GUL 250 → layer loss = clamp(250 − 100, 0, 200) = 150, within the limit.
+        let outcome = placed.absorb_event(250.0, 0.5, &mut syndicates);
+
+        let settled: f64 = outcome.claim.iter().map(|s| s.settled).sum();
+        assert!((settled - 150.0).abs() < 1e-9);
+        assert_eq!(outcome.reinstatement_premium, 0.0, "the free original limit triggers no reinstatement");
+        assert_eq!(outcome.uncovered, 0.0);
+        // Each member pays its 0.5 share of the 150 claim; nothing credited back.
+        assert!((syndicates[0].capital() - 9_925.0).abs() < 1e-9);
+        assert!((syndicates[1].capital() - 9_925.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_second_event_triggers_a_reinstatement_premium_crediting_the_panel_in_the_same_year() {
+        // Once the original limit is eroded, a later event draws on a reinstatement:
+        // the layer pays the claim AND charges a reinstatement premium pro-rated to
+        // the fraction of limit reinstated (factor × premium × reinstated/limit).
+        // That income credits the panel's capital by share, in the same year as the
+        // loss — the mirror of the settlement cascade.
+        let layer = Layer { attachment: 0.0, limit: 100.0 };
+        let panel = Panel::subscribe(&[SyndicateId(0), SyndicateId(1)], 1.0);
+        let terms = ReinstatementTerms { count: 1, factor: 1.0 };
+        let premium = 40.0;
+        let mut placed = ReinstatementLayer::new(layer, panel, terms, premium, 0.0, 1.0);
+
+        let mut syndicates =
+            vec![Syndicate::with_capital(10_000.0), Syndicate::with_capital(10_000.0)];
+
+        // Event 1 (early) erodes the full original limit: claim 100, no reinstatement.
+        let first = placed.absorb_event(100.0, 0.2, &mut syndicates);
+        assert_eq!(first.reinstatement_premium, 0.0);
+
+        // Event 2 (later) erodes the full limit again — entirely above the original
+        // limit, so it consumes one full reinstatement: premium = 1.0 × 40 × 1.0.
+        let second = placed.absorb_event(100.0, 0.6, &mut syndicates);
+        let claim: f64 = second.claim.iter().map(|s| s.settled).sum();
+        assert!((claim - 100.0).abs() < 1e-9, "the reinstated limit pays the second claim in full");
+        assert!((second.reinstatement_premium - 40.0).abs() < 1e-9, "a full reinstatement at 100% of premium");
+        assert_eq!(second.uncovered, 0.0);
+
+        // The reinstatement income is credited pro-rata by share (0.5 each = 20).
+        assert_eq!(second.reinstatement_credits.len(), 2);
+        for c in &second.reinstatement_credits {
+            assert!((c - 20.0).abs() < 1e-9);
+        }
+        // Net capital per member over the year: −50 (two 50-share claims) + 20 credit.
+        for s in &syndicates {
+            assert!((s.capital() - (10_000.0 - 100.0 + 20.0)).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn reinstatements_are_finite_so_an_exhausted_layer_stays_eroded() {
+        // Reinstatements are finite: with count = 1 the aggregate cover is
+        // (1 + 1) × limit = two full limits. A third full-limit event finds the
+        // aggregate exhausted — no further reinstatement, no claim paid, and the
+        // whole loss is uncovered. The layer stays eroded for the rest of the term.
+        let layer = Layer { attachment: 0.0, limit: 100.0 };
+        let panel = Panel::subscribe(&[SyndicateId(0)], 1.0);
+        let terms = ReinstatementTerms { count: 1, factor: 1.0 };
+        let mut placed = ReinstatementLayer::new(layer, panel, terms, 30.0, 0.0, 1.0);
+        assert!((placed.aggregate_limit() - 200.0).abs() < 1e-9);
+
+        let mut syndicates = vec![Syndicate::with_capital(10_000.0)];
+
+        placed.absorb_event(100.0, 0.1, &mut syndicates); // uses original limit
+        placed.absorb_event(100.0, 0.4, &mut syndicates); // uses the one reinstatement
+        assert_eq!(placed.remaining_limit(), 0.0, "both limits consumed");
+
+        // Third event: nothing left to pay, no reinstatement to charge, all uncovered.
+        let third = placed.absorb_event(100.0, 0.8, &mut syndicates);
+        let claim: f64 = third.claim.iter().map(|s| s.settled).sum();
+        assert_eq!(claim, 0.0, "an exhausted layer pays no further claim");
+        assert_eq!(third.reinstatement_premium, 0.0, "no reinstatement remains to charge");
+        assert!((third.uncovered - 100.0).abs() < 1e-9, "the whole loss is uncovered");
+    }
+
+    #[test]
+    fn a_year_of_events_is_absorbed_chronologically_with_out_of_force_events_skipped() {
+        // The within-year time axis drives reinstatement: a layer absorbs a year's
+        // events over its exposure in the chronological order they arrive. Each
+        // shared occurrence strikes the whole exposure (gul = damage_fraction ×
+        // exposure); the first in-force event uses the original limit, a later one
+        // triggers a reinstatement, and events outside the cover window generate
+        // nothing.
+        let layer = Layer { attachment: 0.0, limit: 100.0 };
+        let panel = Panel::subscribe(&[SyndicateId(0)], 1.0);
+        let terms = ReinstatementTerms { count: 1, factor: 1.0 };
+        let mut placed = ReinstatementLayer::new(layer, panel, terms, 20.0, 0.25, 0.75);
+        let exposure = 100.0;
+
+        // Chronological events (as annual_events returns them). The 0.1 event is
+        // before inception and the 0.9 event after expiry — both skipped.
+        let events = [
+            CatastropheEvent { time: 0.1, damage_fraction: 1.0 }, // pre-inception
+            CatastropheEvent { time: 0.3, damage_fraction: 1.0 }, // in force: original limit
+            CatastropheEvent { time: 0.6, damage_fraction: 1.0 }, // in force: reinstatement
+            CatastropheEvent { time: 0.9, damage_fraction: 1.0 }, // post-expiry
+        ];
+
+        let mut syndicates = vec![Syndicate::with_capital(10_000.0)];
+        let settlements = placed.absorb_year(&events, exposure, &mut syndicates);
+
+        assert_eq!(settlements.len(), 4, "one settlement per event, in order");
+        // Out-of-force events generate nothing.
+        for skipped in [0usize, 3] {
+            assert!(settlements[skipped].claim.is_empty());
+            assert_eq!(settlements[skipped].reinstatement_premium, 0.0);
+            assert_eq!(settlements[skipped].uncovered, 0.0);
+        }
+        // The first in-force event uses the free original limit; the second triggers
+        // the reinstatement (charged 1.0 × 20 × 1.0 = 20).
+        assert_eq!(settlements[1].reinstatement_premium, 0.0);
+        assert!((settlements[2].reinstatement_premium - 20.0).abs() < 1e-9);
+        // Only the two in-force claims (100 each) were settled; one reinstatement
+        // credited 20 back.
+        assert!((syndicates[0].capital() - (10_000.0 - 200.0 + 20.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_quoted_premium_incorporates_the_expected_reinstatement_cost() {
+        // The quoted technical premium folds in the layer's reinstatement terms.
+        // Reinstatement premiums are extra income the layer collects when losses
+        // recur within the year, so a cat XoL layer carrying reinstatements quotes
+        // BELOW an otherwise-identical layer with none — the expected
+        // reinstatement-premium income credits the base price. The credit is
+        // model-anchored (read off the cat model, like the cat ELF) and wired into
+        // the same technical_premium path.
+        let model = cat_model();
+        let book = NetBook { lines: vec![] };
+        let exposure = 1_000.0;
+        let layer = Layer { attachment: 0.0, limit: 100.0 };
+        let experience = AttritionalExperience { own_burning_cost: 30.0, benchmark: 25.0, volume: 50.0 };
+        let params = PricingParams { hurdle_rate: 0.15, credibility_k: 10.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 8_000 };
+
+        let bare = LayerExposure { layer, exposure, territory: Territory(0), reinstatement: ReinstatementTerms::none() };
+        let with_reinstatement = LayerExposure {
+            layer,
+            exposure,
+            territory: Territory(0),
+            reinstatement: ReinstatementTerms { count: 1, factor: 1.0 },
+        };
+
+        let mut rng = Rng::seeded(2024);
+        let tp_bare = technical_premium(&bare, &book, &model, &experience, &params, &mut rng);
+        let mut rng = Rng::seeded(2024);
+        let tp_reinst = technical_premium(&with_reinstatement, &book, &model, &experience, &params, &mut rng);
+
+        // The bare layer carries no reinstatement credit and prices exactly as the
+        // pre-reinstatement TP (ATP + cost of capital).
+        assert_eq!(tp_bare.expected_reinstatement_credit, 0.0);
+        assert!((tp_bare.technical_premium - (tp_bare.actuarial_technical_price + tp_bare.cost_of_capital)).abs() < 1e-9);
+
+        // The reinstatement-bearing layer earns a positive expected credit, so it
+        // quotes strictly below the bare layer — the terms are reflected in price.
+        assert!(tp_reinst.expected_reinstatement_credit > 0.0, "a cat-exposed layer with reinstatements should expect reinstatement income");
+        assert!(
+            tp_reinst.technical_premium < tp_bare.technical_premium,
+            "reinstatement income should credit the quote: {} !< {}",
+            tp_reinst.technical_premium,
+            tp_bare.technical_premium
+        );
+        // The breakdown reconciles: TP = ATP + cost of capital − reinstatement credit.
+        assert!(
+            (tp_reinst.technical_premium
+                - (tp_reinst.actuarial_technical_price + tp_reinst.cost_of_capital
+                    - tp_reinst.expected_reinstatement_credit))
+                .abs()
+                < 1e-9
+        );
+
+        // The credit grows with the reinstatement factor (richer reinstatement
+        // terms move more income into the quote).
+        let dearer_reinstatement = LayerExposure {
+            layer,
+            exposure,
+            territory: Territory(0),
+            reinstatement: ReinstatementTerms { count: 1, factor: 2.0 },
+        };
+        let mut rng = Rng::seeded(2024);
+        let tp_dearer = technical_premium(&dearer_reinstatement, &book, &model, &experience, &params, &mut rng);
+        assert!(tp_dearer.expected_reinstatement_credit > tp_reinst.expected_reinstatement_credit);
+    }
+
+    #[test]
+    fn a_clustered_second_event_costs_the_insured_more_than_twice_a_single_event_year() {
+        // Within-year hardening — the non-linear cat-frequency penalty. The insured
+        // cost a reinstatement layer imposes is the reinstatement premiums it pays
+        // plus any loss left uncovered once cover is exhausted. The first event of a
+        // year sits within the free original limit (no reinstatement, fully
+        // covered), so a single-event year imposes NO such cost. A clustered SECOND
+        // event in the same year both draws a claim AND triggers a reinstatement
+        // premium — so a two-event year costs materially more than twice a
+        // single-event year. Spread one-per-year, those same events would each enjoy
+        // a fresh free limit and never harden the cover; clustering within the year
+        // is what bites.
+        let layer = Layer { attachment: 0.0, limit: 100.0 };
+        let terms = ReinstatementTerms { count: 1, factor: 1.0 };
+        let premium = 40.0;
+        let exposure = 100.0; // a damage fraction of 1.0 erodes the full limit
+        let panel = Panel::subscribe(&[SyndicateId(0)], 1.0);
+
+        // Insured cost of a profile of within-year events = reinstatement premiums
+        // paid + loss left uncovered. (Claims recovered are the cover working, not a
+        // cost to the insured.)
+        let insured_cost = |events: &[CatastropheEvent]| -> f64 {
+            let mut placed =
+                ReinstatementLayer::new(layer, panel.clone(), terms, premium, 0.0, 1.0);
+            let mut syndicates = vec![Syndicate::with_capital(1_000_000.0)];
+            placed
+                .absorb_year(events, exposure, &mut syndicates)
+                .iter()
+                .map(|s| s.reinstatement_premium + s.uncovered)
+                .sum()
+        };
+
+        let one_event = [CatastropheEvent { time: 0.3, damage_fraction: 1.0 }];
+        let two_events = [
+            CatastropheEvent { time: 0.3, damage_fraction: 1.0 },
+            CatastropheEvent { time: 0.6, damage_fraction: 1.0 },
+        ];
+        let three_events = [
+            CatastropheEvent { time: 0.2, damage_fraction: 1.0 },
+            CatastropheEvent { time: 0.5, damage_fraction: 1.0 },
+            CatastropheEvent { time: 0.8, damage_fraction: 1.0 },
+        ];
+
+        let single_cost = insured_cost(&one_event);
+        let clustered_cost = insured_cost(&two_events);
+        let triple_cost = insured_cost(&three_events);
+
+        // A single-event year imposes no reinstatement cost — the free original
+        // limit absorbs it.
+        assert_eq!(single_cost, 0.0, "one event sits within the free original limit");
+        // The clustered second event triggers a full reinstatement premium (100% of
+        // the original premium), a material cost a single-event year never pays.
+        assert!((clustered_cost - premium).abs() < 1e-9);
+        // The headline: a clustered two-event year costs materially more than twice
+        // a single-event year (within-year hardening).
+        assert!(
+            clustered_cost > 2.0 * single_cost,
+            "clustered two-event cost {clustered_cost} should exceed twice the single-event cost {single_cost}"
+        );
+
+        // Erosion compounds: a third clustered event finds the finite reinstatement
+        // exhausted, so on top of the reinstatement premium the insured retains a
+        // full uncovered limit — the cost escalates super-linearly with frequency,
+        // far beyond three times a single-event year.
+        assert!((triple_cost - (premium + layer.limit)).abs() < 1e-9);
+        assert!(triple_cost > 3.0 * single_cost + layer.limit);
+        assert!(triple_cost > 2.0 * clustered_cost, "the third event escalates the cost again");
     }
 }

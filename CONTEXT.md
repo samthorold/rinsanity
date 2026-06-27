@@ -24,7 +24,10 @@ _Avoid_: treating as ground truth.
 A syndicate's free exposure budget relative to its capital — how much more risk it can write before hitting its exposure limits. The local state that drives its AvT multiplier.
 
 **Genome**:
-A syndicate's vector of selectable per-syndicate parameters (AvT responsiveness, herding susceptibility, hurdle rate, credibility `k`, payout rule, reserving bias, cat-model parameters) on which market selection acts.
+A syndicate's vector of selectable per-syndicate parameters (AvT responsiveness, share-appetite, herding susceptibility, hurdle rate, credibility `k`, payout rule, reserving bias, cat-model parameters) on which market selection acts.
+
+**Share-appetite**:
+The target win-rate a syndicate's placement-feedback loop seeks: it lifts its AvT multiplier when it wins more than this share and cuts it when it wins less. A selectable genome trait — high appetite chases volume and runs soft, low appetite holds margin.
 
 ## Flagged ambiguities
 

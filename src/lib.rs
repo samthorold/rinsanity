@@ -1,7 +1,12 @@
-//! rinsanity substrate — the attritional loss path.
+//! rinsanity substrate — the loss architecture and placement/settlement cascade.
 //!
-//! See `docs/system-design/README.md` (*Loss architecture*, *Diagnostic
-//! invariants*) and `CONTEXT.md` for the vocabulary used here.
+//! Perils generate ground-up loss; a coverage request is satisfied by a tower of
+//! layers, each placed on a subscription panel; the settlement cascade pro-rates
+//! each penetrated layer's insured loss across its panel against the zero floor.
+//!
+//! See `docs/system-design/README.md` (*Loss architecture*, *Layers and towers*,
+//! *Panels and the settlement cascade*, *Capital, insolvency, and runoff*,
+//! *Diagnostic invariants*) and `CONTEXT.md` for the vocabulary used here.
 
 /// The ground-up loss of an occurrence on an asset: the physical damage,
 /// independent of any insurance. `GUL = damage_fraction × sum_insured`, and
@@ -35,6 +40,37 @@ impl Layer {
     pub fn insured_loss(&self, ground_up_loss: f64) -> f64 {
         let gross = ground_up_loss.min(self.attachment + self.limit);
         (gross - self.attachment).max(0.0)
+    }
+}
+
+/// A tower: a vertical stack of consecutive layers `[0, a₁], [a₁, a₂], …`, each
+/// an independent contract over the same underlying ground-up loss. The unit a
+/// coverage request is satisfied by. A single occurrence's GUL flows up the
+/// tower deterministically — each layer bears `clamp(GUL − attachment, 0, limit)`
+/// — so the tower's aggregate payout is `min(GUL, top of tower)` and never
+/// exceeds the ground-up loss.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tower {
+    pub layers: Vec<Layer>,
+}
+
+impl Tower {
+    /// A tower from a stack of layers, bottom (lowest attachment) first.
+    pub fn new(layers: Vec<Layer>) -> Self {
+        Tower { layers }
+    }
+
+    /// The insured loss each layer bears for a given ground-up loss, in tower
+    /// order. Each layer is independent: GUL flows up via [`Layer::insured_loss`].
+    pub fn insured_losses(&self, ground_up_loss: f64) -> Vec<f64> {
+        self.layers.iter().map(|layer| layer.insured_loss(ground_up_loss)).collect()
+    }
+
+    /// The tower's total insured loss across all its layers for a given
+    /// ground-up loss. For a stack of consecutive layers this is
+    /// `min(GUL, top of tower)`, so it never exceeds the ground-up loss.
+    pub fn aggregate_insured_loss(&self, ground_up_loss: f64) -> f64 {
+        self.insured_losses(ground_up_loss).iter().sum()
     }
 }
 
@@ -364,6 +400,131 @@ impl Syndicate {
         self.capital -= settled;
         Settlement { settled, shortfall: claim_share - settled }
     }
+}
+
+/// A syndicate's identity within the market's roster — an index into the slice
+/// of syndicates a placement is settled against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyndicateId(pub usize);
+
+/// A single subscription on a panel: a syndicate and the fraction of the layer
+/// it has taken. Shares across a panel sum to the placed portion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanelEntry {
+    pub syndicate: SyndicateId,
+    pub share: f64,
+}
+
+/// A subscription panel: an ordered set of `(syndicate, share)` entries whose
+/// shares sum to the placed portion, with the first entry designated **lead**
+/// and the rest **followers**. Single-syndicate placement is a panel of one, not
+/// a separate mode. The substrate owns the panel representation and the pro-rata
+/// settlement; how a panel is formed or priced is agent logic in higher layers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Panel {
+    pub entries: Vec<PanelEntry>,
+}
+
+impl Panel {
+    /// The trivial deterministic placement rule used until pricing exists: split
+    /// the `placed_portion` into equal shares over the shortlisted syndicates in
+    /// order, designating the first as lead and the rest as followers. The
+    /// shortlist order is preserved.
+    pub fn subscribe(syndicates: &[SyndicateId], placed_portion: f64) -> Self {
+        let n = syndicates.len();
+        let share = if n == 0 { 0.0 } else { placed_portion / n as f64 };
+        let entries = syndicates
+            .iter()
+            .map(|&syndicate| PanelEntry { syndicate, share })
+            .collect();
+        Panel { entries }
+    }
+
+    /// The lead — the first entry on the panel.
+    pub fn lead(&self) -> &PanelEntry {
+        &self.entries[0]
+    }
+
+    /// The followers — every entry after the lead.
+    pub fn followers(&self) -> &[PanelEntry] {
+        &self.entries[1..]
+    }
+
+    /// The placed portion of the layer: the sum of the panel's shares.
+    pub fn placed_portion(&self) -> f64 {
+        self.entries.iter().map(|e| e.share).sum()
+    }
+
+    /// Pro-rate a layer's net insured loss across the panel by share, debiting
+    /// each subscriber's capital its share (`share × insured_loss`) against the
+    /// zero floor. Returns one settlement per entry, in panel order.
+    ///
+    /// Liability is **several, not joint**: each member settles its own share
+    /// independently, so an insolvent member's shortfall falls on the insured and
+    /// is never redistributed to co-subscribers. On a fully placed panel the
+    /// settled amounts sum to the insured loss (up to rounding).
+    pub fn settle(&self, insured_loss: f64, syndicates: &mut [Syndicate]) -> Vec<Settlement> {
+        self.entries
+            .iter()
+            .map(|entry| syndicates[entry.syndicate.0].settle(entry.share * insured_loss))
+            .collect()
+    }
+}
+
+/// The syndicates available to write new business: the solvent members of the
+/// roster, in roster order. An insolvent syndicate is in **runoff** — it writes
+/// no new business — so it is excluded here, while [`settle_placed_tower`] still
+/// settles its in-force layers until they expire.
+pub fn available_for_new_business(syndicates: &[Syndicate]) -> Vec<SyndicateId> {
+    syndicates
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_solvent())
+        .map(|(i, _)| SyndicateId(i))
+        .collect()
+}
+
+/// A placed layer: a layer bound to a subscription panel for an annual term with
+/// explicit per-policy inception and expiry dates. A tower is a stack of these.
+/// The substrate honours whatever dates a policy carries; it never decides them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedLayer {
+    pub layer: Layer,
+    pub panel: Panel,
+    /// When cover incepts, as a within-year fraction.
+    pub inception: f64,
+    /// When cover expires (exclusive), as a within-year fraction.
+    pub expiry: f64,
+}
+
+impl PlacedLayer {
+    /// Whether the layer is on risk at `date`: `inception ≤ date < expiry`.
+    /// Outside this window the layer generates no claims.
+    pub fn is_in_force(&self, date: f64) -> bool {
+        self.inception <= date && date < self.expiry
+    }
+}
+
+/// The settlement cascade for a placed tower: flow a ground-up loss up the tower
+/// at a `date`, settling each **in-force** layer's net insured loss on its panel
+/// against the roster of `syndicates`. Expired (or not-yet-incepted) layers
+/// generate no claims and are skipped. Returns the settlements of every panel
+/// entry that was debited, in tower-then-panel order.
+pub fn settle_placed_tower(
+    tower: &[PlacedLayer],
+    ground_up_loss: f64,
+    date: f64,
+    syndicates: &mut [Syndicate],
+) -> Vec<Settlement> {
+    let mut settlements = Vec::new();
+    for placed in tower {
+        if !placed.is_in_force(date) {
+            continue;
+        }
+        let insured_loss = placed.layer.insured_loss(ground_up_loss);
+        settlements.extend(placed.panel.settle(insured_loss, syndicates));
+    }
+    settlements
 }
 
 #[cfg(test)]
@@ -751,5 +912,277 @@ mod tests {
         assert_eq!(settlement.shortfall, 150.0);
         assert_eq!(syndicate.capital(), 0.0);
         assert!(!syndicate.is_solvent());
+    }
+
+    #[test]
+    fn the_full_cascade_settles_a_multi_layer_tower_on_multi_member_panels() {
+        // End-to-end settlement invariant: a GUL flows up a placed tower whose
+        // layers sit on multi-member panels; each penetrated, in-force layer's
+        // settled amounts sum to its insured loss, and the tower's total payout
+        // never exceeds the GUL.
+        let tower = vec![
+            PlacedLayer {
+                layer: Layer { attachment: 0.0, limit: 100.0 },
+                panel: Panel::subscribe(&[SyndicateId(0), SyndicateId(1)], 1.0),
+                inception: 0.0,
+                expiry: 1.0,
+            },
+            PlacedLayer {
+                layer: Layer { attachment: 100.0, limit: 300.0 },
+                panel: Panel::subscribe(&[SyndicateId(1), SyndicateId(2), SyndicateId(0)], 1.0),
+                inception: 0.0,
+                expiry: 1.0,
+            },
+        ];
+        let gul = 250.0; // fills layer 0 (100), penetrates layer 1 by 150
+        let mut syndicates = vec![
+            Syndicate::with_capital(1_000.0),
+            Syndicate::with_capital(1_000.0),
+            Syndicate::with_capital(1_000.0),
+        ];
+
+        let settlements = settle_placed_tower(&tower, gul, 0.5, &mut syndicates);
+
+        // Per-layer panel sizes: 2 + 3 entries all in force.
+        assert_eq!(settlements.len(), 5);
+        // Settled amounts across the whole tower sum to the tower's aggregate
+        // insured loss (fully placed, all solvent), which is min(GUL, top) = 250.
+        let total_settled: f64 = settlements.iter().map(|s| s.settled).sum();
+        let aggregate = Tower::new(tower.iter().map(|p| p.layer).collect()).aggregate_insured_loss(gul);
+        assert!((total_settled - aggregate).abs() < 1e-9);
+        assert!((total_settled - 250.0).abs() < 1e-9);
+        // The tower never pays more than the ground-up loss.
+        assert!(total_settled <= gul + 1e-9);
+        // No shortfalls while every member is well capitalised.
+        assert!(settlements.iter().all(|s| s.shortfall == 0.0));
+    }
+
+    #[test]
+    fn ground_up_loss_flows_up_a_tower_of_consecutive_layers() {
+        // A tower is a stack of independent layers over the same ground-up loss.
+        // Bands [0, 100], [100, 400], [400, 1000]: a GUL of 600 fills the first
+        // two layers and penetrates the third by 200.
+        let tower = Tower::new(vec![
+            Layer { attachment: 0.0, limit: 100.0 },
+            Layer { attachment: 100.0, limit: 300.0 },
+            Layer { attachment: 400.0, limit: 600.0 },
+        ]);
+        let losses = tower.insured_losses(600.0);
+        assert_eq!(losses, vec![100.0, 300.0, 200.0]);
+        // The tower's aggregate payout equals min(GUL, top of tower) and so never
+        // exceeds the ground-up loss.
+        assert_eq!(tower.aggregate_insured_loss(600.0), 600.0);
+    }
+
+    #[test]
+    fn a_panel_subscribes_equal_shares_summing_to_the_placed_portion() {
+        // The trivial deterministic placement rule: the broker assembles a panel
+        // of equal shares over the shortlisted syndicates, summing to the placed
+        // portion, with the first designated lead and the rest followers.
+        let panel = Panel::subscribe(
+            &[SyndicateId(2), SyndicateId(0), SyndicateId(1)],
+            1.0,
+        );
+        // Shares sum to the placed portion (fully placed here).
+        assert!((panel.placed_portion() - 1.0).abs() < 1e-12);
+        // Equal shares.
+        for entry in &panel.entries {
+            assert!((entry.share - 1.0 / 3.0).abs() < 1e-12);
+        }
+        // First is lead, the rest are followers, preserving the shortlist order.
+        assert_eq!(panel.lead().syndicate, SyndicateId(2));
+        let followers: Vec<SyndicateId> = panel.followers().iter().map(|e| e.syndicate).collect();
+        assert_eq!(followers, vec![SyndicateId(0), SyndicateId(1)]);
+    }
+
+    #[test]
+    fn a_panel_of_one_is_a_lead_with_no_followers() {
+        // Single-syndicate placement is a panel of one, not a separate mode.
+        let panel = Panel::subscribe(&[SyndicateId(7)], 0.8);
+        assert_eq!(panel.lead().syndicate, SyndicateId(7));
+        assert!((panel.lead().share - 0.8).abs() < 1e-12);
+        assert!(panel.followers().is_empty());
+        assert!((panel.placed_portion() - 0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn settlement_pro_rates_a_layer_loss_across_the_panel_by_share() {
+        // A penetrated layer's net insured loss is pro-rated across its panel by
+        // share; each syndicate's capital is debited its share, and the settled
+        // amounts sum to the layer's insured loss (a fully placed panel).
+        let panel = Panel::subscribe(&[SyndicateId(0), SyndicateId(1), SyndicateId(2)], 1.0);
+        let mut syndicates = vec![
+            Syndicate::with_capital(10_000.0),
+            Syndicate::with_capital(10_000.0),
+            Syndicate::with_capital(10_000.0),
+        ];
+        let insured_loss = 900.0;
+        let settlements = panel.settle(insured_loss, &mut syndicates);
+
+        // Each member pays its share of the loss.
+        for s in &settlements {
+            assert!((s.settled - 300.0).abs() < 1e-9);
+            assert_eq!(s.shortfall, 0.0);
+        }
+        // The settled amounts sum to the layer's insured loss.
+        let total: f64 = settlements.iter().map(|s| s.settled).sum();
+        assert!((total - insured_loss).abs() < 1e-9);
+        // Capital is debited by each member's share.
+        for s in &syndicates {
+            assert!((s.capital() - 9_700.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn several_liability_leaves_an_insolvent_members_shortfall_with_the_insured() {
+        // Zero-floor partial settlement under several liability: an insolvent
+        // member pays min(share·loss, capital); the remainder is an unrecovered
+        // shortfall borne by the insured, NEVER redistributed to co-subscribers.
+        let panel = Panel::subscribe(&[SyndicateId(0), SyndicateId(1), SyndicateId(2)], 1.0);
+        let mut syndicates = vec![
+            Syndicate::with_capital(10_000.0), // solvent co-subscriber
+            Syndicate::with_capital(100.0),    // undercapitalised: share is 300
+            Syndicate::with_capital(10_000.0), // solvent co-subscriber
+        ];
+        let insured_loss = 900.0; // each share = 300
+
+        let settlements = panel.settle(insured_loss, &mut syndicates);
+
+        // The insolvent member pays only what it has; the rest is its shortfall.
+        assert_eq!(settlements[1].settled, 100.0);
+        assert!((settlements[1].shortfall - 200.0).abs() < 1e-9);
+        assert_eq!(syndicates[1].capital(), 0.0);
+        assert!(!syndicates[1].is_solvent());
+
+        // Co-subscribers pay exactly their own share — the shortfall is NOT
+        // redistributed onto them.
+        assert!((settlements[0].settled - 300.0).abs() < 1e-9);
+        assert!((settlements[2].settled - 300.0).abs() < 1e-9);
+        assert_eq!(settlements[0].shortfall, 0.0);
+        assert_eq!(settlements[2].shortfall, 0.0);
+        assert!((syndicates[0].capital() - 9_700.0).abs() < 1e-9);
+        assert!((syndicates[2].capital() - 9_700.0).abs() < 1e-9);
+
+        // The insured bears the gap: settled + shortfall reconstruct the loss.
+        let settled: f64 = settlements.iter().map(|s| s.settled).sum();
+        let shortfall: f64 = settlements.iter().map(|s| s.shortfall).sum();
+        assert!((settled - 700.0).abs() < 1e-9);
+        assert!((shortfall - 200.0).abs() < 1e-9);
+        assert!((settled + shortfall - insured_loss).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_placed_layer_is_in_force_only_between_inception_and_expiry() {
+        let placed = PlacedLayer {
+            layer: Layer { attachment: 0.0, limit: 100.0 },
+            panel: Panel::subscribe(&[SyndicateId(0)], 1.0),
+            inception: 0.25,
+            expiry: 0.75,
+        };
+        assert!(!placed.is_in_force(0.1)); // before inception
+        assert!(placed.is_in_force(0.25)); // at inception
+        assert!(placed.is_in_force(0.5)); // mid-term
+        assert!(!placed.is_in_force(0.75)); // at expiry (exclusive)
+        assert!(!placed.is_in_force(0.9)); // after expiry
+    }
+
+    #[test]
+    fn the_cascade_settles_in_force_layers_and_expired_layers_generate_no_claims() {
+        // The settlement cascade flows a GUL up a placed tower at a date: in-force
+        // layers settle on their panels; expired layers generate no claims.
+        let tower = vec![
+            PlacedLayer {
+                layer: Layer { attachment: 0.0, limit: 100.0 },
+                panel: Panel::subscribe(&[SyndicateId(0)], 1.0),
+                inception: 0.0,
+                expiry: 1.0, // in force at the settlement date
+            },
+            PlacedLayer {
+                layer: Layer { attachment: 100.0, limit: 300.0 },
+                panel: Panel::subscribe(&[SyndicateId(1)], 1.0),
+                inception: 0.0,
+                expiry: 0.5, // already expired at the settlement date
+            },
+        ];
+        let mut syndicates = vec![
+            Syndicate::with_capital(10_000.0),
+            Syndicate::with_capital(10_000.0),
+        ];
+
+        // GUL of 600 would fill layer 0 (100) and penetrate layer 1 (300).
+        let settlements = settle_placed_tower(&tower, 600.0, 0.7, &mut syndicates);
+
+        // Only the in-force layer settles.
+        assert_eq!(settlements.len(), 1);
+        assert!((settlements[0].settled - 100.0).abs() < 1e-9);
+        // Layer 0's panel member is debited; the expired layer's member is not.
+        assert!((syndicates[0].capital() - 9_900.0).abs() < 1e-9);
+        assert_eq!(syndicates[1].capital(), 10_000.0);
+    }
+
+    #[test]
+    fn an_insolvent_syndicate_in_runoff_writes_no_new_business() {
+        // Insolvency triggers runoff: the syndicate is no longer available for new
+        // placements, so panel formation draws only from the solvent roster.
+        let syndicates = vec![
+            Syndicate::with_capital(10_000.0),
+            Syndicate::with_capital(0.0), // insolvent → in runoff
+            Syndicate::with_capital(10_000.0),
+        ];
+        let available = available_for_new_business(&syndicates);
+        assert_eq!(available, vec![SyndicateId(0), SyndicateId(2)]);
+
+        // A new panel formed from the available roster excludes the runoff member.
+        let panel = Panel::subscribe(&available, 1.0);
+        assert!(panel.entries.iter().all(|e| e.syndicate != SyndicateId(1)));
+    }
+
+    #[test]
+    fn a_syndicate_in_runoff_settles_in_force_layers_until_they_expire() {
+        // Runoff is a gradual withdrawal: an insolvent syndicate still settles its
+        // in-force layers (against the zero floor) until they expire; expired
+        // layers generate no claims. Here the syndicate is already exhausted, so
+        // the in-force layer is still processed but pays nothing — the shortfall
+        // falls to the insured — while the expired layer is skipped entirely.
+        let tower = vec![
+            PlacedLayer {
+                layer: Layer { attachment: 0.0, limit: 100.0 },
+                panel: Panel::subscribe(&[SyndicateId(0)], 1.0),
+                inception: 0.0,
+                expiry: 1.0, // still in force
+            },
+            PlacedLayer {
+                layer: Layer { attachment: 100.0, limit: 300.0 },
+                panel: Panel::subscribe(&[SyndicateId(0)], 1.0),
+                inception: 0.0,
+                expiry: 0.5, // already expired
+            },
+        ];
+        let mut syndicates = vec![Syndicate::with_capital(0.0)]; // in runoff
+        assert!(!syndicates[0].is_solvent());
+
+        let settlements = settle_placed_tower(&tower, 600.0, 0.7, &mut syndicates);
+
+        // The in-force layer is still settled (the obligation survives runoff),
+        // paying nothing with the whole loss recorded as an unrecovered shortfall.
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].settled, 0.0);
+        assert!((settlements[0].shortfall - 100.0).abs() < 1e-9);
+        // The expired layer generated no claim at all.
+    }
+
+    #[test]
+    fn a_tower_never_pays_more_in_aggregate_than_the_ground_up_loss() {
+        // Even a GUL beyond the top of the tower is capped at the tower's limit,
+        // which is below the GUL — the aggregate can never exceed the GUL.
+        let tower = Tower::new(vec![
+            Layer { attachment: 0.0, limit: 100.0 },
+            Layer { attachment: 100.0, limit: 300.0 },
+        ]);
+        for &gul in &[0.0, 50.0, 250.0, 400.0, 1_000.0] {
+            assert!(tower.aggregate_insured_loss(gul) <= gul);
+        }
+        // A GUL above the tower top (400) is capped at 400.
+        assert_eq!(tower.aggregate_insured_loss(1_000.0), 400.0);
     }
 }

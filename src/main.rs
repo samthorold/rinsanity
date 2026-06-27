@@ -10,14 +10,17 @@
 //! real in the model.
 
 use rinsanity::{
-    attritional_aggregate_samples, catastrophe_aggregate_samples, coefficient_of_variation,
-    AttritionalPeril, CatastrophePeril, Rng,
+    anchored_quote, attritional_aggregate_samples, catastrophe_aggregate_samples,
+    coefficient_of_variation, follower_weight, AttritionalPeril, Broker, CatastrophePeril,
+    RelationshipOutcome, Rng, SyndicateId,
 };
 
 fn main() {
     attritional_diagnostic();
     println!();
     catastrophe_diagnostic();
+    println!();
+    placement_demonstration();
 }
 
 fn attritional_diagnostic() {
@@ -91,4 +94,42 @@ fn catastrophe_diagnostic() {
     println!();
     println!("Flat in N (shared draw) but falling in T (diversification across zones):");
     println!("the catastrophe component does NOT pool with size, only with spread.");
+}
+
+fn placement_demonstration() {
+    // The placement loop's two emergent behaviours, both fast and deterministic.
+    println!("Placement loop — herding (#3) and relationship stickiness (#5)");
+    println!();
+
+    // Herding: followers with dispersed beliefs but poor own info cluster their
+    // quotes behind a reputable lead, with a DERIVED weight w (not a constant).
+    let own_beliefs = [80.0, 100.0, 120.0, 140.0];
+    let lead_quote = 100.0;
+    let w_herd = follower_weight(0.1, 0.9, 1.0); // low own-confidence, reputable lead
+    let w_indep = follower_weight(0.95, 0.9, 1.0); // confident followers
+    let clustered: Vec<f64> = own_beliefs.iter().map(|&p| anchored_quote(p, lead_quote, w_herd)).collect();
+    let dispersed: Vec<f64> = own_beliefs.iter().map(|&p| anchored_quote(p, lead_quote, w_indep)).collect();
+    println!("Follower beliefs (dispersed):    {own_beliefs:?}  CV={:.3}", coefficient_of_variation(&own_beliefs));
+    println!("Low confidence, reputable lead:  w={w_herd:.2} -> quotes {:?}  CV={:.3}", round2(&clustered), coefficient_of_variation(&clustered));
+    println!("High confidence (own info good): w={w_indep:.2} -> quotes {:?}  CV={:.3}", round2(&dispersed), coefficient_of_variation(&dispersed));
+    println!("=> w is derived; poor info + reputable lead clusters PRICE (beliefs untouched).");
+    println!();
+
+    // Stickiness: a loyal broker keeps leading its incumbent for years even as a
+    // brand-new challenger wins every renewal — relationships trail, slowly.
+    let mut broker = Broker::new(vec![0.8, 0.0], 0.9);
+    let (incumbent, challenger) = (SyndicateId(0), SyndicateId(1));
+    println!("Year-end relationship scores (incumbent vs winning challenger), inertia=0.9:");
+    println!("{:>5}  {:>10}  {:>10}  {:>8}", "year", "incumbent", "challenger", "lead");
+    for year in 0..12 {
+        let lead = if broker.relationship(incumbent) >= broker.relationship(challenger) { "incumbent" } else { "challenger" };
+        println!("{year:>5}  {:>10.3}  {:>10.3}  {lead:>8}", broker.relationship(incumbent), broker.relationship(challenger));
+        broker.update_relationship(challenger, RelationshipOutcome { quoted: true, won: true, solvent: true });
+        broker.update_relationship(incumbent, RelationshipOutcome { quoted: true, won: false, solvent: true });
+    }
+    println!("=> the incumbent retains the lead for years; share adjusts slowly, not instantly.");
+}
+
+fn round2(xs: &[f64]) -> Vec<f64> {
+    xs.iter().map(|x| (x * 100.0).round() / 100.0).collect()
 }

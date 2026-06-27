@@ -972,6 +972,301 @@ pub fn technical_premium(
     }
 }
 
+/// A **broker**: a stateful intermediary agent that routes coverage requests to
+/// syndicates. It holds a **relationship score per syndicate** (indexed by
+/// [`SyndicateId`]) and a **broker-level update inertia** governing how slowly
+/// those scores move at year-end. Several brokers coexist with heterogeneous
+/// relationship portfolios, so different brokers favour different syndicates;
+/// that heterogeneity is part of the network topology herding (#3) and
+/// stickiness (#5) live on. Routing is relationship-driven — never price-driven.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Broker {
+    /// Relationship score per syndicate, indexed by `SyndicateId.0`. Higher is a
+    /// stronger relationship. New entrants (and syndicates beyond the known
+    /// roster) score zero — relationships are earned, not given.
+    relationships: Vec<f64>,
+    /// Year-end update inertia in `[0, 1]`: the weight kept on the old score when
+    /// blending in the year's signal. High inertia → sticky relationships that
+    /// trail the competitive landscape, which is where renewal stickiness (#5)
+    /// emerges. A per-broker parameter, so brokers differ in loyalty.
+    pub inertia: f64,
+}
+
+/// A syndicate's year's **relationship outcome** with a broker, the signal the
+/// year-end relationship update reads. Trust is raised by competitive quoting
+/// and winning placements (and sustained by staying solvent — paying claims
+/// reliably) and eroded by declining business or, worst of all, going insolvent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RelationshipOutcome {
+    /// The syndicate quoted competitively on the broker's business this year.
+    pub quoted: bool,
+    /// The syndicate won at least one placement from the broker this year.
+    pub won: bool,
+    /// The syndicate remained solvent (able to pay claims) through the year.
+    pub solvent: bool,
+}
+
+impl RelationshipOutcome {
+    /// The target the relationship score is nudged toward, in `[0, 1]`: insolvency
+    /// is the strongest erosion (0); winning is the strongest reinforcement (1);
+    /// quoting-but-losing is mildly positive (engaged but unsuccessful); a year
+    /// with no engagement erodes toward zero.
+    fn signal(&self) -> f64 {
+        if !self.solvent {
+            0.0
+        } else if self.won {
+            1.0
+        } else if self.quoted {
+            0.6
+        } else {
+            0.1
+        }
+    }
+}
+
+impl Broker {
+    /// A broker with the given starting relationship scores and update inertia.
+    pub fn new(relationships: Vec<f64>, inertia: f64) -> Self {
+        Broker { relationships, inertia }
+    }
+
+    /// The broker's relationship score with a syndicate. Syndicates beyond the
+    /// known roster score zero (an unknown is a new relationship).
+    pub fn relationship(&self, syndicate: SyndicateId) -> f64 {
+        self.relationships.get(syndicate.0).copied().unwrap_or(0.0)
+    }
+
+    /// Update the broker's relationship with a syndicate at year-end from the
+    /// year's [`RelationshipOutcome`], blending the old score toward the outcome's
+    /// signal with the broker's inertia: `new = inertia·old + (1 − inertia)·signal`.
+    /// High inertia makes the score trail the competitive landscape, which is
+    /// where renewal stickiness (#5) emerges — the lag is the mechanism, not a
+    /// hardcoded stickiness factor. Grows the roster if it sees a new syndicate.
+    pub fn update_relationship(&mut self, syndicate: SyndicateId, outcome: RelationshipOutcome) {
+        if syndicate.0 >= self.relationships.len() {
+            self.relationships.resize(syndicate.0 + 1, 0.0);
+        }
+        let signal = outcome.signal();
+        let old = self.relationships[syndicate.0];
+        self.relationships[syndicate.0] = self.inertia * old + (1.0 - self.inertia) * signal;
+    }
+
+    /// A **relationship-weighted shortlist** of up to `size` of the `capable`
+    /// syndicates (those already filtered for solvency, line, and zone), ordered
+    /// **lead-first**: the lead is the strongest relationship on the shortlist,
+    /// the rest are followers in descending relationship order.
+    ///
+    /// Selection is a weighted sample **without replacement**, each syndicate's
+    /// inclusion weight rising with its relationship score. A small floor on the
+    /// weight keeps new entrants (relationship zero) shortlisted *rarely but not
+    /// never*, so they can build relationships over years — the relational half
+    /// of the counter-cyclical entry lag (#6). Crucially, **price is not an
+    /// input**: routing does relationship-driven shortlisting and lead
+    /// designation only; which quote wins is the insured's separate clearing
+    /// decision, so routing stickiness (#5) never entangles with price selection.
+    pub fn shortlist(&self, capable: &[SyndicateId], size: usize, rng: &mut Rng) -> Vec<SyndicateId> {
+        // A small floor relative to the strongest relationship: a zero-score
+        // entrant keeps a slim, non-zero chance of inclusion against incumbents.
+        let max_rel = capable.iter().map(|&s| self.relationship(s)).fold(0.0_f64, f64::max);
+        let floor = 0.01 * max_rel.max(1.0);
+
+        let mut pool: Vec<(SyndicateId, f64)> =
+            capable.iter().map(|&s| (s, self.relationship(s) + floor)).collect();
+        let mut chosen: Vec<SyndicateId> = Vec::new();
+        while chosen.len() < size && !pool.is_empty() {
+            let total: f64 = pool.iter().map(|(_, w)| w).sum();
+            let mut target = rng.uniform() * total;
+            let mut picked = pool.len() - 1;
+            for (i, (_, w)) in pool.iter().enumerate() {
+                target -= w;
+                if target <= 0.0 {
+                    picked = i;
+                    break;
+                }
+            }
+            chosen.push(pool.remove(picked).0);
+        }
+        // Order lead-first by relationship: the strongest credible relationship
+        // leads, the rest follow.
+        chosen.sort_by(|&a, &b| {
+            self.relationship(b)
+                .partial_cmp(&self.relationship(a))
+                .expect("relationship scores are finite")
+        });
+        chosen
+    }
+}
+
+/// A syndicate's **quote** on a layer: the syndicate and the price it offers.
+/// The unit the insured clears on and the lead the followers anchor toward.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quote {
+    pub syndicate: SyndicateId,
+    pub price: f64,
+}
+
+/// A syndicate's **blind quote**: its own technical premium scaled by its **ask
+/// multiplier** (the AvT lever; 1.0 until the cycle layer moves it), computed
+/// from its own TP alone. "Blind" is structural — this sees no other quote — so
+/// the lead's quote can never be a reaction to a rival's. Followers also start
+/// from their own blind quote before anchoring (see [`anchored_quote`]).
+pub fn blind_quote(syndicate: SyndicateId, technical_premium: f64, ask_multiplier: f64) -> Quote {
+    Quote { syndicate, price: technical_premium * ask_multiplier }
+}
+
+/// The **derived follower weight** `w ∈ [0, 1]` a follower places on the lead's
+/// quote when anchoring its own (see [`anchored_quote`]). It is computed, never
+/// a fixed constant — a fixed herding weight would make herding (#3)
+/// tautological. It rises when the follower's **own estimate is low-confidence**
+/// (`1 − own_confidence`, the same information-content logic as credibility:
+/// thin own data leans on the lead) and when the **lead is more reputable**
+/// (`lead_reputation`), and is scaled by the follower's per-syndicate **herding
+/// susceptibility** (a genome parameter). `own_confidence` and `lead_reputation`
+/// are expected in `[0, 1]`; the product is clamped into `[0, 1]`.
+pub fn follower_weight(own_confidence: f64, lead_reputation: f64, herding_susceptibility: f64) -> f64 {
+    (herding_susceptibility * (1.0 - own_confidence) * lead_reputation).clamp(0.0, 1.0)
+}
+
+/// A follower's **anchored quote**: its own blind price pulled toward the lead's
+/// observed quote by the derived weight `w` (see [`follower_weight`]),
+/// `(1 − w)·own_price + w·lead_quote`. The blend moves **price, not belief** — it
+/// consumes only prices, so a follower's cat-model parameters are untouched. This
+/// is where herding (#3) emerges, and confining it to price keeps it orthogonal
+/// to cat-model homogeneity (#14).
+pub fn anchored_quote(own_price: f64, lead_quote: f64, w: f64) -> f64 {
+    (1.0 - w) * own_price + w * lead_quote
+}
+
+/// A follower's response on a placement: either an (anchored) [`Quote`] or a
+/// decline carrying the [`DeclineReason`] from its own exposure policy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FollowerResponse {
+    Quote(Quote),
+    Decline(DeclineReason),
+}
+
+/// A follower's placement response, composing capacity discipline with herding.
+/// The follower first applies its OWN exposure limits (the `exposure` decision,
+/// produced by [`ExposurePolicy::assess`]): on a decline it drops off the panel
+/// regardless of the lead — herding moves price, never capacity discipline. On
+/// accept it quotes its own blind `own_price` **anchored** toward `lead_quote`
+/// by the derived weight `w` (see [`anchored_quote`]).
+pub fn follower_response(
+    follower: SyndicateId,
+    own_price: f64,
+    lead_quote: f64,
+    w: f64,
+    exposure: UnderwritingDecision,
+) -> FollowerResponse {
+    match exposure {
+        UnderwritingDecision::Decline(reason) => FollowerResponse::Decline(reason),
+        UnderwritingDecision::Accept => FollowerResponse::Quote(Quote {
+            syndicate: follower,
+            price: anchored_quote(own_price, lead_quote, w),
+        }),
+    }
+}
+
+/// An **insured**: the demand-side agent seeking cover. It carries a private
+/// **risk-aversion loading** (`> 1`) and an **expected loss** on the cover it
+/// wants; its **willingness-to-pay** is the product. WTP is a stable preference —
+/// an insured's own losses enter the market through experience rating on the
+/// supply side (see [`experience_modifier`]), not by perturbing WTP.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Insured {
+    /// Risk-aversion loading on expected loss, `> 1`.
+    pub risk_aversion: f64,
+    /// The insured's expected annual loss on the cover sought.
+    pub expected_loss: f64,
+}
+
+impl Insured {
+    /// The insured's **willingness-to-pay**: `risk_aversion × expected_loss`. The
+    /// ceiling on any premium it will accept.
+    pub fn willingness_to_pay(&self) -> f64 {
+        self.risk_aversion * self.expected_loss
+    }
+}
+
+/// **Clearing**: the insured takes the **cheapest** quote at or below `wtp`, or
+/// `None` if every quote exceeds it. Clearing is a demand-side decision distinct
+/// from routing — the relationship-designated lead does not win on its status, so
+/// routing stickiness (#5) never entangles with price selection.
+pub fn clear_cheapest(quotes: &[Quote], wtp: f64) -> Option<Quote> {
+    quotes
+        .iter()
+        .filter(|q| q.price <= wtp)
+        .min_by(|a, b| a.price.partial_cmp(&b.price).expect("prices are finite"))
+        .copied()
+}
+
+/// One band of an insured's desired tower as offered to it: the [`Layer`], the
+/// **expected loss** it covers (its value to the insured), and the **cleared
+/// price** for that band (the cheapest acceptable quote on it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TowerLayerOffer {
+    pub layer: Layer,
+    pub expected_loss: f64,
+    pub price: f64,
+}
+
+/// The outcome of an insured structuring its tower against its WTP budget.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TowerPurchase {
+    /// The bands bound (a subset of those offered when restructured) and the
+    /// total premium paid.
+    Bound { layers: Vec<Layer>, total_price: f64 },
+    /// No band was affordable within WTP — the insured self-insures entirely.
+    Declined,
+}
+
+/// **Demand-side restructuring**: the insured fits its tower to a `wtp` budget.
+/// If the whole offered tower fits, it buys all of it. Otherwise it drops the
+/// **worst value-for-money** band (highest price-to-expected-loss ratio) and
+/// retries — the fine-grained quantity elasticity that raises retention, lowers
+/// limit, or self-insures a tranche when prices spike, damping apparent
+/// hard-market profitability (#1). If not even one band fits, it declines.
+pub fn restructure_tower(offers: &[TowerLayerOffer], wtp: f64) -> TowerPurchase {
+    let mut kept: Vec<&TowerLayerOffer> = offers.iter().collect();
+    // Worst value-for-money first, so popping from the end drops it.
+    kept.sort_by(|a, b| {
+        let la = a.price / a.expected_loss.max(f64::MIN_POSITIVE);
+        let lb = b.price / b.expected_loss.max(f64::MIN_POSITIVE);
+        la.partial_cmp(&lb).expect("loadings are finite")
+    });
+    while !kept.is_empty() {
+        let total: f64 = kept.iter().map(|o| o.price).sum();
+        if total <= wtp {
+            let mut layers: Vec<Layer> = kept.iter().map(|o| o.layer).collect();
+            // Restore tower order (ascending attachment) for the bound layers.
+            layers.sort_by(|a, b| a.attachment.partial_cmp(&b.attachment).expect("attachments are finite"));
+            return TowerPurchase::Bound { layers, total_price: total };
+        }
+        kept.pop(); // drop the worst value-for-money band and retry
+    }
+    TowerPurchase::Declined
+}
+
+/// The **experience-rating modifier** a syndicate applies to its loss-cost
+/// estimate for a *specific* risk, given that insured's own **loss history**
+/// (#9). It credibility-weights the insured's realised loss relativity
+/// (`own_losses / expected_losses`) against unity: `(1 − Z) · 1 + Z · relativity`
+/// with `Z = credibility(n, k)` on the volume `n` of the insured's own history.
+///
+/// A clean history (`own < expected`) earns a **credit** (`< 1`); a chronic one
+/// (`own > expected`) earns a **surcharge** (`> 1`); an insured with no own
+/// history (`n = 0`) is **unrated** (`1`). Applied as a multiplier on loss cost,
+/// it surcharges chronic loss-generators beyond an insured's WTP so the pool
+/// self-selects — bad risks priced out — as an emergent consequence, not a cull.
+pub fn experience_modifier(own_losses: f64, expected_losses: f64, n: f64, k: f64) -> f64 {
+    if expected_losses <= 0.0 {
+        return 1.0;
+    }
+    let relativity = own_losses / expected_losses;
+    let z = credibility(n, k);
+    (1.0 - z) * 1.0 + z * relativity
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2132,6 +2427,423 @@ mod tests {
         assert_eq!(settlements[0].settled, 0.0);
         assert!((settlements[0].shortfall - 100.0).abs() < 1e-9);
         // The expired layer generated no claim at all.
+    }
+
+    #[test]
+    fn a_broker_holds_a_relationship_score_per_syndicate() {
+        // A broker is a stateful agent: it carries a relationship score per
+        // syndicate (indexed by SyndicateId) and a broker-level update inertia.
+        // Syndicates the broker has never dealt with score zero (the new-entrant
+        // starting point — relationships are earned, not given).
+        let broker = Broker::new(vec![0.8, 0.2, 0.0], 0.9);
+        assert_eq!(broker.relationship(SyndicateId(0)), 0.8);
+        assert_eq!(broker.relationship(SyndicateId(1)), 0.2);
+        assert_eq!(broker.relationship(SyndicateId(2)), 0.0);
+        // A syndicate beyond the known roster is an unknown — score zero.
+        assert_eq!(broker.relationship(SyndicateId(9)), 0.0);
+        assert_eq!(broker.inertia, 0.9);
+    }
+
+    #[test]
+    fn the_broker_shortlists_by_relationship_and_leads_the_strongest_not_the_cheapest() {
+        // Routing is relationship-driven, never price-driven: shortlist() takes no
+        // prices at all. With one dominant relationship and two weak ones, the
+        // broker shortlists the strong syndicate almost always and designates it
+        // lead (the strongest relationship is first). A would-be cheaper rival has
+        // no way to buy its way onto the lead slot — price is simply not an input.
+        let broker = Broker::new(vec![10.0, 0.1, 0.1], 0.9);
+        let capable = [SyndicateId(0), SyndicateId(1), SyndicateId(2)];
+
+        let mut led_by_strong = 0;
+        let mut shortlisted_strong = 0;
+        let trials = 2_000;
+        for s in 0..trials {
+            let mut rng = Rng::seeded(1_000 + s as u64);
+            let shortlist = broker.shortlist(&capable, 2, &mut rng);
+            assert_eq!(shortlist.len(), 2, "shortlist of the requested size");
+            // The lead is always the strongest relationship on the shortlist.
+            let lead = shortlist[0];
+            let lead_rel = broker.relationship(lead);
+            for &member in &shortlist[1..] {
+                assert!(broker.relationship(member) <= lead_rel, "lead is not the strongest");
+            }
+            if lead == SyndicateId(0) {
+                led_by_strong += 1;
+            }
+            if shortlist.contains(&SyndicateId(0)) {
+                shortlisted_strong += 1;
+            }
+        }
+        // The strong relationship dominates both shortlisting and the lead slot.
+        assert!(shortlisted_strong > 1_950, "strong syndicate shortlisted only {shortlisted_strong}/{trials}");
+        assert!(led_by_strong > 1_950, "strong syndicate led only {led_by_strong}/{trials}");
+    }
+
+    #[test]
+    fn several_brokers_have_heterogeneous_portfolios_and_lead_different_syndicates() {
+        // The market has SEVERAL brokers with heterogeneous relationship
+        // portfolios — different brokers favour different syndicates, and that
+        // heterogeneity is the network topology herding (#3) and the entry lag (#6)
+        // ride on. Two brokers over the SAME capable roster lead different
+        // syndicates, purely from their own relationship books (and they differ in
+        // loyalty via inertia).
+        let alpha = Broker::new(vec![9.0, 0.1, 0.1], 0.95); // loyal to syndicate 0
+        let beta = Broker::new(vec![0.1, 0.1, 9.0], 0.5); // loyal to syndicate 2
+        assert_ne!(alpha.inertia, beta.inertia, "brokers differ in loyalty");
+        let capable = [SyndicateId(0), SyndicateId(1), SyndicateId(2)];
+
+        let mut alpha_leads_0 = 0;
+        let mut beta_leads_2 = 0;
+        let trials = 1_000;
+        for s in 0..trials {
+            let mut ra = Rng::seeded(20_000 + s as u64);
+            let mut rb = Rng::seeded(20_000 + s as u64);
+            if alpha.shortlist(&capable, 2, &mut ra)[0] == SyndicateId(0) {
+                alpha_leads_0 += 1;
+            }
+            if beta.shortlist(&capable, 2, &mut rb)[0] == SyndicateId(2) {
+                beta_leads_2 += 1;
+            }
+        }
+        assert!(alpha_leads_0 > 950, "broker alpha did not consistently lead its favourite");
+        assert!(beta_leads_2 > 950, "broker beta did not consistently lead its favourite");
+    }
+
+    #[test]
+    fn a_new_entrant_is_occasionally_shortlisted_so_relationships_can_be_built() {
+        // New entrants start at zero everywhere, yet must be able to win a little
+        // business to build relationships over years (the relational half of the
+        // entry lag, #6). So a zero-relationship syndicate is shortlisted rarely
+        // but not never, against an incumbent — weighting, not exclusion.
+        let broker = Broker::new(vec![5.0, 0.0], 0.9);
+        let capable = [SyndicateId(0), SyndicateId(1)];
+        let mut entrant_shortlisted = 0;
+        let trials = 4_000;
+        for s in 0..trials {
+            let mut rng = Rng::seeded(7_000 + s as u64);
+            if broker.shortlist(&capable, 1, &mut rng).contains(&SyndicateId(1)) {
+                entrant_shortlisted += 1;
+            }
+        }
+        assert!(entrant_shortlisted > 0, "new entrant never gets a chance");
+        assert!(entrant_shortlisted < trials / 2, "new entrant not rare against an incumbent");
+    }
+
+    #[test]
+    fn a_syndicate_quotes_blind_from_its_own_technical_premium() {
+        // The lead quotes BLIND: its price is its own technical premium scaled by
+        // its ask multiplier (AvT; 1.0 until the cycle layer sets it), computed
+        // from its own TP alone — blind_quote takes no other quote, so seeing no
+        // rival is structural, not a convention. At AvT 1.0 the quote IS the TP;
+        // the ask multiplier is the (future) competitive lever around it.
+        let model = cat_model();
+        let book = NetBook { lines: vec![] };
+        let risk = LayerExposure { layer: Layer { attachment: 0.0, limit: 100.0 }, exposure: 1_000.0, territory: Territory(0) };
+        let experience = AttritionalExperience { own_burning_cost: 30.0, benchmark: 25.0, volume: 50.0 };
+        let params = PricingParams { hurdle_rate: 0.15, credibility_k: 10.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 4_000 };
+        let mut rng = Rng::seeded(2024);
+        let tp = technical_premium(&risk, &book, &model, &experience, &params, &mut rng).technical_premium;
+
+        let blind = blind_quote(SyndicateId(0), tp, 1.0);
+        assert_eq!(blind.syndicate, SyndicateId(0));
+        assert_eq!(blind.price, tp);
+
+        // The ask multiplier scales the TP — the lever the competitive AvT channel
+        // will eventually move; at 1.2 the lead holds out 20% above its floor.
+        let firmer = blind_quote(SyndicateId(0), tp, 1.2);
+        assert!((firmer.price - tp * 1.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_follower_weight_is_derived_from_confidence_reputation_and_susceptibility() {
+        // The herding weight w is DERIVED, never a fixed constant (a fixed weight
+        // would make #3 tautological). It rises when the follower's OWN estimate
+        // is low-confidence (thin own data leaning on the lead, the same
+        // information-content logic as credibility) and when the LEAD is more
+        // reputable, and it is scaled by the follower's per-syndicate herding
+        // susceptibility (a genome parameter). It always lands in [0, 1].
+
+        // Rises as own confidence falls (more willing to lean on the lead).
+        let low_conf = follower_weight(0.1, 0.8, 1.0);
+        let high_conf = follower_weight(0.9, 0.8, 1.0);
+        assert!(low_conf > high_conf, "w should rise as own confidence falls");
+
+        // Rises as lead reputation rises.
+        let rep_lead = follower_weight(0.5, 0.9, 1.0);
+        let unknown_lead = follower_weight(0.5, 0.1, 1.0);
+        assert!(rep_lead > unknown_lead, "w should rise with lead reputation");
+
+        // Scales with herding susceptibility: a more susceptible follower herds
+        // harder on identical information.
+        let susceptible = follower_weight(0.4, 0.7, 1.5);
+        let stubborn = follower_weight(0.4, 0.7, 0.3);
+        assert!(susceptible > stubborn, "w should scale with herding susceptibility");
+
+        // Boundary behaviour: a fully confident follower ignores the lead (w = 0);
+        // a zero-susceptibility follower never herds (w = 0); w stays in [0, 1]
+        // even when the raw product would exceed 1.
+        assert_eq!(follower_weight(1.0, 1.0, 2.0), 0.0);
+        assert_eq!(follower_weight(0.0, 1.0, 0.0), 0.0);
+        let saturated = follower_weight(0.0, 1.0, 5.0);
+        assert!((0.0..=1.0).contains(&saturated) && saturated == 1.0);
+    }
+
+    #[test]
+    fn a_follower_anchors_its_price_toward_the_lead_without_touching_its_belief() {
+        // A follower anchors its QUOTE toward the lead's, not its beliefs:
+        //   follower_quote = (1 − w)·own + w·lead.
+        // At w = 0 it quotes its own blind price; at w = 1 it fully matches the
+        // lead; in between it interpolates and moves toward the lead as w rises.
+        let own = 100.0;
+        let lead = 60.0;
+        assert!((anchored_quote(own, lead, 0.0) - own).abs() < 1e-12);
+        assert!((anchored_quote(own, lead, 1.0) - lead).abs() < 1e-12);
+        let half = anchored_quote(own, lead, 0.5);
+        assert!((half - 80.0).abs() < 1e-12);
+        // Strictly toward the lead as w grows.
+        assert!(anchored_quote(own, lead, 0.7) < anchored_quote(own, lead, 0.3));
+
+        // Belief is NOT overwritten — only the price moves. A follower prices off
+        // its OWN cat model, anchors its quote toward a lead, then re-prices: its
+        // technical premium is byte-identical, because anchoring touched price
+        // alone (this keeps pricing herding #3 orthogonal to model homogeneity
+        // #14). anchored_quote cannot even see the model — it takes only prices.
+        let model = cat_model();
+        let book = NetBook { lines: vec![] };
+        let risk = LayerExposure { layer: Layer { attachment: 0.0, limit: 100.0 }, exposure: 1_000.0, territory: Territory(0) };
+        let experience = AttritionalExperience { own_burning_cost: 30.0, benchmark: 25.0, volume: 50.0 };
+        let params = PricingParams { hurdle_rate: 0.15, credibility_k: 10.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 4_000 };
+
+        let mut rng = Rng::seeded(2024);
+        let before = technical_premium(&risk, &book, &model, &experience, &params, &mut rng).technical_premium;
+        // Anchor hard toward a very different lead quote.
+        let _ = anchored_quote(before, before * 0.3, 0.9);
+        let mut rng = Rng::seeded(2024);
+        let after = technical_premium(&risk, &book, &model, &experience, &params, &mut rng).technical_premium;
+        assert_eq!(before, after, "anchoring a price must not move the follower's belief-driven TP");
+    }
+
+    #[test]
+    fn a_follower_declines_on_its_own_exposure_limits_regardless_of_the_lead() {
+        // Herding moves price, never capacity discipline: a follower applies its
+        // OWN exposure limits (#4's ExposurePolicy) and may decline regardless of
+        // how attractive the lead quote is. Here a follower already loaded up in a
+        // zone trips its cat aggregate, so it declines even though anchoring to the
+        // cheap, reputable lead would otherwise be irresistible.
+        let model = cat_model();
+        let policy = ExposurePolicy { return_period: 200.0, solvency_fraction: 0.5, line_fraction: 0.9, tail_trials: 4_000 };
+        let syndicate = Syndicate::with_capital(100.0);
+        // A book already heavy in Territory(0): one more line trips the aggregate.
+        let loaded = NetBook { lines: (0..60).map(|_| NetLine { territory: Territory(0), net_limit: 1.0 }).collect() };
+        let candidate = NetLine { territory: Territory(0), net_limit: 1.0 };
+        let mut rng = Rng::seeded(5);
+        let decision = policy.assess(&syndicate, &loaded, &model, candidate, &mut rng);
+        assert!(matches!(decision, UnderwritingDecision::Decline(DeclineReason::CatAggregate)), "setup: follower should be over-exposed");
+
+        // A cheap, fully-herdable lead quote (w = 1) cannot drag a declined
+        // follower onto the panel.
+        let response = follower_response(SyndicateId(1), 100.0, 10.0, 1.0, decision);
+        assert_eq!(response, FollowerResponse::Decline(DeclineReason::CatAggregate));
+
+        // With headroom the same follower accepts and quotes — anchored toward the
+        // lead by w (here pulled fully onto the lead's 10.0).
+        let mut rng = Rng::seeded(5);
+        let ok = policy.assess(&syndicate, &NetBook { lines: vec![] }, &model, candidate, &mut rng);
+        assert_eq!(ok, UnderwritingDecision::Accept);
+        let response = follower_response(SyndicateId(1), 100.0, 10.0, 1.0, ok);
+        assert_eq!(response, FollowerResponse::Quote(Quote { syndicate: SyndicateId(1), price: 10.0 }));
+    }
+
+    #[test]
+    fn the_insured_clears_on_the_cheapest_acceptable_quote_within_willingness_to_pay() {
+        // An insured's willingness-to-pay is its expected loss scaled by a private
+        // risk-aversion loading (> 1). It clears on the CHEAPEST quote at or below
+        // WTP — and clearing is a demand-side decision separate from routing, so
+        // the relationship-designated lead need not win: a cheaper follower takes
+        // the placement.
+        let insured = Insured { risk_aversion: 1.4, expected_loss: 100.0 };
+        assert!((insured.willingness_to_pay() - 140.0).abs() < 1e-9);
+
+        // Lead (by relationship) quotes 150 — above WTP; two followers quote 120
+        // and 135. The cheapest acceptable (≤ 140) is the 120 follower.
+        let quotes = [
+            Quote { syndicate: SyndicateId(0), price: 150.0 }, // the relationship lead
+            Quote { syndicate: SyndicateId(1), price: 135.0 },
+            Quote { syndicate: SyndicateId(2), price: 120.0 },
+        ];
+        let cleared = clear_cheapest(&quotes, insured.willingness_to_pay());
+        assert_eq!(cleared, Some(Quote { syndicate: SyndicateId(2), price: 120.0 }));
+
+        // When every quote exceeds WTP the insured declines (no acceptable cover).
+        let dear = [
+            Quote { syndicate: SyndicateId(0), price: 200.0 },
+            Quote { syndicate: SyndicateId(1), price: 160.0 },
+        ];
+        assert_eq!(clear_cheapest(&dear, insured.willingness_to_pay()), None);
+    }
+
+    #[test]
+    fn a_priced_out_insured_restructures_its_tower_or_declines() {
+        // Demand is price-elastic in QUANTITY (the cycle damper, #1). Facing the
+        // cleared price per band, the insured buys the whole tower when it fits its
+        // WTP budget; when priced out it drops the worst value-for-money band first
+        // (raising retention / lowering limit / self-insuring a tranche); and when
+        // even the single most affordable band exceeds WTP it declines entirely.
+        let offers = [
+            // working/primary: heavily loaded (price/expected = 2.5)
+            TowerLayerOffer { layer: Layer { attachment: 0.0, limit: 100.0 }, expected_loss: 60.0, price: 150.0 },
+            TowerLayerOffer { layer: Layer { attachment: 100.0, limit: 100.0 }, expected_loss: 20.0, price: 30.0 },
+            TowerLayerOffer { layer: Layer { attachment: 200.0, limit: 100.0 }, expected_loss: 5.0, price: 7.0 },
+        ];
+
+        // Generous budget: buy the whole tower.
+        match restructure_tower(&offers, 200.0) {
+            TowerPurchase::Bound { layers, total_price } => {
+                assert_eq!(layers.len(), 3, "full tower should bind within a generous WTP");
+                assert!((total_price - 187.0).abs() < 1e-9);
+            }
+            other => panic!("expected the full tower to bind, got {other:?}"),
+        }
+
+        // Priced out at WTP 50: the primary band (worst loading) is dropped —
+        // retention rises to 100 — and the upper bands bind within budget.
+        match restructure_tower(&offers, 50.0) {
+            TowerPurchase::Bound { layers, total_price } => {
+                assert_eq!(layers.len(), 2, "should restructure to a smaller tower");
+                assert!(layers.iter().all(|l| l.attachment >= 100.0), "primary band should be dropped, raising retention");
+                assert!(total_price <= 50.0, "restructured price {total_price} must fit WTP");
+            }
+            other => panic!("expected a restructured tower, got {other:?}"),
+        }
+
+        // WTP below even the cheapest single band: no acceptable cover → decline.
+        assert_eq!(restructure_tower(&offers, 5.0), TowerPurchase::Declined);
+    }
+
+    #[test]
+    fn experience_rating_surcharges_chronic_loss_generators_so_the_pool_self_selects() {
+        // Experience rating (#9) is supply-side pricing on a demand-side attribute:
+        // a syndicate scales its loss-cost estimate for a SPECIFIC risk by that
+        // insured's own loss history, credibility-weighted. A clean history earns a
+        // credit (modifier < 1), a chronic one a surcharge (modifier > 1), and an
+        // insured with no own history is unrated (modifier = 1).
+        let k = 10.0;
+        let n = 20.0; // Z = 20/30 ≈ 0.667
+        assert!(experience_modifier(40.0, 100.0, n, k) < 1.0, "a clean history should earn a credit");
+        assert!(experience_modifier(250.0, 100.0, n, k) > 1.0, "a chronic history should be surcharged");
+        assert!((experience_modifier(123.0, 100.0, 0.0, k) - 1.0).abs() < 1e-12, "no own history → unrated");
+
+        // Self-selection emerges where per-risk rating meets the WTP exit. The same
+        // syndicate prices a base loss cost of 60 (loaded ÷ 0.6 TLR = 100) for
+        // three insureds differing only in loss history; each clears against its
+        // own WTP (130). The chronic loss-generator is surcharged beyond WTP and
+        // declines out of the pool, while clean and neutral risks bind — no cull.
+        let base_loss_cost = 60.0;
+        let tlr = 0.6;
+        let histories = [
+            ("clean", 30.0),
+            ("neutral", 100.0),
+            ("chronic", 300.0),
+        ];
+        let mut bound = Vec::new();
+        for (label, own_losses) in histories {
+            let insured = Insured { risk_aversion: 1.3, expected_loss: 100.0 }; // WTP = 130
+            let modifier = experience_modifier(own_losses, 100.0, n, k);
+            let price = actuarial_technical_price(base_loss_cost, tlr) * modifier;
+            let quote = Quote { syndicate: SyndicateId(0), price };
+            if clear_cheapest(&[quote], insured.willingness_to_pay()).is_some() {
+                bound.push(label);
+            }
+        }
+        assert!(bound.contains(&"clean"), "the clean risk should clear");
+        assert!(bound.contains(&"neutral"), "the neutral risk should clear");
+        assert!(!bound.contains(&"chronic"), "the chronic loss-generator should be priced out of the pool");
+    }
+
+    #[test]
+    fn relationship_scores_update_slowly_with_broker_inertia_so_renewals_stay_sticky() {
+        // Relationship scores update slowly at year-end with broker-level inertia:
+        //   new = inertia·old + (1 − inertia)·signal.
+        // A single good year barely moves the score (the lag), and that lag is
+        // where renewal stickiness (#5) emerges — it is not a hardcoded stickiness
+        // factor.
+        let mut broker = Broker::new(vec![0.5], 0.9);
+        broker.update_relationship(SyndicateId(0), RelationshipOutcome { quoted: true, won: true, solvent: true });
+        let after_one_win = broker.relationship(SyndicateId(0));
+        // Winning pushes the score up, but only a little — slow, not a jump to the
+        // signal.
+        assert!(after_one_win > 0.5, "a winning year should raise the score");
+        assert!(after_one_win < 0.56, "the update is slow under high inertia, not a jump: {after_one_win}");
+
+        // Stickiness across renewals: a well-established incumbent keeps being the
+        // strongest relationship (and so the lead) for years even as a brand-new
+        // challenger wins business every year — relationships trail the competitive
+        // landscape. The incumbent merely quotes and loses; the challenger wins.
+        let mut broker = Broker::new(vec![0.8, 0.0], 0.9);
+        let incumbent = SyndicateId(0);
+        let challenger = SyndicateId(1);
+        let mut incumbent_led_for = 0;
+        for year in 0..30 {
+            if broker.relationship(incumbent) >= broker.relationship(challenger) {
+                incumbent_led_for = year;
+            } else {
+                break;
+            }
+            // The challenger wins; the incumbent quotes competitively but loses.
+            broker.update_relationship(challenger, RelationshipOutcome { quoted: true, won: true, solvent: true });
+            broker.update_relationship(incumbent, RelationshipOutcome { quoted: true, won: false, solvent: true });
+        }
+        assert!(incumbent_led_for >= 5, "incumbent lost the lead after only {incumbent_led_for} renewals — not sticky enough");
+        // But stickiness is a lag, not a lock: the persistently winning challenger
+        // does eventually overtake — share adjusts slowly, it does adjust.
+        assert!(incumbent_led_for < 30, "challenger never overtook — that would be a hardcoded lock, not a lag");
+
+        // Insolvency is the strongest erosion signal — it drives the score toward
+        // zero faster than a mere decline.
+        let mut broker = Broker::new(vec![0.9], 0.9);
+        broker.update_relationship(SyndicateId(0), RelationshipOutcome { quoted: false, won: false, solvent: false });
+        let after_insolvency = broker.relationship(SyndicateId(0));
+        broker = Broker::new(vec![0.9], 0.9);
+        broker.update_relationship(SyndicateId(0), RelationshipOutcome { quoted: true, won: false, solvent: true });
+        let after_decline = broker.relationship(SyndicateId(0));
+        assert!(after_insolvency < after_decline, "insolvency should erode trust faster than a decline");
+    }
+
+    #[test]
+    fn herding_emerges_as_quote_clustering_behind_a_reputable_lead() {
+        // The #3 emergent test, composing the derived weight and the price anchor:
+        // followers with dispersed own beliefs but POOR own info, facing a
+        // REPUTABLE lead, derive a high w and cluster their quotes tightly around
+        // the lead. The SAME followers, confident in their own estimates (or facing
+        // an unknown lead), derive w ≈ 0 and stay dispersed. The clustering is not
+        // imposed — it falls out of follower_weight × anchored_quote.
+        let own_prices = [80.0, 100.0, 120.0, 140.0]; // heterogeneous beliefs
+        let lead_quote = 100.0;
+        let susceptibility = 1.0;
+
+        // Low own-confidence + reputable lead → high w → clustering.
+        let w_herd = follower_weight(0.1, 0.9, susceptibility);
+        let clustered: Vec<f64> = own_prices.iter().map(|&p| anchored_quote(p, lead_quote, w_herd)).collect();
+
+        // High own-confidence → w ≈ 0 → quotes stay near own beliefs (dispersed).
+        let w_indep = follower_weight(0.95, 0.9, susceptibility);
+        let dispersed: Vec<f64> = own_prices.iter().map(|&p| anchored_quote(p, lead_quote, w_indep)).collect();
+
+        let spread_clustered = coefficient_of_variation(&clustered);
+        let spread_dispersed = coefficient_of_variation(&dispersed);
+
+        // Herding sharply compresses the spread of quotes.
+        assert!(
+            spread_clustered < 0.3 * spread_dispersed,
+            "clustered spread {spread_clustered} not far below dispersed {spread_dispersed}"
+        );
+        // And the clustered quotes sit tightly around the reputable lead.
+        for q in &clustered {
+            assert!((q - lead_quote).abs() < 0.25 * lead_quote, "quote {q} did not cluster near the lead {lead_quote}");
+        }
+        // A facsimile of #14-orthogonality: clustering is on PRICE; the dispersion
+        // of underlying beliefs (own_prices) is untouched by the blend.
+        assert!(coefficient_of_variation(&own_prices) > spread_clustered);
     }
 
     #[test]

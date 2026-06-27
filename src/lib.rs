@@ -1711,6 +1711,515 @@ pub fn experience_modifier(own_losses: f64, expected_losses: f64, n: f64, k: f64
     (1.0 - z) * 1.0 + z * relativity
 }
 
+// ============================================================================
+// The annual market engine
+// ----------------------------------------------------------------------------
+// The full end-to-end annual simulation loop that exercises the real substrate:
+// demand → placement → within-year losses → year-end. The emergent underwriting
+// cycle (#1) is whatever the population of local AvT rules produces over a
+// multi-decade run — there is no market-phase variable, coordinator, or
+// `AP = TP × f(t)` curve anywhere in here.
+//
+// Deferred (seams documented, end-state design intact): endogenous entry and the
+// rising supply curve (#8 — so the pool only shrinks via insolvency and the run
+// horizon is bounded by attrition); experience rating (modifier ≡ 1, #9); the
+// decomposed GWP→NEP chain (a single expense ratio, reinsurance ceded = 0); and
+// the quarter-day renewal calendar (one annual cohort, all policies incept at 0
+// and expire at 1).
+// ============================================================================
+
+/// A broker's identity within the market's roster — an index into the brokers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BrokerId(pub usize);
+
+/// The per-syndicate **genome**: the full vector of selectable parameters market
+/// selection acts on (#12), bundled so a population varies across them. It unions
+/// the pricing, exposure, AvT, and distribution parameters with the herding
+/// susceptibility and the target line a syndicate offers on any one layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SyndicateGenome {
+    pub cat_model: CatModel,
+    pub exposure: ExposurePolicy,
+    pub pricing: PricingParams,
+    pub avt: AvtParams,
+    pub distribution: DistributionParams,
+    /// Scales the follower weight `w` when anchoring toward a lead (#3).
+    pub herding_susceptibility: f64,
+    /// The share of any one layer's limit the syndicate offers to subscribe.
+    pub target_line: f64,
+}
+
+/// A **syndicate agent**: its genome plus the slow-moving and within-year state it
+/// carries through the loop. Capital lives in the market's parallel capital roster
+/// (so the substrate's settlement cascade can debit a `&mut [Syndicate]` slice);
+/// everything else — the AvT multiplier, the current net book, the year's tallies —
+/// lives here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyndicateAgent {
+    pub genome: SyndicateGenome,
+    /// The capital the agent is seeded with — consumed by [`Market::new`] to build
+    /// the persistent capital roster.
+    pub initial_capital: f64,
+    /// The slow-moving AvT multiplier, re-set once a year at renewal.
+    pub avt: f64,
+    /// The net retained book, rebuilt each year as the annual cohort places.
+    pub book: NetBook,
+    // Within-year tallies, reset at the start of each year:
+    /// Bound placements the agent was shortlisted on (the win-rate denominator).
+    pub shortlisted: u32,
+    /// Bound placements the agent subscribed to (the win-rate numerator).
+    pub won: u32,
+    /// Net earned premium this year (placement premium net of expense, plus
+    /// reinstatement income).
+    pub premium: f64,
+    /// Claims incurred this year.
+    pub losses: f64,
+}
+
+impl SyndicateAgent {
+    /// A fresh agent on the TP floor (`AvT = 1`) with an empty book and clean
+    /// tallies.
+    pub fn new(initial_capital: f64, genome: SyndicateGenome) -> Self {
+        SyndicateAgent {
+            genome,
+            initial_capital,
+            avt: 1.0,
+            book: NetBook { lines: Vec::new() },
+            shortlisted: 0,
+            won: 0,
+            premium: 0.0,
+            losses: 0.0,
+        }
+    }
+
+    fn reset_year(&mut self) {
+        self.book = NetBook { lines: Vec::new() };
+        self.shortlisted = 0;
+        self.won = 0;
+        self.premium = 0.0;
+        self.losses = 0.0;
+    }
+}
+
+/// A demand-side **insured** in the market: an asset to cover, a risk-aversion
+/// loading (its WTP is risk-aversion × expected loss), and the broker it places
+/// through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarketInsured {
+    pub asset: Asset,
+    pub risk_aversion: f64,
+    pub broker: BrokerId,
+}
+
+/// One **territory market**: the true catastrophe process (owned by the substrate,
+/// seen by no agent) and the cohort of insureds seeking cover in the zone.
+#[derive(Debug, Clone)]
+pub struct TerritoryMarket {
+    pub territory: Territory,
+    pub peril: CatastrophePeril,
+    pub insureds: Vec<MarketInsured>,
+}
+
+/// The per-year diagnostic readings the CSV emission and the HITL cycle read are
+/// built from — one row per simulated year.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct YearReport {
+    pub year: usize,
+    /// Mean AvT multiplier across solvent syndicates.
+    pub mean_avt: f64,
+    /// Population standard deviation of AvT across solvent syndicates — the spread
+    /// of asks the heterogeneous genomes settle at.
+    pub avt_spread: f64,
+    /// The effective market rate achieved: premium-weighted `AP / TP` over the
+    /// year's bound placements (1.0 = priced exactly at the technical floor).
+    pub rate_index: f64,
+    /// Incurred losses over net earned premium — the headline whose bimodality
+    /// (benign vs cat years) is the cycle diagnostic.
+    pub combined_ratio: f64,
+    pub solvent_count: usize,
+    /// Mean post-distribution capacity headroom across solvent syndicates.
+    pub mean_headroom: f64,
+    /// Number of true catastrophe events across all territories this year.
+    pub cat_events: usize,
+    /// Number of layers bound this year.
+    pub placements: usize,
+    /// Total net earned premium this year.
+    pub gross_premium: f64,
+    /// Total incurred losses this year.
+    pub incurred_losses: f64,
+}
+
+/// A bound tower for one insured, held through the loss phase: the asset it covers
+/// and the placed reinstatement layers (one per kept band).
+struct InsuredPlacement {
+    asset: Asset,
+    layers: Vec<ReinstatementLayer>,
+}
+
+/// Monte-Carlo trials an insured uses to value its own expected loss (for WTP).
+const DEMAND_TRIALS: usize = 80;
+
+/// The **annual market engine**. Holds the syndicate agents, their persistent
+/// capital roster, the brokers, the territory markets, and the shared attritional
+/// peril, and steps the whole market forward one year at a time.
+#[derive(Debug, Clone)]
+pub struct Market {
+    agents: Vec<SyndicateAgent>,
+    capitals: Vec<Syndicate>,
+    brokers: Vec<Broker>,
+    territories: Vec<TerritoryMarket>,
+    attritional: AttritionalPeril,
+    expense_ratio: f64,
+    panel_size: usize,
+    rng: Rng,
+    year: usize,
+}
+
+impl Market {
+    /// Assemble a market. Each agent's `initial_capital` seeds the persistent
+    /// capital roster; capital carries over between years with no re-endowment.
+    pub fn new(
+        agents: Vec<SyndicateAgent>,
+        brokers: Vec<Broker>,
+        territories: Vec<TerritoryMarket>,
+        attritional: AttritionalPeril,
+        expense_ratio: f64,
+        panel_size: usize,
+        rng: Rng,
+    ) -> Self {
+        let capitals = agents.iter().map(|a| Syndicate::with_capital(a.initial_capital)).collect();
+        Market { agents, capitals, brokers, territories, attritional, expense_ratio, panel_size, rng, year: 0 }
+    }
+
+    /// The next year to be simulated (0 before the first [`step_year`](Self::step_year)).
+    pub fn year(&self) -> usize {
+        self.year
+    }
+
+    /// A syndicate's current capital balance.
+    pub fn capital(&self, id: SyndicateId) -> f64 {
+        self.capitals[id.0].capital()
+    }
+
+    /// A syndicate's current AvT multiplier.
+    pub fn avt(&self, id: SyndicateId) -> f64 {
+        self.agents[id.0].avt
+    }
+
+    /// A syndicate's current capacity headroom under its own book and beliefs.
+    pub fn headroom(&self, id: SyndicateId) -> f64 {
+        let agent = &self.agents[id.0];
+        let mut rng = Rng::seeded(0x4845_4144 ^ id.0 as u64 ^ self.year as u64);
+        agent.genome.exposure.capacity_headroom(&self.capitals[id.0], &agent.book, &agent.genome.cat_model, &mut rng)
+    }
+
+    /// Step the whole market forward one year and return the year's diagnostics:
+    /// demand meets supply (firm-order subscription panels), within-year cat and
+    /// attritional losses settle through the substrate cascade, and the year-end
+    /// rolls (tally → distributions → AvT re-set off post-distribution headroom →
+    /// relationship update → roll forward).
+    pub fn step_year(&mut self) -> YearReport {
+        let Market {
+            agents,
+            capitals,
+            brokers,
+            territories,
+            attritional,
+            expense_ratio,
+            panel_size,
+            rng,
+            year,
+        } = self;
+        let expense_ratio = *expense_ratio;
+        let panel_size = *panel_size;
+
+        for agent in agents.iter_mut() {
+            agent.reset_year();
+        }
+
+        // --- Placement (renewal): the annual cohort places its towers ----------
+        let mut placements: Vec<Vec<InsuredPlacement>> = Vec::with_capacity(territories.len());
+        let mut bound_layers = 0usize;
+        let mut sum_ap = 0.0; // premium-weighted actual premium (rate index numerator)
+        let mut sum_tp = 0.0; // premium-weighted technical premium (denominator)
+
+        for tm in territories.iter() {
+            let truth = CatModel {
+                annual_frequency: tm.peril.annual_frequency,
+                min_damage_fraction: tm.peril.min_damage_fraction,
+                tail_alpha: tm.peril.tail_alpha,
+            };
+            let mut territory_placements: Vec<InsuredPlacement> = Vec::new();
+
+            for insured in &tm.insureds {
+                let si = insured.asset.sum_insured;
+                // A two-band tower: a primary `[0, si/2]` and an excess `[si/2, si]`.
+                // Both carry one reinstatement, so a clustered second event triggers
+                // within-year hardening.
+                let bands = [
+                    Layer { attachment: 0.0, limit: si / 2.0 },
+                    Layer { attachment: si / 2.0, limit: si / 2.0 },
+                ];
+                let terms = ReinstatementTerms { count: 1, factor: 1.0 };
+
+                // Form a panel for each band, collecting the insured's offers.
+                struct BandPanel {
+                    band: Layer,
+                    panel: Panel,
+                    firm_order: f64,
+                    lead_tp: f64,
+                    shortlist: Vec<SyndicateId>,
+                }
+                let mut band_panels: Vec<BandPanel> = Vec::new();
+                let mut offers: Vec<TowerLayerOffer> = Vec::new();
+                let mut expected_total = 0.0;
+
+                for band in bands {
+                    let capable: Vec<SyndicateId> = capitals
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.is_solvent())
+                        .map(|(i, _)| SyndicateId(i))
+                        .collect();
+                    if capable.is_empty() {
+                        continue;
+                    }
+                    let broker = &brokers[insured.broker.0];
+                    let shortlist = broker.shortlist(&capable, panel_size, rng);
+                    if shortlist.is_empty() {
+                        continue;
+                    }
+                    let lead_id = shortlist[0];
+                    let risk = LayerExposure { layer: band, exposure: si, territory: tm.territory, reinstatement: terms };
+
+                    // The insured's own expected loss on the band (it knows its own
+                    // risk), for WTP and value-ranking — true cat ELF + a small
+                    // attritional term.
+                    let cat_el = catastrophe_elf(&band, si, &truth, DEMAND_TRIALS, rng);
+                    let attr_mean = band.insured_loss(attritional.occurrence_probability * attritional.mean_damage_fraction * si);
+                    let band_expected = cat_el + attr_mean;
+                    expected_total += band_expected;
+
+                    let experience = |benchmark: f64| AttritionalExperience {
+                        own_burning_cost: benchmark,
+                        benchmark,
+                        volume: 10.0,
+                    };
+
+                    // The lead quotes blind: firm order = its TP · AvT.
+                    let lead = &agents[lead_id.0];
+                    let lead_tp = technical_premium(&risk, &lead.book, &lead.genome.cat_model, &experience(attr_mean), &lead.genome.pricing, rng).technical_premium;
+                    let firm_order = lead_tp * lead.avt;
+                    let lead_reputation = {
+                        let r = broker.relationship(lead_id);
+                        r / (r + 1.0)
+                    };
+
+                    // Build each shortlisted syndicate's subscription offer.
+                    let mut lead_offer = None;
+                    let mut follower_offers: Vec<SubscriptionOffer> = Vec::new();
+                    for (pos, &id) in shortlist.iter().enumerate() {
+                        let agent = &agents[id.0];
+                        let candidate = NetLine { territory: tm.territory, net_limit: agent.genome.target_line * band.limit };
+                        let decision = agent.genome.exposure.assess(&capitals[id.0], &agent.book, &agent.genome.cat_model, candidate, rng);
+                        let offer = if pos == 0 {
+                            SubscriptionOffer { syndicate: id, quote: firm_order, decision, offered_share: agent.genome.target_line }
+                        } else {
+                            let own_tp = technical_premium(&risk, &agent.book, &agent.genome.cat_model, &experience(attr_mean), &agent.genome.pricing, rng).technical_premium;
+                            let own_price = own_tp * agent.avt;
+                            let own_confidence = credibility(10.0, agent.genome.pricing.credibility_k);
+                            let w = follower_weight(own_confidence, lead_reputation, agent.genome.herding_susceptibility);
+                            let anchored = anchored_quote(own_price, firm_order, w);
+                            SubscriptionOffer { syndicate: id, quote: anchored, decision, offered_share: agent.genome.target_line }
+                        };
+                        if pos == 0 {
+                            lead_offer = Some(offer);
+                        } else {
+                            follower_offers.push(offer);
+                        }
+                    }
+
+                    let lead_offer = lead_offer.expect("a non-empty shortlist has a lead");
+                    let panel = form_panel(lead_offer, &follower_offers);
+                    let placed_portion = panel.placed_portion();
+                    if placed_portion <= 0.0 {
+                        continue;
+                    }
+                    offers.push(TowerLayerOffer { layer: band, expected_loss: band_expected, price: firm_order * placed_portion });
+                    band_panels.push(BandPanel { band, panel, firm_order, lead_tp, shortlist });
+                }
+
+                if band_panels.is_empty() {
+                    continue;
+                }
+
+                // Elastic demand: the insured fits its tower to its WTP, dropping the
+                // worst value-for-money bands when the market hardens (the cycle
+                // damper, #1).
+                let wtp = insured.risk_aversion * expected_total;
+                let kept: Vec<Layer> = match restructure_tower(&offers, wtp) {
+                    TowerPurchase::Bound { layers, .. } => layers,
+                    TowerPurchase::Declined => continue,
+                };
+
+                // Commit the kept bands: update books, credit net premium, tally
+                // wins, and hold the placed layer for the loss phase.
+                let mut insured_layers: Vec<ReinstatementLayer> = Vec::new();
+                for bp in band_panels.into_iter().filter(|bp| kept.contains(&bp.band)) {
+                    bound_layers += 1;
+                    sum_ap += bp.firm_order * bp.panel.placed_portion();
+                    sum_tp += bp.lead_tp * bp.panel.placed_portion();
+                    // Every shortlisted member on a bound band saw the opportunity
+                    // (the win-rate denominator) — including those whose quote sat
+                    // above the firm order and so did not subscribe.
+                    for &id in &bp.shortlist {
+                        agents[id.0].shortlisted += 1;
+                    }
+                    // Subscribers take their share: net premium credited, book grown,
+                    // a win tallied (the numerator).
+                    for entry in &bp.panel.entries {
+                        let i = entry.syndicate.0;
+                        let net_premium = entry.share * bp.firm_order * (1.0 - expense_ratio);
+                        capitals[i].credit(net_premium);
+                        agents[i].premium += net_premium;
+                        agents[i].book.lines.push(NetLine { territory: tm.territory, net_limit: entry.share * bp.band.limit });
+                        agents[i].won += 1;
+                    }
+                    insured_layers.push(ReinstatementLayer::new(bp.band, bp.panel, terms, bp.firm_order, 0.0, 1.0));
+                }
+                if !insured_layers.is_empty() {
+                    territory_placements.push(InsuredPlacement { asset: insured.asset, layers: insured_layers });
+                }
+            }
+            placements.push(territory_placements);
+        }
+
+        // --- Within-year losses -----------------------------------------------
+        let mut cat_event_count = 0usize;
+        for (ti, tm) in territories.iter().enumerate() {
+            let cat_events = tm.peril.annual_events(rng); // the true process
+            cat_event_count += cat_events.len();
+            for placement in placements[ti].iter_mut() {
+                let si = placement.asset.sum_insured;
+                // The shared catastrophe occurrence strikes the whole zone: every
+                // exposed layer absorbs the SAME events (correlated losses).
+                for layer in placement.layers.iter_mut() {
+                    let settlements = layer.absorb_year(&cat_events, si, capitals);
+                    attribute(&settlements, &layer.panel, agents);
+                }
+                // Attritional: independent per asset (the pooling half).
+                let gul = attritional.strike(&placement.asset, rng);
+                if gul > 0.0 {
+                    let date = rng.uniform();
+                    for layer in placement.layers.iter_mut() {
+                        let settlement = layer.absorb_event(gul, date, capitals);
+                        attribute(&[settlement], &layer.panel, agents);
+                    }
+                }
+            }
+        }
+
+        // --- Year-end: tally → distributions → AvT → relationships → roll ------
+        let mut mean_headroom_acc = 0.0;
+        let mut solvent_count = 0usize;
+        let mut avt_values: Vec<f64> = Vec::new();
+        let mut total_premium = 0.0;
+        let mut total_losses = 0.0;
+
+        for (i, agent) in agents.iter_mut().enumerate() {
+            total_premium += agent.premium;
+            total_losses += agent.losses;
+
+            // Distributions release profit above the floor, suppressed in loss
+            // years — debited before AvT reads headroom.
+            let result = agent.premium - agent.losses;
+            let payout = distribution(capitals[i].capital(), result, &agent.genome.distribution);
+            if payout > 0.0 {
+                capitals[i].settle(payout);
+            }
+
+            // AvT re-set off post-distribution headroom + realised win-rate.
+            let headroom = agent.genome.exposure.capacity_headroom(&capitals[i], &agent.book, &agent.genome.cat_model, rng);
+            let win_rate = if agent.shortlisted > 0 {
+                agent.won as f64 / agent.shortlisted as f64
+            } else {
+                agent.genome.avt.share_appetite // no opportunities → feedback neutral
+            };
+            agent.avt = updated_avt(agent.avt, headroom, win_rate, &agent.genome.avt);
+
+            if capitals[i].is_solvent() {
+                solvent_count += 1;
+                mean_headroom_acc += headroom;
+                avt_values.push(agent.avt);
+            }
+        }
+
+        // Relationships update slowly from the year's experience (aggregate read).
+        for broker in brokers.iter_mut() {
+            for (i, agent) in agents.iter().enumerate() {
+                broker.update_relationship(
+                    SyndicateId(i),
+                    RelationshipOutcome {
+                        quoted: agent.shortlisted > 0,
+                        won: agent.won > 0,
+                        solvent: capitals[i].is_solvent(),
+                    },
+                );
+            }
+        }
+
+        let mean_avt = if avt_values.is_empty() { 0.0 } else { avt_values.iter().sum::<f64>() / avt_values.len() as f64 };
+        let avt_spread = population_std(&avt_values, mean_avt);
+        let report = YearReport {
+            year: *year,
+            mean_avt,
+            avt_spread,
+            rate_index: if sum_tp > 0.0 { sum_ap / sum_tp } else { 1.0 },
+            combined_ratio: if total_premium > 0.0 { total_losses / total_premium } else { 0.0 },
+            solvent_count,
+            mean_headroom: if solvent_count > 0 { mean_headroom_acc / solvent_count as f64 } else { 0.0 },
+            cat_events: cat_event_count,
+            placements: bound_layers,
+            gross_premium: total_premium,
+            incurred_losses: total_losses,
+        };
+
+        *year += 1;
+        report
+    }
+
+    /// Run the market for `years` years, returning the per-year diagnostics.
+    pub fn run(&mut self, years: usize) -> Vec<YearReport> {
+        (0..years).map(|_| self.step_year()).collect()
+    }
+}
+
+/// Attribute a panel's settlements back to the agents' loss/premium tallies. The
+/// substrate guarantees the loss-settlement invariants on the settlements; this
+/// re-checks them as the engine's hard gate (no claim above its share, no negative
+/// settlement or shortfall) so a violation anywhere in a run panics loudly.
+fn attribute(settlements: &[EventSettlement], panel: &Panel, agents: &mut [SyndicateAgent]) {
+    for es in settlements {
+        for (entry, settled) in panel.entries.iter().zip(&es.claim) {
+            assert!(settled.settled >= 0.0 && settled.shortfall >= 0.0, "settlement is non-negative");
+            agents[entry.syndicate.0].losses += settled.settled;
+        }
+        for (entry, credit) in panel.entries.iter().zip(&es.reinstatement_credits) {
+            agents[entry.syndicate.0].premium += credit;
+        }
+    }
+}
+
+/// Population standard deviation about a supplied `mean` (zero for fewer than two
+/// samples).
+fn population_std(values: &[f64], mean: f64) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    variance.sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3809,5 +4318,158 @@ mod tests {
         let released = distribution(120.0, 500.0, &params);
         assert!((released - 20.0).abs() < 1e-9, "capped at the headroom above the floor, got {released}");
         assert!(120.0 - released >= params.solvency_floor, "capital never falls below the floor");
+    }
+
+    // --- The annual market engine -------------------------------------------
+
+    fn test_genome(appetite: f64) -> SyndicateGenome {
+        SyndicateGenome {
+            cat_model: CatModel { annual_frequency: 0.5, min_damage_fraction: 0.05, tail_alpha: 1.5 },
+            exposure: ExposurePolicy { return_period: 200.0, solvency_fraction: 0.6, line_fraction: 0.4, tail_trials: 120 },
+            pricing: PricingParams { hurdle_rate: 0.1, credibility_k: 50.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 120 },
+            avt: AvtParams { headroom_responsiveness: 0.3, feedback_responsiveness: 0.4, share_appetite: appetite },
+            distribution: DistributionParams { payout_fraction: 0.5, solvency_floor: 200.0 },
+            herding_susceptibility: 0.5,
+            target_line: 0.34,
+        }
+    }
+
+    fn small_market(seed: u64) -> Market {
+        // A handful of syndicates with heterogeneous share-appetites, two brokers,
+        // and two territories each carrying a cohort of insureds. Small enough to
+        // step quickly, real enough to exercise cats, panels, and the year-end loop.
+        let syndicates: Vec<SyndicateAgent> = [0.45, 0.5, 0.55, 0.5]
+            .iter()
+            .map(|&a| SyndicateAgent::new(1_000.0, test_genome(a)))
+            .collect();
+        let n = syndicates.len();
+        let brokers = vec![
+            Broker::new(vec![1.0, 0.5, 0.2, 0.1], 0.85),
+            Broker::new(vec![0.1, 0.2, 0.5, 1.0], 0.85),
+        ];
+        let n_brokers = brokers.len();
+        let territory_market = |t: u32, freq: f64| TerritoryMarket {
+            territory: Territory(t),
+            peril: CatastrophePeril { annual_frequency: freq, min_damage_fraction: 0.05, tail_alpha: 1.5 },
+            insureds: (0..8)
+                .map(|i| MarketInsured {
+                    asset: Asset { sum_insured: 100.0, territory: Territory(t) },
+                    risk_aversion: 1.6,
+                    broker: BrokerId(i % n_brokers),
+                })
+                .collect(),
+        };
+        Market::new(
+            syndicates,
+            brokers,
+            vec![territory_market(0, 0.4), territory_market(1, 0.4)],
+            AttritionalPeril { occurrence_probability: 0.2, mean_damage_fraction: 0.05 },
+            0.15,
+            n.min(3),
+            Rng::seeded(seed),
+        )
+    }
+
+    #[test]
+    fn the_annual_loop_steps_a_year_binds_cover_and_re_prices_avt() {
+        // The tracer: one turn of the whole annual loop. Demand meets supply, some
+        // cover binds, premium is earned, and the year-end re-set leaves every
+        // solvent syndicate carrying an AvT it can quote next year from.
+        let mut market = small_market(1);
+        let report = market.step_year();
+
+        assert_eq!(report.year, 0, "the first step reports year 0");
+        assert!(report.solvent_count > 0, "syndicates start solvent");
+        assert!(report.placements > 0, "demand and supply meet, so cover binds");
+        assert!(report.gross_premium > 0.0, "binding cover earns premium");
+        assert!(report.mean_avt > 0.0, "every syndicate carries a positive ask multiplier");
+        assert_eq!(market.year(), 1, "stepping advances the calendar");
+    }
+
+    #[test]
+    fn a_shared_catastrophe_hardens_exposed_syndicates_headroom_and_avt_together() {
+        // Criterion 5 / #2: a shared occurrence strikes every syndicate exposed to
+        // the zone at once. With the feedback channel silenced to isolate the
+        // headroom channel, the correlated capital drawdown collapses EVERY exposed
+        // syndicate's headroom together and lifts EVERY one's AvT target above the
+        // floor together — market-wide hardening as the aggregate of purely local
+        // states, with no coordinator and no market-phase variable.
+        let model = CatModel { annual_frequency: 0.5, min_damage_fraction: 0.05, tail_alpha: 1.5 };
+        let policy = ExposurePolicy { return_period: 200.0, solvency_fraction: 0.6, line_fraction: 0.6, tail_trials: 3_000 };
+        // Headroom channel only: feedback_responsiveness = 0.
+        let params = AvtParams { headroom_responsiveness: 0.5, feedback_responsiveness: 0.0, share_appetite: 0.5 };
+        // Three syndicates, each holding the same book in the same zone.
+        let book = NetBook { lines: vec![NetLine { territory: Territory(0), net_limit: 30.0 }] };
+        let mut syndicates = vec![Syndicate::with_capital(200.0); 3];
+
+        let read = |s: &Syndicate, rng_seed: u64| {
+            let mut rng = Rng::seeded(rng_seed);
+            policy.capacity_headroom(s, &book, &model, &mut rng)
+        };
+        // Pre-cat: abundant capital → high headroom, AvT relaxing at or below the floor.
+        let pre_headroom: Vec<f64> = (0..3).map(|i| read(&syndicates[i], 42 + i as u64)).collect();
+        let pre_avt: Vec<f64> = pre_headroom.iter().map(|&h| updated_avt(1.0, h, 0.5, &params)).collect();
+
+        // The shared catastrophe: one occurrence debits every exposed syndicate.
+        for s in &mut syndicates {
+            s.settle(150.0); // 200 → 50, together
+        }
+
+        // Post-cat: the same book now sits against a much smaller budget.
+        let post_headroom: Vec<f64> = (0..3).map(|i| read(&syndicates[i], 42 + i as u64)).collect();
+        let post_avt: Vec<f64> = post_headroom.iter().map(|&h| updated_avt(1.0, h, 0.5, &params)).collect();
+
+        for i in 0..3 {
+            assert!(post_headroom[i] < pre_headroom[i], "syndicate {i} headroom must collapse: {} !< {}", post_headroom[i], pre_headroom[i]);
+            assert!(post_avt[i] > pre_avt[i], "syndicate {i} AvT must harden: {} !> {}", post_avt[i], pre_avt[i]);
+            assert!(post_avt[i] > 1.0, "syndicate {i} holds out above the floor post-cat, got {}", post_avt[i]);
+        }
+    }
+
+    #[test]
+    fn a_multi_decade_run_stays_physical_and_holds_the_loss_settlement_invariants() {
+        // The hard gate. Stepping the real substrate for decades routes every loss
+        // through the settlement cascade, whose invariants `attribute` re-checks on
+        // each settlement — so completing the run at all means they held throughout.
+        // On top of that: capital never goes negative (the zero floor), and every
+        // diagnostic reading is finite and in range.
+        let mut market = small_market(7);
+        let reports = market.run(40);
+
+        assert_eq!(reports.len(), 40);
+        for id in 0..4 {
+            assert!(market.capital(SyndicateId(id)) >= 0.0, "capital never goes below the zero floor");
+        }
+        for r in &reports {
+            assert!(r.combined_ratio >= 0.0 && r.combined_ratio.is_finite(), "combined ratio is physical: {}", r.combined_ratio);
+            assert!(r.mean_avt >= 0.0 && r.mean_avt.is_finite(), "mean AvT is physical: {}", r.mean_avt);
+            assert!((0.0..=1.0).contains(&r.mean_headroom), "headroom is a fraction: {}", r.mean_headroom);
+            assert!(r.year < 40);
+        }
+        assert!(reports.iter().any(|r| r.placements > 0), "cover binds over the run");
+        assert!(reports.iter().any(|r| r.cat_events > 0), "the true cat process fires over the run");
+    }
+
+    #[test]
+    fn the_engines_loss_architecture_preserves_the_risk_pooling_invariant() {
+        // The other half of the gate: the engine's attritional peril pools (aggregate
+        // CV falls ~1/√N) while its catastrophe peril — a single shared occurrence —
+        // does not compress with pool size. If this fails the loss architecture under
+        // the run is wrong and no emergent cycle on top of it is trustworthy.
+        let attritional = AttritionalPeril { occurrence_probability: 0.2, mean_damage_fraction: 0.05 };
+        let cat = CatastrophePeril { annual_frequency: 0.4, min_damage_fraction: 0.05, tail_alpha: 1.5 };
+        let si = 100.0;
+        let trials = 6_000;
+        let mut rng = Rng::seeded(99);
+
+        // Attritional: each quadrupling of N roughly halves the CV.
+        let cv_small = coefficient_of_variation(&attritional_aggregate_samples(200, si, &attritional, trials, &mut rng));
+        let cv_large = coefficient_of_variation(&attritional_aggregate_samples(800, si, &attritional, trials, &mut rng));
+        assert!(cv_large < 0.65 * cv_small, "attritional must pool: {cv_large} not well below {cv_small}");
+
+        // Catastrophe (one shared occurrence): CV stays ~flat as the pool grows.
+        let cat_small = coefficient_of_variation(&catastrophe_aggregate_samples(1, 200, si, &cat, trials, &mut rng));
+        let cat_large = coefficient_of_variation(&catastrophe_aggregate_samples(1, 800, si, &cat, trials, &mut rng));
+        assert!(cat_large > 0.85 * cat_small, "catastrophe CV must not compress with N: {cat_large} vs {cat_small}");
     }
 }

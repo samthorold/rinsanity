@@ -634,7 +634,7 @@ pub fn portfolio_tail_loss(
     if zones.is_empty() || trials == 0 {
         return 0.0;
     }
-    let mut aggregates: Vec<f64> = (0..trials)
+    let aggregates: Vec<f64> = (0..trials)
         .map(|_| {
             zones
                 .iter()
@@ -651,10 +651,7 @@ pub fn portfolio_tail_loss(
                 .sum::<f64>() // cross-zone: independent draws diversify
         })
         .collect();
-    aggregates.sort_by(|a, b| a.partial_cmp(b).expect("losses are finite"));
-    let rank = ((trials as f64) * (1.0 - 1.0 / return_period)).ceil() as usize;
-    let index = rank.saturating_sub(1).min(trials - 1);
-    aggregates[index]
+    tail_quantile(aggregates, return_period)
 }
 
 /// Why a syndicate **declined** a risk under its exposure limits.
@@ -725,9 +722,575 @@ impl ExposurePolicy {
     }
 }
 
+/// The **Bühlmann-Straub credibility** weight `Z = n / (n + k)` placed on a
+/// syndicate's own experience when blending it with an industry benchmark. `n`
+/// is the volume (information content) of the syndicate's own experience —
+/// exposure-years or claim count — and `k` is the per-syndicate credibility
+/// parameter (the ratio of within-syndicate process variance to between-syndicate
+/// variance of hypothetical means), part of the selectable genome. Credibility
+/// is a function of *information content*, not elapsed time: a dense specialist
+/// (large `n`) earns `Z` near 1 and trusts itself; a thin generalist (small `n`)
+/// earns `Z` near 0 and leans on the benchmark. With `n = 0`, `Z = 0`.
+pub fn credibility(n: f64, k: f64) -> f64 {
+    let denominator = n + k;
+    if denominator <= 0.0 {
+        return 0.0;
+    }
+    n / denominator
+}
+
+/// The **attritional ELF** (expected loss cost) for the attritional component of
+/// a layer: the syndicate's own realised **burning cost** blended with an
+/// **industry benchmark** by Bühlmann-Straub [`credibility`],
+/// `Z·own + (1 − Z)·benchmark`. Attritional losses are high-frequency, so a year
+/// is informative and the estimate is **experience-updated** — the structural
+/// opposite of the model-anchored catastrophe ELF. `n` is the volume of the
+/// syndicate's own experience and `k` its per-syndicate credibility parameter.
+pub fn attritional_elf(own_burning_cost: f64, benchmark: f64, n: f64, k: f64) -> f64 {
+    let z = credibility(n, k);
+    z * own_burning_cost + (1.0 - z) * benchmark
+}
+
+/// The unit being priced: a [`Layer`] sitting over an underlying net `exposure`
+/// (the syndicate's net retained sum at risk for the risk) in a `territory`. A
+/// catastrophe in the territory strikes the whole exposure as one shared
+/// occurrence, and the layer bears `clamp(damage_fraction × exposure − attachment,
+/// 0, limit)`. Both the catastrophe ELF and the marginal tail capital are read off
+/// this.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerExposure {
+    pub layer: Layer,
+    pub exposure: f64,
+    pub territory: Territory,
+}
+
+/// The **catastrophe ELF** (expected loss cost) for the catastrophe component of
+/// a layer: the **model-anchored** expected annual cat loss to the layer over its
+/// underlying `exposure`, estimated from the syndicate's own [`CatModel`] belief.
+/// Each believed event's damage fraction strikes the whole exposure as one shared
+/// occurrence (`gul = damage_fraction × exposure`), and that ground-up loss flows
+/// up the layer ([`Layer::insured_loss`]); the ELF is the mean annual layered loss
+/// over `trials` believed years.
+///
+/// It is **never experience-updated**: it consumes only the model (and a seeded
+/// `rng`), so a run of benign, loss-free years cannot pull it down — a quiet
+/// decade is a benign sample, not evidence the hazard fell. Higher layers are
+/// reached only by larger believed events, so the cat ELF falls with attachment.
+pub fn catastrophe_elf(
+    layer: &Layer,
+    exposure: f64,
+    model: &CatModel,
+    trials: usize,
+    rng: &mut Rng,
+) -> f64 {
+    if trials == 0 {
+        return 0.0;
+    }
+    let total: f64 = (0..trials)
+        .map(|_| {
+            let count = model.annual_event_count(rng);
+            (0..count)
+                .map(|_| layer.insured_loss(model.draw_damage_fraction(rng) * exposure))
+                .sum::<f64>()
+        })
+        .sum();
+    total / trials as f64
+}
+
+/// The **actuarial technical price** of a layer: its loss cost loaded for
+/// expenses and profit by dividing by the **target loss ratio**,
+/// `ATP = loss_cost / target_loss_ratio`. Division by a target loss ratio below
+/// 1 is a **multiplicative** loading (`× 1 / target_loss_ratio > 1`), equivalent
+/// to the expense form `gross = pure / (1 − expense_ratio)` with the target loss
+/// ratio in the role of `1 − expense_ratio`. The multiplicative form self-funds
+/// the loading; additive loading systematically underprices. The cost-of-capital
+/// loading is added on top (see [`technical_premium`]).
+pub fn actuarial_technical_price(loss_cost: f64, target_loss_ratio: f64) -> f64 {
+    loss_cost / target_loss_ratio
+}
+
+/// The (1 − 1/return_period) quantile of a sorted sample of annual aggregate
+/// losses — the same tail read used by the portfolio tail measure.
+fn tail_quantile(mut aggregates: Vec<f64>, return_period: f64) -> f64 {
+    if aggregates.is_empty() {
+        return 0.0;
+    }
+    aggregates.sort_by(|a, b| a.partial_cmp(b).expect("losses are finite"));
+    let trials = aggregates.len();
+    let rank = ((trials as f64) * (1.0 - 1.0 / return_period)).ceil() as usize;
+    let index = rank.saturating_sub(1).min(trials - 1);
+    aggregates[index]
+}
+
+/// The **marginal capital** a layer consumes: its marginal contribution to the
+/// syndicate's [`portfolio_tail_loss`] measure — the return-period net loss WITH
+/// the `risk` (a [`LayerExposure`]) on the book minus WITHOUT it. The existing
+/// `book` is the syndicate's current net retained lines, and the measure is
+/// computed from the syndicate's own [`CatModel`] belief with zone correlation,
+/// exactly as `portfolio_tail_loss`.
+///
+/// Both the with- and without-layer aggregates are read off the **same** believed
+/// event draws (common random numbers, one simulation), so the difference is the
+/// layer's clean marginal contribution rather than Monte-Carlo noise. The measure
+/// is **layer-aware**: a higher attachment is penetrated only by larger believed
+/// events, so an upper, cat-exposed layer that the tail does reach consumes
+/// disproportionate tail capital per unit of limit while a remote layer the tail
+/// never reaches consumes almost none. This is the capital the cost-of-capital
+/// loading charges for (see [`technical_premium`]).
+pub fn marginal_capital(
+    book: &NetBook,
+    risk: &LayerExposure,
+    model: &CatModel,
+    return_period: f64,
+    trials: usize,
+    rng: &mut Rng,
+) -> f64 {
+    if trials == 0 {
+        return 0.0;
+    }
+    // The zones the simulation walks: the book's zones, plus the candidate's
+    // territory if the book has no exposure there yet.
+    let mut zones = book.zones();
+    if !zones.contains(&risk.territory) {
+        zones.push(risk.territory);
+    }
+    let zone_exposures: Vec<(Territory, f64)> =
+        zones.iter().map(|&z| (z, book.zone_exposure(z))).collect();
+
+    let mut base = Vec::with_capacity(trials);
+    let mut with_layer = Vec::with_capacity(trials);
+    for _ in 0..trials {
+        let mut base_year = 0.0;
+        let mut with_year = 0.0;
+        for &(zone, flat_exposure) in &zone_exposures {
+            // One year's believed events in this zone, drawn once and shared by
+            // both books (common random numbers).
+            let count = model.annual_event_count(rng);
+            for _ in 0..count {
+                let damage_fraction = model.draw_damage_fraction(rng);
+                let flat_loss = damage_fraction * flat_exposure;
+                base_year += flat_loss;
+                with_year += flat_loss;
+                if zone == risk.territory {
+                    // The candidate layer is struck by the same shared occurrence.
+                    with_year += risk.layer.insured_loss(damage_fraction * risk.exposure);
+                }
+            }
+        }
+        base.push(base_year);
+        with_layer.push(with_year);
+    }
+    let marginal = tail_quantile(with_layer, return_period) - tail_quantile(base, return_period);
+    marginal.max(0.0)
+}
+
+/// A syndicate's realised **attritional experience** for a risk, the input to the
+/// experience-updated attritional ELF: its own realised **burning cost**, the
+/// **industry benchmark** burning cost, and the **volume** `n` of own experience
+/// (exposure-years / claim count) that drives Bühlmann-Straub credibility.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttritionalExperience {
+    pub own_burning_cost: f64,
+    pub benchmark: f64,
+    pub volume: f64,
+}
+
+/// The per-syndicate **pricing genome** parameters and pricing calibration that
+/// build the technical premium. `hurdle_rate` (the cost-of-capital loading rate)
+/// and `credibility_k` (the Bühlmann-Straub information-content parameter) are
+/// selectable genome parameters that vary across the population (#12);
+/// `target_loss_ratio` is pricing calibration; and `return_period` / `tail_trials`
+/// configure the portfolio tail measure the cost-of-capital loading reads. They
+/// live with the syndicate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PricingParams {
+    pub hurdle_rate: f64,
+    pub credibility_k: f64,
+    pub target_loss_ratio: f64,
+    /// The return period the marginal tail capital is read at (e.g. 200).
+    pub return_period: f64,
+    /// Monte-Carlo trials for the catastrophe ELF and the marginal tail capital.
+    pub tail_trials: usize,
+}
+
+/// The decomposed **technical premium** (TP) for a layer — the rational price
+/// floor, not the market price. Loss cost splits into an experience-updated
+/// attritional ELF and a model-anchored catastrophe ELF; the actuarial technical
+/// price loads loss cost multiplicatively by the target loss ratio; and the
+/// cost-of-capital loading is the hurdle rate on the marginal tail capital the
+/// layer consumes. `TP = ATP + cost_of_capital`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TechnicalPremium {
+    pub attritional_elf: f64,
+    pub catastrophe_elf: f64,
+    pub loss_cost: f64,
+    pub actuarial_technical_price: f64,
+    pub marginal_capital: f64,
+    pub cost_of_capital: f64,
+    pub technical_premium: f64,
+}
+
+/// Compute a syndicate's [`TechnicalPremium`] for a `risk` (a [`LayerExposure`]),
+/// given its current net `book`, its own [`CatModel`] belief, its realised
+/// attritional [`experience`](AttritionalExperience), and its [`PricingParams`].
+/// The rational floor the market's actual premium oscillates around — computing
+/// it encodes no market behaviour.
+///
+/// Loss cost = experience-updated [`attritional_elf`] + model-anchored
+/// [`catastrophe_elf`]; the [`actuarial_technical_price`] loads it by the target
+/// loss ratio; and the cost-of-capital loading is `hurdle_rate × marginal_capital`,
+/// where [`marginal_capital`] is the layer's marginal contribution to the
+/// portfolio tail measure. The tail measure's `return_period` and `tail_trials`
+/// come from the params; the result is deterministic given a seeded `rng`.
+pub fn technical_premium(
+    risk: &LayerExposure,
+    book: &NetBook,
+    model: &CatModel,
+    experience: &AttritionalExperience,
+    params: &PricingParams,
+    rng: &mut Rng,
+) -> TechnicalPremium {
+    let attritional = attritional_elf(
+        experience.own_burning_cost,
+        experience.benchmark,
+        experience.volume,
+        params.credibility_k,
+    );
+    let catastrophe = catastrophe_elf(&risk.layer, risk.exposure, model, params.tail_trials, rng);
+    let loss_cost = attritional + catastrophe;
+    let atp = actuarial_technical_price(loss_cost, params.target_loss_ratio);
+    let marginal = marginal_capital(book, risk, model, params.return_period, params.tail_trials, rng);
+    let cost_of_capital = params.hurdle_rate * marginal;
+    TechnicalPremium {
+        attritional_elf: attritional,
+        catastrophe_elf: catastrophe,
+        loss_cost,
+        actuarial_technical_price: atp,
+        marginal_capital: marginal,
+        cost_of_capital,
+        technical_premium: atp + cost_of_capital,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bühlmann_straub_credibility_rises_with_information_content() {
+        // Z = n / (n + k): credibility as a function of the VOLUME of own
+        // experience n against the per-syndicate parameter k. With no own data
+        // Z is 0 (lean entirely on the benchmark); as n grows past k, Z passes a
+        // half and climbs toward 1 (trust own experience); it never reaches 1.
+        let k = 10.0;
+        assert_eq!(credibility(0.0, k), 0.0);
+        assert!((credibility(10.0, k) - 0.5).abs() < 1e-12); // n == k → exactly a half
+        assert!(credibility(90.0, k) > 0.89 && credibility(90.0, k) < 1.0);
+        // Strictly increasing in n.
+        assert!(credibility(5.0, k) < credibility(50.0, k));
+    }
+
+    #[test]
+    fn attritional_elf_blends_own_burning_cost_and_benchmark_by_credibility() {
+        // The attritional ELF is experience-updated: Z·own + (1−Z)·benchmark.
+        // At full credibility (Z→1) it equals own burning cost; at zero
+        // credibility (n = 0) it equals the benchmark; in between it interpolates.
+        let own = 120.0;
+        let benchmark = 80.0;
+        let k = 10.0;
+
+        // No own experience → lean entirely on the benchmark.
+        assert!((attritional_elf(own, benchmark, 0.0, k) - benchmark).abs() < 1e-9);
+        // n == k → Z = 0.5 → the midpoint of own and benchmark.
+        assert!((attritional_elf(own, benchmark, 10.0, k) - 100.0).abs() < 1e-9);
+        // Dense own experience → close to own burning cost.
+        let dense = attritional_elf(own, benchmark, 1_000.0, k);
+        assert!(dense > 119.0 && dense < own);
+    }
+
+    #[test]
+    fn credibility_differs_between_a_dense_specialist_and_a_thin_generalist() {
+        // Specialist/generalist divergence (#4) is straight from information
+        // content: a narrow specialist with dense, low-variance data in its line
+        // earns a high Z and trusts its own burning cost; a thin generalist earns
+        // a low Z and leans on the industry benchmark — over the SAME own/benchmark
+        // gap, so the only thing differing is the volume of own experience (and the
+        // per-syndicate k).
+        let own = 150.0; // both have observed the same own burning cost
+        let benchmark = 100.0;
+
+        // Dense specialist: many exposure-years of own data, tight k.
+        let specialist_n = 200.0;
+        let specialist_k = 8.0;
+        let z_specialist = credibility(specialist_n, specialist_k);
+        let elf_specialist = attritional_elf(own, benchmark, specialist_n, specialist_k);
+
+        // Thin generalist: little own data, looser k.
+        let generalist_n = 3.0;
+        let generalist_k = 20.0;
+        let z_generalist = credibility(generalist_n, generalist_k);
+        let elf_generalist = attritional_elf(own, benchmark, generalist_n, generalist_k);
+
+        // The specialist trusts itself far more than the generalist.
+        assert!(z_specialist > 0.9, "specialist Z {z_specialist} should be near 1");
+        assert!(z_generalist < 0.2, "generalist Z {z_generalist} should be near 0");
+        assert!(z_specialist > z_generalist);
+
+        // So the specialist's ELF sits close to its own burning cost, while the
+        // generalist's is pulled toward the benchmark.
+        assert!((elf_specialist - own).abs() < (elf_generalist - own).abs());
+        assert!(elf_specialist > 145.0);
+        assert!(elf_generalist < 110.0);
+    }
+
+    #[test]
+    fn catastrophe_elf_is_layer_aware_and_falls_as_attachment_rises() {
+        // The catastrophe ELF is the model-anchored expected annual cat loss to a
+        // layer over its underlying exposure: derived from the syndicate's own
+        // CatModel by flowing each believed event's damage up the layer. Because a
+        // higher layer is reached only by larger events, the cat ELF falls sharply
+        // as attachment rises (the loss-cost half of the layer-position gradient).
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let exposure = 1_000.0;
+        let limit = 100.0;
+
+        let working = Layer { attachment: 0.0, limit };
+        let upper = Layer { attachment: 400.0, limit };
+
+        let mut rng = Rng::seeded(2024);
+        let elf_working = catastrophe_elf(&working, exposure, &model, 8_000, &mut rng);
+        let mut rng = Rng::seeded(2024);
+        let elf_upper = catastrophe_elf(&upper, exposure, &model, 8_000, &mut rng);
+
+        assert!(elf_working > 0.0, "a cat-exposed working layer has positive ELF");
+        assert!(elf_upper > 0.0, "a reachable upper layer has positive ELF");
+        assert!(
+            elf_upper < elf_working,
+            "upper-layer cat ELF {elf_upper} should be far below working {elf_working}"
+        );
+    }
+
+    #[test]
+    fn catastrophe_elf_is_model_anchored_and_unmoved_by_benign_experience() {
+        // Cat ELF comes from the CatModel belief and is NEVER pulled down by a run
+        // of loss-free years. We compute it, then "live through" a decade of benign
+        // (zero realised loss) cat experience, and recompute: it is identical,
+        // because catastrophe_elf consumes only the model — there is no experience
+        // input to it (the truth/belief separation enforced by the type signature).
+        let model = CatModel { annual_frequency: 0.5, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let layer = Layer { attachment: 0.0, limit: 100.0 };
+        let exposure = 1_000.0;
+
+        let mut rng = Rng::seeded(7);
+        let elf_before = catastrophe_elf(&layer, exposure, &model, 8_000, &mut rng);
+
+        // A decade of benign experience: realised cat losses are all zero. This is
+        // a benign SAMPLE, not evidence the hazard fell — and it cannot touch the
+        // model-anchored estimate.
+        let benign_realised_losses = [0.0_f64; 10];
+        assert!(benign_realised_losses.iter().all(|&l| l == 0.0));
+
+        let mut rng = Rng::seeded(7);
+        let elf_after = catastrophe_elf(&layer, exposure, &model, 8_000, &mut rng);
+
+        assert_eq!(
+            elf_before, elf_after,
+            "benign experience must not move the model-anchored cat ELF"
+        );
+        // Contrast: were the cat ELF experience-updated like the attritional one,
+        // the benign zero burning cost observed at high credibility (own = 0)
+        // would collapse it toward zero against the model as benchmark — the
+        // soft-market rate-erosion miscalibration the cat ELF is built to avoid.
+        let experience_updated = attritional_elf(0.0, elf_before, 1_000.0, 10.0);
+        assert!(experience_updated < 0.5 * elf_before);
+    }
+
+    #[test]
+    fn the_actuarial_technical_price_loads_loss_cost_multiplicatively() {
+        // ATP = loss_cost / target_loss_ratio. Dividing by a target loss ratio
+        // below 1 is a MULTIPLICATIVE loading (× 1/target_LR > 1), the form that
+        // self-funds the loading — additive loading systematically underprices.
+        let loss_cost = 60.0;
+        let target_loss_ratio = 0.6;
+        let atp = actuarial_technical_price(loss_cost, target_loss_ratio);
+
+        // The defining identity.
+        assert!((atp - 100.0).abs() < 1e-9);
+        // Multiplicative: the loaded price is a constant factor 1/target_LR above
+        // loss cost, so doubling loss cost doubles ATP (a fixed factor, not a fixed
+        // additive margin).
+        assert!((atp / loss_cost - 1.0 / target_loss_ratio).abs() < 1e-12);
+        let doubled = actuarial_technical_price(2.0 * loss_cost, target_loss_ratio);
+        assert!((doubled - 2.0 * atp).abs() < 1e-9);
+        // Equivalent to the multiplicative expense form gross = pure/(1−expense)
+        // when the target loss ratio plays the role of (1 − expense_ratio).
+        let expense_ratio = 1.0 - target_loss_ratio;
+        assert!((atp - loss_cost / (1.0 - expense_ratio)).abs() < 1e-9);
+        // The loading genuinely lifts the price above the pure loss cost.
+        assert!(atp > loss_cost);
+    }
+
+    #[test]
+    fn marginal_capital_is_the_layers_contribution_to_the_portfolio_tail_measure() {
+        // marginal_capital(layer) = portfolio tail measure WITH the layer minus
+        // WITHOUT it, over the syndicate's own book and cat-model belief. On an
+        // empty book it is the standalone return-period loss the layer adds; it is
+        // non-negative (a layer can only add exposure) and deterministic.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let empty = NetBook { lines: vec![] };
+        let layer = Layer { attachment: 0.0, limit: 100.0 };
+        let exposure = 1_000.0;
+        let t0 = Territory(0);
+
+        let risk = LayerExposure { layer, exposure, territory: t0 };
+        let mut rng = Rng::seeded(2024);
+        let mc = marginal_capital(&empty, &risk, &model, 200.0, 8_000, &mut rng);
+        assert!(mc > 0.0, "a cat-exposed working layer consumes tail capital");
+
+        // Deterministic given a seed.
+        let mut rng = Rng::seeded(2024);
+        let mc_again = marginal_capital(&empty, &risk, &model, 200.0, 8_000, &mut rng);
+        assert_eq!(mc, mc_again);
+
+        // Adding the layer to an existing book never lowers the tail (marginal ≥ 0).
+        let book = NetBook { lines: vec![NetLine { territory: t0, net_limit: 500.0 }] };
+        let mut rng = Rng::seeded(11);
+        let mc_on_book = marginal_capital(&book, &risk, &model, 200.0, 8_000, &mut rng);
+        assert!(mc_on_book >= 0.0);
+    }
+
+    #[test]
+    fn marginal_capital_is_layer_aware_so_an_unreachable_upper_layer_consumes_almost_none() {
+        // The measure is layer-aware, not a flat limit charge: a layer attaching
+        // far above any believable event almost never penetrates, so it adds
+        // essentially nothing to the return-period loss — it consumes negligible
+        // tail capital, while a working layer over the same exposure consumes much.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let empty = NetBook { lines: vec![] };
+        let exposure = 1_000.0;
+        let t0 = Territory(0);
+
+        let working = Layer { attachment: 0.0, limit: 100.0 };
+        // Attaches at 980 over exposure 1000: needs a damage fraction above 0.98,
+        // far into the believed tail, so the 1-in-200 barely reaches it.
+        let remote = Layer { attachment: 980.0, limit: 20.0 };
+
+        let working_risk = LayerExposure { layer: working, exposure, territory: t0 };
+        let remote_risk = LayerExposure { layer: remote, exposure, territory: t0 };
+        let mut rng = Rng::seeded(2024);
+        let mc_working = marginal_capital(&empty, &working_risk, &model, 200.0, 8_000, &mut rng);
+        let mut rng = Rng::seeded(2024);
+        let mc_remote = marginal_capital(&empty, &remote_risk, &model, 200.0, 8_000, &mut rng);
+
+        assert!(mc_working > 0.0);
+        // Per unit of limit the remote layer consumes far less tail capital.
+        assert!(
+            mc_remote / remote.limit < 0.2 * (mc_working / working.limit),
+            "remote/limit {} not far below working/limit {}",
+            mc_remote / remote.limit,
+            mc_working / working.limit
+        );
+    }
+
+    fn cat_model() -> CatModel {
+        CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 }
+    }
+
+    #[test]
+    fn the_technical_premium_is_the_actuarial_price_plus_a_cost_of_capital_loading() {
+        // TP = ATP + hurdle_rate × marginal_capital(layer). The breakdown is
+        // internally consistent: loss cost is attritional ELF + catastrophe ELF,
+        // ATP loads it by the target loss ratio, and the cost-of-capital loading is
+        // the per-syndicate hurdle rate on the marginal tail capital the layer
+        // consumes.
+        let model = cat_model();
+        let book = NetBook { lines: vec![] };
+        let risk = LayerExposure { layer: Layer { attachment: 0.0, limit: 100.0 }, exposure: 1_000.0, territory: Territory(0) };
+        let experience = AttritionalExperience { own_burning_cost: 30.0, benchmark: 25.0, volume: 50.0 };
+        let params = PricingParams { hurdle_rate: 0.15, credibility_k: 10.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 8_000 };
+
+        let mut rng = Rng::seeded(2024);
+        let tp = technical_premium(&risk, &book, &model, &experience, &params, &mut rng);
+
+        // Components reconcile.
+        assert!((tp.loss_cost - (tp.attritional_elf + tp.catastrophe_elf)).abs() < 1e-9);
+        assert!((tp.actuarial_technical_price - tp.loss_cost / params.target_loss_ratio).abs() < 1e-9);
+        assert!((tp.cost_of_capital - params.hurdle_rate * tp.marginal_capital).abs() < 1e-9);
+        assert!((tp.technical_premium - (tp.actuarial_technical_price + tp.cost_of_capital)).abs() < 1e-9);
+
+        // Both halves of loss cost are present and positive for a cat-exposed
+        // working layer with attritional experience.
+        assert!(tp.attritional_elf > 0.0 && tp.catastrophe_elf > 0.0);
+        assert!(tp.cost_of_capital > 0.0);
+
+        // A higher hurdle rate raises the technical premium through the loading
+        // alone; a zero hurdle collapses TP onto the actuarial technical price.
+        let greedier = PricingParams { hurdle_rate: 0.30, ..params };
+        let mut rng = Rng::seeded(2024);
+        let tp_greedier = technical_premium(&risk, &book, &model, &experience, &greedier, &mut rng);
+        assert!(tp_greedier.technical_premium > tp.technical_premium);
+
+        let no_hurdle = PricingParams { hurdle_rate: 0.0, ..params };
+        let mut rng = Rng::seeded(2024);
+        let tp_floor = technical_premium(&risk, &book, &model, &experience, &no_hurdle, &mut rng);
+        assert!((tp_floor.technical_premium - tp_floor.actuarial_technical_price).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_layer_position_premium_gradient_emerges_up_a_tower() {
+        // Layer-position premium gradient (#10), derived — never scheduled. Pricing
+        // a vertical tower of equal-limit catastrophe layers over one exposure:
+        //
+        //   * rate-on-line (TP per unit limit) FALLS as attachment rises — the
+        //     loss cost collapses because higher layers are reached only by rarer,
+        //     larger events;
+        //   * the cost-of-capital SHARE of the premium RISES as attachment rises —
+        //     working/primary layers are loss-cost-dominated, while upper,
+        //     cat-exposed layers are capital-dominated: almost all of their thin
+        //     premium is the required return on the tail capital they consume.
+        //
+        // Both fall out of capital consumption and the model-anchored cat ELF, not
+        // a hardcoded per-layer schedule.
+        let model = cat_model();
+        let book = NetBook { lines: vec![] };
+        let exposure = 1_000.0;
+        let limit = 100.0;
+        // Pure catastrophe layers (no attritional component), to read the cat-driven
+        // vertical gradient cleanly.
+        let no_attritional = AttritionalExperience { own_burning_cost: 0.0, benchmark: 0.0, volume: 0.0 };
+        let params = PricingParams { hurdle_rate: 0.15, credibility_k: 10.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 8_000 };
+
+        let attachments = [0.0, 100.0, 200.0, 400.0];
+        let priced: Vec<TechnicalPremium> = attachments
+            .iter()
+            .map(|&attachment| {
+                let risk = LayerExposure { layer: Layer { attachment, limit }, exposure, territory: Territory(0) };
+                // Common random numbers across layers: same seed isolates the
+                // layer-position effect from Monte-Carlo noise.
+                let mut rng = Rng::seeded(2024);
+                technical_premium(&risk, &book, &model, &no_attritional, &params, &mut rng)
+            })
+            .collect();
+
+        let rate_on_line: Vec<f64> = priced.iter().map(|p| p.technical_premium / limit).collect();
+        let coc_share: Vec<f64> = priced.iter().map(|p| p.cost_of_capital / p.technical_premium).collect();
+
+        // Rate-on-line strictly falls as attachment rises.
+        for window in rate_on_line.windows(2) {
+            assert!(window[1] < window[0], "rate-on-line did not fall with attachment: {rate_on_line:?}");
+        }
+        // Cost-of-capital share strictly rises as attachment rises.
+        for window in coc_share.windows(2) {
+            assert!(window[1] > window[0], "cost-of-capital share did not rise with attachment: {coc_share:?}");
+        }
+
+        // The working (primary) layer is loss-cost-dominated; the top layer is
+        // capital-dominated — the two faces of the gradient.
+        let working = priced.first().unwrap();
+        let top = priced.last().unwrap();
+        assert!(working.actuarial_technical_price > working.cost_of_capital);
+        assert!(top.cost_of_capital > top.actuarial_technical_price);
+    }
 
     #[test]
     fn an_empty_net_book_has_zero_portfolio_tail_loss() {

@@ -81,6 +81,145 @@ impl AttritionalPeril {
     }
 }
 
+/// The catastrophe peril: a territory's true **cat process** (the ground-truth
+/// generator of occurrences — frequency, heavy-tailed severity). A catastrophe
+/// is a rare, large event that strikes *all* exposed assets in a territory as a
+/// single shared occurrence, so its losses are correlated by construction.
+///
+/// This is the substrate's truth, not any syndicate's belief (a *cat model*);
+/// no agent observes it directly.
+#[derive(Debug, Clone, Copy)]
+pub struct CatastrophePeril {
+    /// Expected number of catastrophe events per year in the territory (the mean
+    /// of a Poisson arrival count, so multiple events in one year are possible).
+    pub annual_frequency: f64,
+    /// The Pareto scale `x_m`: the minimum (and most probable) damage fraction.
+    pub min_damage_fraction: f64,
+    /// Pareto tail index `α`. Smaller is heavier: the empirical US-hurricane
+    /// damage tail sits near `α ≈ 1.25–1.52` (near-infinite variance), the
+    /// regime that drives cat-year capital volatility.
+    pub tail_alpha: f64,
+}
+
+impl CatastrophePeril {
+    /// Draw one event's uniform damage fraction from a Pareto-style law,
+    /// `x_m · U^(−1/α)` with `U` uniform on `(0, 1]`, clamped into `[0, 1]`. The
+    /// result has a heavy body but bounded support, so `GUL ≤ sum_insured`
+    /// holds while the tail stays empirically fat.
+    pub fn draw_damage_fraction(&self, rng: &mut Rng) -> f64 {
+        // 1 − uniform() lands in (0, 1], avoiding a divide-by-zero blow-up.
+        let u = 1.0 - rng.uniform();
+        let pareto = self.min_damage_fraction * u.powf(-1.0 / self.tail_alpha);
+        pareto.clamp(0.0, 1.0)
+    }
+
+    /// The number of catastrophe events arriving in one year, a Poisson count
+    /// with mean [`annual_frequency`](Self::annual_frequency), drawn by Knuth's
+    /// algorithm from the in-crate uniform stream.
+    fn annual_event_count(&self, rng: &mut Rng) -> usize {
+        let threshold = (-self.annual_frequency).exp();
+        let mut count = 0usize;
+        let mut product = 1.0;
+        loop {
+            product *= rng.uniform();
+            if product <= threshold {
+                return count;
+            }
+            count += 1;
+        }
+    }
+
+    /// Draw this year's catastrophe events for the territory: a Poisson number
+    /// of single shared occurrences, each placed at a uniform within-year time
+    /// and carrying its own heavy-tailed damage fraction. Returned in
+    /// chronological order.
+    pub fn annual_events(&self, rng: &mut Rng) -> Vec<CatastropheEvent> {
+        let count = self.annual_event_count(rng);
+        let mut events: Vec<CatastropheEvent> = (0..count)
+            .map(|_| CatastropheEvent {
+                time: rng.uniform(),
+                damage_fraction: self.draw_damage_fraction(rng),
+            })
+            .collect();
+        events.sort_by(|a, b| a.time.partial_cmp(&b.time).expect("times are finite"));
+        events
+    }
+}
+
+/// A single catastrophe occurrence in a territory: a point on the within-year
+/// time axis carrying the **uniform damage fraction** the event inflicts on
+/// every exposed asset in the struck territory at once. The "shared occurrence"
+/// of the risk-pooling diagnostic — contrast with attritional, drawn
+/// independently per asset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CatastropheEvent {
+    /// When in the year the event falls, as a fraction of the year in `[0, 1)`.
+    pub time: f64,
+    /// The damage fraction applied uniformly to every exposed asset, in `[0, 1]`
+    /// so `GUL ≤ sum_insured` per asset.
+    pub damage_fraction: f64,
+}
+
+/// The insurer's aggregate catastrophe ground-up loss over a pool of assets in
+/// one territory across a year's catastrophe events. Each event is a single
+/// shared occurrence: its uniform damage fraction strikes every asset, whose
+/// ground-up loss flows through a full-value layer. Because the draw is shared,
+/// the aggregate is `Σ_events damage_fraction × Σ_assets sum_insured` — the
+/// total exposure scales the loss but does not diversify the event severity,
+/// which is why the catastrophe-component CV is flat in pool size.
+pub fn territory_catastrophe_loss(assets: &[Asset], events: &[CatastropheEvent]) -> f64 {
+    events
+        .iter()
+        .map(|event| {
+            assets
+                .iter()
+                .map(|asset| {
+                    let gul = ground_up_loss(event.damage_fraction, asset.sum_insured);
+                    Layer::full_value(asset.sum_insured).insured_loss(gul)
+                })
+                .sum::<f64>()
+        })
+        .sum()
+}
+
+/// Sample the insurer's aggregate catastrophe loss over `trials` independent
+/// years for a market of `territories` uncorrelated territories, each holding a
+/// fresh pool of `pool_size_per_territory` identical assets and running its own
+/// independent cat process. Returns one aggregate-loss figure per year.
+///
+/// The instrument the catastrophe risk-pooling diagnostic reads: holding
+/// `territories = 1` and growing the pool shows the cat CV is flat in pool size
+/// (shared draw); holding total exposure fixed and growing `territories` shows
+/// it falls ~1/√T (diversification across uncorrelated zones).
+pub fn catastrophe_aggregate_samples(
+    territories: usize,
+    pool_size_per_territory: usize,
+    sum_insured: f64,
+    peril: &CatastrophePeril,
+    trials: usize,
+    rng: &mut Rng,
+) -> Vec<f64> {
+    let zones: Vec<Vec<Asset>> = (0..territories)
+        .map(|z| {
+            (0..pool_size_per_territory)
+                .map(|_| Asset { sum_insured, territory: Territory(z as u32) })
+                .collect()
+        })
+        .collect();
+    (0..trials)
+        .map(|_| {
+            zones
+                .iter()
+                .map(|assets| {
+                    // Each territory draws its own independent catastrophe events.
+                    let events = peril.annual_events(rng);
+                    territory_catastrophe_loss(assets, &events)
+                })
+                .sum()
+        })
+        .collect()
+}
+
 /// The insurer's aggregate attritional ground-up loss over a pool of assets in
 /// one period: each asset is struck by an independent attritional occurrence,
 /// whose ground-up loss flows through a full-value layer (attachment 0,
@@ -386,6 +525,204 @@ mod tests {
         // occurrence would produce).
         let hit_rate = struck as f64 / losses.len() as f64;
         assert!((0.25..0.35).contains(&hit_rate), "hit rate {hit_rate} not near 0.3");
+    }
+
+    #[test]
+    fn a_catastrophe_event_is_a_single_shared_occurrence_across_the_territory() {
+        // The defining contrast with attritional: one cat event applies the SAME
+        // damage fraction to every exposed asset in the struck territory at once.
+        // A panel of assets with heterogeneous sums insured each lose that one
+        // fraction of their own value — perfectly correlated, not independent.
+        let event = CatastropheEvent { time: 0.5, damage_fraction: 0.3 };
+        let assets = [
+            Asset { sum_insured: 1_000.0, territory: Territory(0) },
+            Asset { sum_insured: 4_000.0, territory: Territory(0) },
+        ];
+        // Each asset loses 0.3 of its own sum insured: 300 + 1200 = 1500.
+        let loss = territory_catastrophe_loss(&assets, &[event]);
+        assert_eq!(loss, 0.3 * (1_000.0 + 4_000.0));
+    }
+
+    #[test]
+    fn catastrophe_loss_never_exceeds_total_sum_insured() {
+        // The physical cap survives the shared occurrence: even a degenerate
+        // damage fraction beyond 1.0 cannot inflict more than each asset's full
+        // replacement value (GUL ≤ sum insured, per asset).
+        let event = CatastropheEvent { time: 0.1, damage_fraction: 1.5 };
+        let assets = [
+            Asset { sum_insured: 1_000.0, territory: Territory(0) },
+            Asset { sum_insured: 2_000.0, territory: Territory(0) },
+        ];
+        let loss = territory_catastrophe_loss(&assets, &[event]);
+        assert_eq!(loss, 3_000.0);
+    }
+
+    #[test]
+    fn catastrophe_severity_is_heavy_tailed_and_bounded_to_the_unit_interval() {
+        // A Pareto-style severity: a heavy *body* (most events mild, occasional
+        // extreme) with *bounded support* — the damage fraction is clamped into
+        // [0, 1], the first of the two stacked domain caps. Heavy-tailed shows up
+        // as a mean well below the midpoint yet a tail that reaches the cap.
+        let peril = CatastrophePeril {
+            annual_frequency: 0.5,
+            tail_alpha: 1.4,
+            min_damage_fraction: 0.02,
+        };
+        let mut rng = Rng::seeded(2024);
+        let draws: Vec<f64> = (0..50_000).map(|_| peril.draw_damage_fraction(&mut rng)).collect();
+
+        // Bounded support: every draw lies in [0, 1].
+        for d in &draws {
+            assert!((0.0..=1.0).contains(d), "damage fraction {d} outside [0, 1]");
+        }
+
+        // Heavy-tailed body: the bulk of events are mild (median well below the
+        // mean), yet the tail occasionally reaches the [0,1] cap.
+        let mean = draws.iter().sum::<f64>() / draws.len() as f64;
+        let small = draws.iter().filter(|&&d| d < 0.1).count() as f64 / draws.len() as f64;
+        let capped = draws.iter().filter(|&&d| d >= 1.0).count();
+        assert!(mean < 0.25, "mean {mean} too high for a heavy-tailed body");
+        assert!(small > 0.5, "expected most events mild; only {small} below 0.1");
+        assert!(capped > 0, "expected a tail reaching the [0,1] cap; none did");
+    }
+
+    #[test]
+    fn catastrophe_events_fall_on_a_within_year_time_axis_with_multiple_per_year_possible() {
+        // Events arrive on a within-year axis (times in [0, 1), chronological),
+        // and the Poisson count means a year can carry zero, one, or several
+        // events — the precondition for clustered-event within-year hardening.
+        let peril = CatastrophePeril {
+            annual_frequency: 1.5,
+            min_damage_fraction: 0.02,
+            tail_alpha: 1.4,
+        };
+        let mut rng = Rng::seeded(7);
+
+        let mut counts = Vec::new();
+        for _ in 0..5_000 {
+            let events = peril.annual_events(&mut rng);
+            // Times lie within the year and are in chronological order.
+            for window in events.windows(2) {
+                assert!(window[0].time <= window[1].time, "events not chronological");
+            }
+            for e in &events {
+                assert!((0.0..1.0).contains(&e.time), "time {} outside [0, 1)", e.time);
+                assert!((0.0..=1.0).contains(&e.damage_fraction));
+            }
+            counts.push(events.len());
+        }
+
+        // Some years are quiet, some carry multiple events.
+        let quiet = counts.iter().filter(|&&c| c == 0).count();
+        let multi = counts.iter().filter(|&&c| c >= 2).count();
+        assert!(quiet > 0, "expected some catastrophe-free years");
+        assert!(multi > 0, "expected some years with multiple events");
+
+        // The mean event count tracks the configured annual frequency.
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        assert!((1.35..1.65).contains(&mean), "mean event count {mean} off 1.5");
+    }
+
+    #[test]
+    fn catastrophe_cv_is_flat_in_pool_size_but_falls_when_spread_across_territories() {
+        // The catastrophe half of the risk-pooling diagnostic invariant, the
+        // structural mirror of the attritional 1/√N law:
+        //
+        //   * Within ONE territory the cat draw is shared, so growing the pool
+        //     scales the loss but cannot diversify the event severity — the
+        //     catastrophe-component CV is ~flat in pool size.
+        //   * Spreading the SAME total exposure across more *uncorrelated*
+        //     territories does diversify (independent cat processes), so the CV
+        //     falls ~1/√T. This is the only thing that reduces cat variance.
+        let peril = CatastrophePeril {
+            annual_frequency: 0.6,
+            min_damage_fraction: 0.02,
+            tail_alpha: 1.4,
+        };
+        let trials = 12_000;
+        let sum_insured = 1_000.0;
+
+        // --- Flat in N within one territory ---
+        // Flatness is exact (the pool size cancels in the CV), so modest pools
+        // demonstrate it; we grow N 16× and the CV barely moves.
+        let mut rng = Rng::seeded(2024);
+        let cvs_by_pool: Vec<f64> = [50usize, 100, 200, 800]
+            .iter()
+            .map(|&n| {
+                let samples =
+                    catastrophe_aggregate_samples(1, n, sum_insured, &peril, trials, &mut rng);
+                coefficient_of_variation(&samples)
+            })
+            .collect();
+
+        // The CV barely moves as the pool grows 64×: every ratio stays near 1.
+        for window in cvs_by_pool.windows(2) {
+            let ratio = window[1] / window[0];
+            assert!(
+                (0.9..1.1).contains(&ratio),
+                "cat CV not flat in pool size: {cvs_by_pool:?}"
+            );
+        }
+
+        // --- Falls ~1/√T as the same total exposure spreads across territories ---
+        // Hold total assets at 1024; split across 1, 4, 16, 64 territories.
+        let total = 1_024usize;
+        let cvs_by_spread: Vec<f64> = [1usize, 4, 16, 64]
+            .iter()
+            .map(|&t| {
+                let per = total / t;
+                let samples =
+                    catastrophe_aggregate_samples(t, per, sum_insured, &peril, trials, &mut rng);
+                coefficient_of_variation(&samples)
+            })
+            .collect();
+
+        // CV strictly falls as exposure spreads.
+        for window in cvs_by_spread.windows(2) {
+            assert!(window[1] < window[0], "cat CV did not fall as spread grew: {cvs_by_spread:?}");
+        }
+        // Each 4× spread roughly halves the CV (1/√4), with a generous band.
+        for window in cvs_by_spread.windows(2) {
+            let ratio = window[1] / window[0];
+            assert!(
+                (0.40..0.62).contains(&ratio),
+                "cat CV ratio {ratio} per 4× spread not near 0.5; {cvs_by_spread:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catastrophe_losses_settle_against_capital_within_the_zero_floor() {
+        // A correlated cat loss flows through the same settlement cascade as any
+        // other loss: it debits capital, never takes a syndicate below zero, and
+        // any uncovered remainder is recorded as a shortfall. The shared
+        // occurrence is exactly what makes a cat able to exhaust capital where a
+        // diversified attritional book would not.
+        let peril = CatastrophePeril {
+            annual_frequency: 5.0, // forced busy so a loss is essentially certain
+            min_damage_fraction: 0.2,
+            tail_alpha: 1.4,
+        };
+        let assets: Vec<Asset> =
+            (0..500).map(|_| Asset { sum_insured: 1_000.0, territory: Territory(0) }).collect();
+
+        let mut rng = Rng::seeded(2024);
+        let events = peril.annual_events(&mut rng);
+        let loss = territory_catastrophe_loss(&assets, &events);
+        assert!(loss > 0.0, "expected a catastrophe loss in a busy year");
+
+        // Undercapitalised relative to the loss: settlement floors at zero.
+        let mut syndicate = Syndicate::with_capital(loss / 2.0);
+        let settlement = syndicate.settle(loss);
+
+        assert_eq!(settlement.settled, loss / 2.0);
+        assert!((settlement.shortfall - loss / 2.0).abs() < 1e-9);
+        assert_eq!(syndicate.capital(), 0.0);
+        assert!(!syndicate.is_solvent());
+
+        // The cat loss respects the physical cap: it cannot exceed total TIV.
+        let total_tiv: f64 = assets.iter().map(|a| a.sum_insured).sum();
+        assert!(loss <= total_tiv * events.len() as f64);
     }
 
     #[test]

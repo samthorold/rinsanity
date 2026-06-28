@@ -1,36 +1,142 @@
-//! Runnable risk-pooling diagnostic. Two halves of one invariant:
+//! `rinsanity` CLI. Two surfaces over one engine:
 //!
-//!   * Attritional losses are drawn independently per asset, so the CV of the
-//!     insurer's aggregate falls as ~1/√N — each quadrupling of N halves the CV.
-//!   * A catastrophe is a single shared occurrence per territory, so the CV is
-//!     ~flat as the pool grows within a territory and only falls when exposure
-//!     is spread across uncorrelated territories (~1/√T).
+//!   * `cycle` — agent-consumable emission. Runs the cycle simulation and writes
+//!     **only** the per-year [`YearReport`] diagnostics (CSV or JSON) to stdout (or
+//!     `--out`). Every stdout line is a data line; no prose, no other diagnostics,
+//!     parseable with zero heuristics.
+//!   * `diagnostics` (also the default, and `--explain`) — the human read: the
+//!     risk-pooling, catastrophe, and placement demonstrations plus the qualitative
+//!     underwriting-cycle read. Prose lives here and never pollutes `cycle`.
 //!
-//! If both halves hold, the attritional/catastrophe distinction is physically
-//! real in the model.
+//! Deliberately dependency-free: args are parsed with [`std::env::args`] and JSON is
+//! hand-rolled in the library ([`reports_to_json`]). The emission itself is a pure
+//! library function over `&[YearReport]`, so the bytes here and the unit tests share
+//! one code path.
+
+use std::process::ExitCode;
 
 use rinsanity::{
     anchored_quote, attritional_aggregate_samples, catastrophe_aggregate_samples,
-    coefficient_of_variation, demonstration_market, follower_weight, AttritionalPeril, Broker,
-    CatastrophePeril, RelationshipOutcome, Rng, SyndicateId, YearReport,
+    coefficient_of_variation, demonstration_market, follower_weight, reports_to_csv,
+    reports_to_json, AttritionalPeril, Broker, CatastrophePeril, RelationshipOutcome, Rng,
+    SyndicateId,
 };
 
-fn main() {
-    attritional_diagnostic();
-    println!();
-    catastrophe_diagnostic();
-    println!();
-    placement_demonstration();
-    println!();
-    cycle_demonstration();
+const USAGE: &str = "\
+rinsanity — emergent underwriting-cycle simulation
+
+USAGE:
+    rinsanity cycle [--seed <u64>] [--years <usize>] [--format csv|json] [--out <path>]
+    rinsanity diagnostics            # human demonstrations + qualitative cycle read
+    rinsanity [--explain]            # alias for diagnostics (default)
+
+cycle:
+    Runs the cycle simulation and emits ONLY the per-year diagnostics — one header
+    line then one row per year, nothing else. The schema (columns / keys) is the
+    documented YearReport fields; see YearReport::CSV_HEADER.
+
+    --seed   <u64>      RNG seed for the demonstration market (default 2024)
+    --years  <usize>    number of years to simulate (default 60)
+    --format csv|json   csv (header + rows) or json (array of objects) (default csv)
+    --out    <path>     write to a file instead of stdout
+";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("cycle") => match run_cycle(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("error: {msg}\n\n{USAGE}");
+                ExitCode::FAILURE
+            }
+        },
+        // The human read: default, explicit, or via --explain.
+        None | Some("diagnostics") | Some("--explain") => {
+            run_diagnostics();
+            ExitCode::SUCCESS
+        }
+        Some("-h") | Some("--help") | Some("help") => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("error: unknown command '{other}'\n\n{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The machine-readable surface: parse the `cycle` options, run the simulation, and
+/// emit only the per-year diagnostics in the requested format.
+fn run_cycle(args: &[String]) -> Result<(), String> {
+    let mut seed: u64 = 2024;
+    let mut years: usize = 60;
+    let mut format = Format::Csv;
+    let mut out: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let value = |i: usize| -> Result<&String, String> {
+            args.get(i + 1).ok_or_else(|| format!("{flag} requires a value"))
+        };
+        match flag {
+            "--seed" => {
+                seed = value(i)?.parse().map_err(|_| format!("invalid --seed '{}'", value(i).unwrap()))?;
+                i += 2;
+            }
+            "--years" => {
+                years = value(i)?.parse().map_err(|_| format!("invalid --years '{}'", value(i).unwrap()))?;
+                i += 2;
+            }
+            "--format" => {
+                format = value(i)?.parse()?;
+                i += 2;
+            }
+            "--out" => {
+                out = Some(value(i)?.clone());
+                i += 2;
+            }
+            other => return Err(format!("unknown cycle option '{other}'")),
+        }
+    }
+
+    let reports = demonstration_market(seed).run(years);
+    let body = match format {
+        Format::Csv => reports_to_csv(&reports),
+        Format::Json => reports_to_json(&reports),
+    };
+
+    match out {
+        Some(path) => std::fs::write(&path, format!("{body}\n")).map_err(|e| format!("writing {path}: {e}"))?,
+        None => println!("{body}"),
+    }
+    Ok(())
+}
+
+enum Format {
+    Csv,
+    Json,
+}
+
+impl std::str::FromStr for Format {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "csv" => Ok(Format::Csv),
+            "json" => Ok(Format::Json),
+            other => Err(format!("invalid --format '{other}' (expected csv or json)")),
+        }
+    }
 }
 
 /// The HITL deliverable for #7: a multi-decade run of the [`demonstration_market`]
 /// whose emergent underwriting cycle a human reads for the right qualitative shape
-/// (soft → shock → hard → soft). Emits the per-year diagnostics as CSV (no
-/// charting) plus a short qualitative read. Nothing here imposes a cycle — there is
-/// no market-phase variable, coordinator, or `AP = TP × f(t)` curve; the rate
-/// movement is the aggregate of each syndicate's purely local AvT state.
+/// (soft → shock → hard → soft). Emits the per-year diagnostics as CSV plus a short
+/// qualitative read. Nothing here imposes a cycle — there is no market-phase
+/// variable, coordinator, or `AP = TP × f(t)` curve; the rate movement is the
+/// aggregate of each syndicate's purely local AvT state.
 fn cycle_demonstration() {
     let years = 60;
     let mut market = demonstration_market(2024);
@@ -39,10 +145,7 @@ fn cycle_demonstration() {
     println!("Underwriting cycle (#1) — emergent AvT over a {years}-year run");
     println!("AP = TP · AvT; AvT is per-syndicate, driven only by local headroom + placement feedback.");
     println!();
-    println!("{}", YearReport::CSV_HEADER);
-    for r in &reports {
-        println!("{}", r.csv_row());
-    }
+    println!("{}", reports_to_csv(&reports));
     println!();
 
     // A qualitative read to orient the human reviewer (the close is theirs).
@@ -63,6 +166,19 @@ fn cycle_demonstration() {
     println!("  combined ratio is bimodal: benign-year median {median_cr:.2}, {cat_years} cat years spiking to {max_cr:.2}");
     println!("=> soft markets compete AvT below the floor; a cat collapses headroom and hardens it above;");
     println!("   recovered capital re-softens. Human review confirms the soft → shock → hard → soft shape.");
+}
+
+/// The human demonstrations: substrate diagnostics (pooling, catastrophe), the
+/// placement loop's emergent behaviours, and the qualitative cycle read. Prose
+/// lives here only — it never reaches the `cycle` data stream.
+fn run_diagnostics() {
+    attritional_diagnostic();
+    println!();
+    catastrophe_diagnostic();
+    println!();
+    placement_demonstration();
+    println!();
+    cycle_demonstration();
 }
 
 fn attritional_diagnostic() {

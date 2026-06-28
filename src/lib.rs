@@ -520,6 +520,37 @@ pub fn available_for_new_business(syndicates: &[Syndicate]) -> Vec<SyndicateId> 
         .collect()
 }
 
+/// The per-syndicate **distribution rule** (part of the genome): how a syndicate
+/// releases profit to its capital providers at year-end. `payout_fraction` is the
+/// share of the year's underwriting profit it pays out; `solvency_floor` is the
+/// capital level below which it distributes nothing and rebuilds first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DistributionParams {
+    /// Fraction of a profitable year's result released to capital providers.
+    pub payout_fraction: f64,
+    /// Capital level below which distributions are suppressed (rebuild first).
+    pub solvency_floor: f64,
+}
+
+/// The **year-end distribution**: the amount of capital a syndicate releases to its
+/// providers. Profit is released only when the year was profitable and capital sits
+/// at or above the [`solvency_floor`](DistributionParams::solvency_floor); the
+/// release is the [`payout_fraction`](DistributionParams::payout_fraction) of the
+/// year's `year_result`, **capped so it never drives capital below the floor**.
+///
+/// Distributions are **suppressed in loss years and while impaired** — an impaired
+/// syndicate rebuilds before it pays out. This is the only check on unbounded
+/// capital accumulation: releasing recovered capital is exactly what competes AvT
+/// back down and lets a hard market re-soften, closing the loop from hard to soft.
+pub fn distribution(capital: f64, year_result: f64, params: &DistributionParams) -> f64 {
+    if year_result <= 0.0 || capital < params.solvency_floor {
+        return 0.0;
+    }
+    let desired = params.payout_fraction * year_result;
+    let above_floor = (capital - params.solvency_floor).max(0.0);
+    desired.min(above_floor)
+}
+
 /// A placed layer: a layer bound to a subscription panel for an annual term with
 /// explicit per-policy inception and expiry dates. A tower is a stack of these.
 /// The substrate honours whatever dates a policy carries; it never decides them.
@@ -904,6 +935,33 @@ impl ExposurePolicy {
             return UnderwritingDecision::Decline(DeclineReason::CatAggregate);
         }
         UnderwritingDecision::Accept
+    }
+
+    /// The syndicate's **capacity headroom**: the free cat-aggregate budget as a
+    /// fraction of the whole budget, in `[0, 1]`. The budget is the coverable cat
+    /// aggregate `solvency_fraction × capital` (the same figure the cat-aggregate
+    /// limit binds on in [`assess`](Self::assess)); the consumed portion is the
+    /// current book's [`portfolio_tail_loss`] under the syndicate's own cat-model
+    /// belief. `1` is an idle book (all budget free, abundant capital); `0` is a
+    /// book filled to the limit, or an insolvent syndicate with no budget at all.
+    ///
+    /// This is the local input the AvT multiplier's headroom channel reads (see
+    /// [`headroom_target`]). Because the budget scales with *current* capital, a
+    /// post-cat drawdown shrinks it — so a shared catastrophe collapses every
+    /// exposed syndicate's headroom together, and their AvT targets harden in step.
+    pub fn capacity_headroom(
+        &self,
+        syndicate: &Syndicate,
+        book: &NetBook,
+        model: &CatModel,
+        rng: &mut Rng,
+    ) -> f64 {
+        let budget = self.solvency_fraction * syndicate.capital();
+        if budget <= 0.0 {
+            return 0.0; // no loss-absorbing capital → no capacity to write
+        }
+        let consumed = portfolio_tail_loss(book, model, self.return_period, self.tail_trials, rng);
+        ((budget - consumed) / budget).clamp(0.0, 1.0)
     }
 }
 
@@ -1353,6 +1411,72 @@ impl Broker {
     }
 }
 
+/// The free-budget fraction treated as **normal** capacity utilisation, where the
+/// headroom-implied AvT target is exactly `1` — the syndicate prices at the TP
+/// floor the cycle oscillates around. Below it capacity is scarce (target above
+/// `1`, holding out); above it capacity is abundant (target below `1`, undercutting
+/// to win business). A market-level calibration constant, not a genome trait.
+pub const NORMAL_HEADROOM: f64 = 0.5;
+
+/// How far the headroom-implied AvT target swings away from `1` per unit of
+/// headroom deviation from [`NORMAL_HEADROOM`]. Calibration — it sets the *shape*
+/// of the target curve `AvT*(h)`; how fast a syndicate chases that target is its
+/// own genome [`AvtParams::headroom_responsiveness`].
+pub const HEADROOM_TARGET_SLOPE: f64 = 1.0;
+
+/// The per-syndicate **AvT genome**: how a syndicate re-prices its ask around the
+/// technical-premium floor. All three are selectable parameters market selection
+/// acts on (#12) — a syndicate that chases share too hard runs soft and is punished
+/// when the tail arrives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AvtParams {
+    /// Relaxation rate in `[0, 1]`: the fraction of the gap to the headroom-implied
+    /// target the AvT multiplier closes each year. Small → slow-moving, which is
+    /// what gives the cycle its inertia.
+    pub headroom_responsiveness: f64,
+    /// Gain on the placement-feedback channel — how sharply AvT reacts to the gap
+    /// between realised win-rate and the syndicate's share-appetite.
+    pub feedback_responsiveness: f64,
+    /// The **share-appetite**: the target win-rate the feedback loop homeostatically
+    /// seeks. Winning more than this lifts AvT (giving margin back); winning less
+    /// cuts it (to compete). An explicit, selectable target — never an implied 50%.
+    pub share_appetite: f64,
+}
+
+/// The **headroom-implied AvT target** `AvT*(h)`: the level a syndicate's capacity
+/// state alone says it should price at. Anchored so that normal headroom
+/// ([`NORMAL_HEADROOM`]) targets exactly `1` (the TP floor); abundant headroom
+/// (idle capital, low opportunity cost of writing) targets **below 1** to win
+/// business, and scarce headroom targets **above 1** to hold out. Monotone
+/// decreasing in headroom. This is the structural core of the cycle: a shared
+/// catastrophe collapses every exposed syndicate's headroom at once, lifting their
+/// targets above 1 together — market-wide hardening with no coordinator.
+pub fn headroom_target(headroom: f64) -> f64 {
+    1.0 + HEADROOM_TARGET_SLOPE * (NORMAL_HEADROOM - headroom)
+}
+
+/// The annual **AvT update**: a syndicate's slow-moving ask multiplier re-set once
+/// a year at renewal from two purely local inputs, combined **additively**:
+///
+/// 1. **Headroom channel** — AvT *relaxes toward* the [`headroom_target`] level by
+///    the genome [`headroom_responsiveness`](AvtParams::headroom_responsiveness)
+///    fraction of the gap. Targeting a *level* (not integrating a per-round nudge)
+///    anchors AvT to the TP floor: the floor is the standing attractor and the slow
+///    relaxation toward it is the multi-year hard-market persistence.
+/// 2. **Feedback channel** — a homeostatic nudge toward the syndicate's
+///    [`share_appetite`](AvtParams::share_appetite): `feedback_responsiveness ×
+///    (realised_win_rate − share_appetite)`. Winning above appetite lifts AvT to
+///    give margin back; winning below cuts it to compete.
+///
+/// Neither input is a market-phase signal — both read the syndicate's own state, so
+/// summing them double-counts nothing. The result is floored at `0` (a price can
+/// never be negative).
+pub fn updated_avt(current: f64, headroom: f64, realised_win_rate: f64, params: &AvtParams) -> f64 {
+    let headroom_channel = params.headroom_responsiveness * (headroom_target(headroom) - current);
+    let feedback_channel = params.feedback_responsiveness * (realised_win_rate - params.share_appetite);
+    (current + headroom_channel + feedback_channel).max(0.0)
+}
+
 /// A syndicate's **quote** on a layer: the syndicate and the price it offers.
 /// The unit the insured clears on and the lead the followers anchor toward.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1421,6 +1545,70 @@ pub fn follower_response(
             price: anchored_quote(own_price, lead_quote, w),
         }),
     }
+}
+
+/// A syndicate's offer to subscribe to a layer under **firm-order subscription**:
+/// its (anchored) `quote`, its own exposure `decision`, and the `offered_share` —
+/// the fraction of the layer limit it is willing to take. Followers' quotes are
+/// already anchored toward the lead (see [`anchored_quote`]); the lead's `quote`
+/// is the firm order itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubscriptionOffer {
+    pub syndicate: SyndicateId,
+    pub quote: f64,
+    pub decision: UnderwritingDecision,
+    pub offered_share: f64,
+}
+
+/// Form a subscription [`Panel`] by **firm-order subscription** (Model B). The
+/// `lead`'s quote is the layer's **firm order** — the single price the insured pays
+/// — and the lead takes the first share. Each follower offer is considered in
+/// order and **subscribes when both** its own exposure limits permit (`decision` is
+/// [`Accept`](UnderwritingDecision::Accept)) **and** its anchored `quote` sits **at
+/// or below the firm order** (it will write at the lead's terms). This is why
+/// herding is load-bearing in *formation*: a follower anchored toward a reputable
+/// lead lowers its quote and subscribes to a firm order it would otherwise reject.
+///
+/// Fill is **capacity-first**: shares accumulate in order up to the full layer, the
+/// last needed share trimmed so the panel never exceeds `1.0`; once full, later
+/// willing offers are not needed. If willing capacity falls short the layer is left
+/// **partially placed** (the panel's [`placed_portion`](Panel::placed_portion) is
+/// below `1.0`). A lead that cannot write (declines on exposure) leaves the layer
+/// entirely unplaced — an empty panel.
+pub fn form_panel(lead: SubscriptionOffer, followers: &[SubscriptionOffer]) -> Panel {
+    let mut entries: Vec<PanelEntry> = Vec::new();
+    let firm_order = lead.quote;
+    let mut placed = 0.0;
+
+    let subscribe = |offer: &SubscriptionOffer, placed: &mut f64, entries: &mut Vec<PanelEntry>| {
+        if *placed >= 1.0 {
+            return;
+        }
+        if offer.decision != UnderwritingDecision::Accept {
+            return;
+        }
+        let take = offer.offered_share.min(1.0 - *placed);
+        if take <= 0.0 {
+            return;
+        }
+        entries.push(PanelEntry { syndicate: offer.syndicate, share: take });
+        *placed += take;
+    };
+
+    // The lead sets the firm order and takes the first share. Only a lead that can
+    // write founds a panel; a declining lead leaves the layer unplaced.
+    subscribe(&lead, &mut placed, &mut entries);
+    if entries.is_empty() {
+        return Panel { entries };
+    }
+
+    for follower in followers {
+        if follower.quote <= firm_order {
+            subscribe(follower, &mut placed, &mut entries);
+        }
+    }
+
+    Panel { entries }
 }
 
 /// An **insured**: the demand-side agent seeking cover. It carries a private
@@ -1521,6 +1709,594 @@ pub fn experience_modifier(own_losses: f64, expected_losses: f64, n: f64, k: f64
     let relativity = own_losses / expected_losses;
     let z = credibility(n, k);
     (1.0 - z) * 1.0 + z * relativity
+}
+
+// ============================================================================
+// The annual market engine
+// ----------------------------------------------------------------------------
+// The full end-to-end annual simulation loop that exercises the real substrate:
+// demand → placement → within-year losses → year-end. The emergent underwriting
+// cycle (#1) is whatever the population of local AvT rules produces over a
+// multi-decade run — there is no market-phase variable, coordinator, or
+// `AP = TP × f(t)` curve anywhere in here.
+//
+// Deferred (seams documented, end-state design intact): endogenous entry and the
+// rising supply curve (#8 — so the pool only shrinks via insolvency and the run
+// horizon is bounded by attrition); experience rating (modifier ≡ 1, #9); the
+// decomposed GWP→NEP chain (a single expense ratio, reinsurance ceded = 0); and
+// the quarter-day renewal calendar (one annual cohort, all policies incept at 0
+// and expire at 1).
+// ============================================================================
+
+/// A broker's identity within the market's roster — an index into the brokers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BrokerId(pub usize);
+
+/// The per-syndicate **genome**: the full vector of selectable parameters market
+/// selection acts on (#12), bundled so a population varies across them. It unions
+/// the pricing, exposure, AvT, and distribution parameters with the herding
+/// susceptibility and the target line a syndicate offers on any one layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SyndicateGenome {
+    pub cat_model: CatModel,
+    pub exposure: ExposurePolicy,
+    pub pricing: PricingParams,
+    pub avt: AvtParams,
+    pub distribution: DistributionParams,
+    /// Scales the follower weight `w` when anchoring toward a lead (#3).
+    pub herding_susceptibility: f64,
+    /// The share of any one layer's limit the syndicate offers to subscribe.
+    pub target_line: f64,
+}
+
+/// A **syndicate agent**: its genome plus the slow-moving and within-year state it
+/// carries through the loop. Capital lives in the market's parallel capital roster
+/// (so the substrate's settlement cascade can debit a `&mut [Syndicate]` slice);
+/// everything else — the AvT multiplier, the current net book, the year's tallies —
+/// lives here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyndicateAgent {
+    pub genome: SyndicateGenome,
+    /// The capital the agent is seeded with — consumed by [`Market::new`] to build
+    /// the persistent capital roster.
+    pub initial_capital: f64,
+    /// The slow-moving AvT multiplier, re-set once a year at renewal.
+    pub avt: f64,
+    /// The net retained book, rebuilt each year as the annual cohort places.
+    pub book: NetBook,
+    // Within-year tallies, reset at the start of each year:
+    /// Bound placements the agent was shortlisted on (the win-rate denominator).
+    pub shortlisted: u32,
+    /// Bound placements the agent subscribed to (the win-rate numerator).
+    pub won: u32,
+    /// Net earned premium this year (placement premium net of expense, plus
+    /// reinstatement income).
+    pub premium: f64,
+    /// Claims incurred this year.
+    pub losses: f64,
+}
+
+impl SyndicateAgent {
+    /// A fresh agent on the TP floor (`AvT = 1`) with an empty book and clean
+    /// tallies.
+    pub fn new(initial_capital: f64, genome: SyndicateGenome) -> Self {
+        SyndicateAgent {
+            genome,
+            initial_capital,
+            avt: 1.0,
+            book: NetBook { lines: Vec::new() },
+            shortlisted: 0,
+            won: 0,
+            premium: 0.0,
+            losses: 0.0,
+        }
+    }
+
+    fn reset_year(&mut self) {
+        self.book = NetBook { lines: Vec::new() };
+        self.shortlisted = 0;
+        self.won = 0;
+        self.premium = 0.0;
+        self.losses = 0.0;
+    }
+}
+
+/// A demand-side **insured** in the market: an asset to cover, a risk-aversion
+/// loading (its WTP is risk-aversion × expected loss), and the broker it places
+/// through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarketInsured {
+    pub asset: Asset,
+    pub risk_aversion: f64,
+    pub broker: BrokerId,
+}
+
+/// One **territory market**: the true catastrophe process (owned by the substrate,
+/// seen by no agent) and the cohort of insureds seeking cover in the zone.
+#[derive(Debug, Clone)]
+pub struct TerritoryMarket {
+    pub territory: Territory,
+    pub peril: CatastrophePeril,
+    pub insureds: Vec<MarketInsured>,
+}
+
+/// The per-year diagnostic readings the CSV emission and the HITL cycle read are
+/// built from — one row per simulated year.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct YearReport {
+    pub year: usize,
+    /// Mean AvT multiplier across solvent syndicates.
+    pub mean_avt: f64,
+    /// Population standard deviation of AvT across solvent syndicates — the spread
+    /// of asks the heterogeneous genomes settle at.
+    pub avt_spread: f64,
+    /// The effective market rate achieved: premium-weighted `AP / TP` over the
+    /// year's bound placements (1.0 = priced exactly at the technical floor).
+    pub rate_index: f64,
+    /// Incurred losses over net earned premium — the headline whose bimodality
+    /// (benign vs cat years) is the cycle diagnostic.
+    pub combined_ratio: f64,
+    pub solvent_count: usize,
+    /// Mean post-distribution capacity headroom across solvent syndicates.
+    pub mean_headroom: f64,
+    /// Number of true catastrophe events across all territories this year.
+    pub cat_events: usize,
+    /// Number of layers bound this year.
+    pub placements: usize,
+    /// Total net earned premium this year.
+    pub gross_premium: f64,
+    /// Total incurred losses this year.
+    pub incurred_losses: f64,
+}
+
+/// A bound tower for one insured, held through the loss phase: the asset it covers
+/// and the placed reinstatement layers (one per kept band).
+struct InsuredPlacement {
+    asset: Asset,
+    layers: Vec<ReinstatementLayer>,
+}
+
+/// Monte-Carlo trials an insured uses to value its own expected loss (for WTP).
+const DEMAND_TRIALS: usize = 80;
+
+/// The **annual market engine**. Holds the syndicate agents, their persistent
+/// capital roster, the brokers, the territory markets, and the shared attritional
+/// peril, and steps the whole market forward one year at a time.
+#[derive(Debug, Clone)]
+pub struct Market {
+    agents: Vec<SyndicateAgent>,
+    capitals: Vec<Syndicate>,
+    brokers: Vec<Broker>,
+    territories: Vec<TerritoryMarket>,
+    attritional: AttritionalPeril,
+    expense_ratio: f64,
+    panel_size: usize,
+    rng: Rng,
+    year: usize,
+}
+
+impl Market {
+    /// Assemble a market. Each agent's `initial_capital` seeds the persistent
+    /// capital roster; capital carries over between years with no re-endowment.
+    pub fn new(
+        agents: Vec<SyndicateAgent>,
+        brokers: Vec<Broker>,
+        territories: Vec<TerritoryMarket>,
+        attritional: AttritionalPeril,
+        expense_ratio: f64,
+        panel_size: usize,
+        rng: Rng,
+    ) -> Self {
+        let capitals = agents.iter().map(|a| Syndicate::with_capital(a.initial_capital)).collect();
+        Market { agents, capitals, brokers, territories, attritional, expense_ratio, panel_size, rng, year: 0 }
+    }
+
+    /// The next year to be simulated (0 before the first [`step_year`](Self::step_year)).
+    pub fn year(&self) -> usize {
+        self.year
+    }
+
+    /// A syndicate's current capital balance.
+    pub fn capital(&self, id: SyndicateId) -> f64 {
+        self.capitals[id.0].capital()
+    }
+
+    /// A syndicate's current AvT multiplier.
+    pub fn avt(&self, id: SyndicateId) -> f64 {
+        self.agents[id.0].avt
+    }
+
+    /// A syndicate's current capacity headroom under its own book and beliefs.
+    pub fn headroom(&self, id: SyndicateId) -> f64 {
+        let agent = &self.agents[id.0];
+        let mut rng = Rng::seeded(0x4845_4144 ^ id.0 as u64 ^ self.year as u64);
+        agent.genome.exposure.capacity_headroom(&self.capitals[id.0], &agent.book, &agent.genome.cat_model, &mut rng)
+    }
+
+    /// Step the whole market forward one year and return the year's diagnostics:
+    /// demand meets supply (firm-order subscription panels), within-year cat and
+    /// attritional losses settle through the substrate cascade, and the year-end
+    /// rolls (tally → distributions → AvT re-set off post-distribution headroom →
+    /// relationship update → roll forward).
+    pub fn step_year(&mut self) -> YearReport {
+        let Market {
+            agents,
+            capitals,
+            brokers,
+            territories,
+            attritional,
+            expense_ratio,
+            panel_size,
+            rng,
+            year,
+        } = self;
+        let expense_ratio = *expense_ratio;
+        let panel_size = *panel_size;
+
+        for agent in agents.iter_mut() {
+            agent.reset_year();
+        }
+
+        // --- Placement (renewal): the annual cohort places its towers ----------
+        let mut placements: Vec<Vec<InsuredPlacement>> = Vec::with_capacity(territories.len());
+        let mut bound_layers = 0usize;
+        let mut sum_ap = 0.0; // premium-weighted actual premium (rate index numerator)
+        let mut sum_tp = 0.0; // premium-weighted technical premium (denominator)
+
+        for tm in territories.iter() {
+            let truth = CatModel {
+                annual_frequency: tm.peril.annual_frequency,
+                min_damage_fraction: tm.peril.min_damage_fraction,
+                tail_alpha: tm.peril.tail_alpha,
+            };
+            let mut territory_placements: Vec<InsuredPlacement> = Vec::new();
+
+            for insured in &tm.insureds {
+                let si = insured.asset.sum_insured;
+                // A two-band tower: a primary `[0, si/2]` and an excess `[si/2, si]`.
+                // Both carry one reinstatement, so a clustered second event triggers
+                // within-year hardening.
+                let bands = [
+                    Layer { attachment: 0.0, limit: si / 2.0 },
+                    Layer { attachment: si / 2.0, limit: si / 2.0 },
+                ];
+                let terms = ReinstatementTerms { count: 1, factor: 1.0 };
+
+                // Form a panel for each band, collecting the insured's offers.
+                struct BandPanel {
+                    band: Layer,
+                    panel: Panel,
+                    firm_order: f64,
+                    lead_tp: f64,
+                    shortlist: Vec<SyndicateId>,
+                }
+                let mut band_panels: Vec<BandPanel> = Vec::new();
+                let mut offers: Vec<TowerLayerOffer> = Vec::new();
+                let mut expected_total = 0.0;
+
+                for band in bands {
+                    let capable: Vec<SyndicateId> = capitals
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.is_solvent())
+                        .map(|(i, _)| SyndicateId(i))
+                        .collect();
+                    if capable.is_empty() {
+                        continue;
+                    }
+                    let broker = &brokers[insured.broker.0];
+                    let shortlist = broker.shortlist(&capable, panel_size, rng);
+                    if shortlist.is_empty() {
+                        continue;
+                    }
+                    let lead_id = shortlist[0];
+                    let risk = LayerExposure { layer: band, exposure: si, territory: tm.territory, reinstatement: terms };
+
+                    // The insured's own expected loss on the band (it knows its own
+                    // risk), for WTP and value-ranking — true cat ELF + a small
+                    // attritional term.
+                    let cat_el = catastrophe_elf(&band, si, &truth, DEMAND_TRIALS, rng);
+                    let attr_mean = band.insured_loss(attritional.occurrence_probability * attritional.mean_damage_fraction * si);
+                    let band_expected = cat_el + attr_mean;
+                    expected_total += band_expected;
+
+                    let experience = |benchmark: f64| AttritionalExperience {
+                        own_burning_cost: benchmark,
+                        benchmark,
+                        volume: 10.0,
+                    };
+
+                    // The lead quotes blind: firm order = its TP · AvT.
+                    let lead = &agents[lead_id.0];
+                    let lead_tp = technical_premium(&risk, &lead.book, &lead.genome.cat_model, &experience(attr_mean), &lead.genome.pricing, rng).technical_premium;
+                    let firm_order = lead_tp * lead.avt;
+                    let lead_reputation = {
+                        let r = broker.relationship(lead_id);
+                        r / (r + 1.0)
+                    };
+
+                    // Build each shortlisted syndicate's subscription offer.
+                    let mut lead_offer = None;
+                    let mut follower_offers: Vec<SubscriptionOffer> = Vec::new();
+                    for (pos, &id) in shortlist.iter().enumerate() {
+                        let agent = &agents[id.0];
+                        let candidate = NetLine { territory: tm.territory, net_limit: agent.genome.target_line * band.limit };
+                        let decision = agent.genome.exposure.assess(&capitals[id.0], &agent.book, &agent.genome.cat_model, candidate, rng);
+                        let offer = if pos == 0 {
+                            SubscriptionOffer { syndicate: id, quote: firm_order, decision, offered_share: agent.genome.target_line }
+                        } else {
+                            let own_tp = technical_premium(&risk, &agent.book, &agent.genome.cat_model, &experience(attr_mean), &agent.genome.pricing, rng).technical_premium;
+                            let own_price = own_tp * agent.avt;
+                            let own_confidence = credibility(10.0, agent.genome.pricing.credibility_k);
+                            let w = follower_weight(own_confidence, lead_reputation, agent.genome.herding_susceptibility);
+                            let anchored = anchored_quote(own_price, firm_order, w);
+                            SubscriptionOffer { syndicate: id, quote: anchored, decision, offered_share: agent.genome.target_line }
+                        };
+                        if pos == 0 {
+                            lead_offer = Some(offer);
+                        } else {
+                            follower_offers.push(offer);
+                        }
+                    }
+
+                    let lead_offer = lead_offer.expect("a non-empty shortlist has a lead");
+                    let panel = form_panel(lead_offer, &follower_offers);
+                    let placed_portion = panel.placed_portion();
+                    if placed_portion <= 0.0 {
+                        continue;
+                    }
+                    offers.push(TowerLayerOffer { layer: band, expected_loss: band_expected, price: firm_order * placed_portion });
+                    band_panels.push(BandPanel { band, panel, firm_order, lead_tp, shortlist });
+                }
+
+                if band_panels.is_empty() {
+                    continue;
+                }
+
+                // Elastic demand: the insured fits its tower to its WTP, dropping the
+                // worst value-for-money bands when the market hardens (the cycle
+                // damper, #1).
+                let wtp = insured.risk_aversion * expected_total;
+                let kept: Vec<Layer> = match restructure_tower(&offers, wtp) {
+                    TowerPurchase::Bound { layers, .. } => layers,
+                    TowerPurchase::Declined => continue,
+                };
+
+                // Commit the kept bands: update books, credit net premium, tally
+                // wins, and hold the placed layer for the loss phase.
+                let mut insured_layers: Vec<ReinstatementLayer> = Vec::new();
+                for bp in band_panels.into_iter().filter(|bp| kept.contains(&bp.band)) {
+                    bound_layers += 1;
+                    sum_ap += bp.firm_order * bp.panel.placed_portion();
+                    sum_tp += bp.lead_tp * bp.panel.placed_portion();
+                    // Every shortlisted member on a bound band saw the opportunity
+                    // (the win-rate denominator) — including those whose quote sat
+                    // above the firm order and so did not subscribe.
+                    for &id in &bp.shortlist {
+                        agents[id.0].shortlisted += 1;
+                    }
+                    // Subscribers take their share: net premium credited, book grown,
+                    // a win tallied (the numerator).
+                    for entry in &bp.panel.entries {
+                        let i = entry.syndicate.0;
+                        let net_premium = entry.share * bp.firm_order * (1.0 - expense_ratio);
+                        capitals[i].credit(net_premium);
+                        agents[i].premium += net_premium;
+                        agents[i].book.lines.push(NetLine { territory: tm.territory, net_limit: entry.share * bp.band.limit });
+                        agents[i].won += 1;
+                    }
+                    insured_layers.push(ReinstatementLayer::new(bp.band, bp.panel, terms, bp.firm_order, 0.0, 1.0));
+                }
+                if !insured_layers.is_empty() {
+                    territory_placements.push(InsuredPlacement { asset: insured.asset, layers: insured_layers });
+                }
+            }
+            placements.push(territory_placements);
+        }
+
+        // --- Within-year losses -----------------------------------------------
+        let mut cat_event_count = 0usize;
+        for (ti, tm) in territories.iter().enumerate() {
+            let cat_events = tm.peril.annual_events(rng); // the true process
+            cat_event_count += cat_events.len();
+            for placement in placements[ti].iter_mut() {
+                let si = placement.asset.sum_insured;
+                // The shared catastrophe occurrence strikes the whole zone: every
+                // exposed layer absorbs the SAME events (correlated losses).
+                for layer in placement.layers.iter_mut() {
+                    let settlements = layer.absorb_year(&cat_events, si, capitals);
+                    attribute(&settlements, &layer.panel, agents);
+                }
+                // Attritional: independent per asset (the pooling half).
+                let gul = attritional.strike(&placement.asset, rng);
+                if gul > 0.0 {
+                    let date = rng.uniform();
+                    for layer in placement.layers.iter_mut() {
+                        let settlement = layer.absorb_event(gul, date, capitals);
+                        attribute(&[settlement], &layer.panel, agents);
+                    }
+                }
+            }
+        }
+
+        // --- Year-end: tally → distributions → AvT → relationships → roll ------
+        let mut mean_headroom_acc = 0.0;
+        let mut solvent_count = 0usize;
+        let mut avt_values: Vec<f64> = Vec::new();
+        let mut total_premium = 0.0;
+        let mut total_losses = 0.0;
+
+        for (i, agent) in agents.iter_mut().enumerate() {
+            total_premium += agent.premium;
+            total_losses += agent.losses;
+
+            // Distributions release profit above the floor, suppressed in loss
+            // years — debited before AvT reads headroom.
+            let result = agent.premium - agent.losses;
+            let payout = distribution(capitals[i].capital(), result, &agent.genome.distribution);
+            if payout > 0.0 {
+                capitals[i].settle(payout);
+            }
+
+            // AvT re-set off post-distribution headroom + realised win-rate.
+            let headroom = agent.genome.exposure.capacity_headroom(&capitals[i], &agent.book, &agent.genome.cat_model, rng);
+            let win_rate = if agent.shortlisted > 0 {
+                agent.won as f64 / agent.shortlisted as f64
+            } else {
+                agent.genome.avt.share_appetite // no opportunities → feedback neutral
+            };
+            agent.avt = updated_avt(agent.avt, headroom, win_rate, &agent.genome.avt);
+
+            if capitals[i].is_solvent() {
+                solvent_count += 1;
+                mean_headroom_acc += headroom;
+                avt_values.push(agent.avt);
+            }
+        }
+
+        // Relationships update slowly from the year's experience (aggregate read).
+        for broker in brokers.iter_mut() {
+            for (i, agent) in agents.iter().enumerate() {
+                broker.update_relationship(
+                    SyndicateId(i),
+                    RelationshipOutcome {
+                        quoted: agent.shortlisted > 0,
+                        won: agent.won > 0,
+                        solvent: capitals[i].is_solvent(),
+                    },
+                );
+            }
+        }
+
+        let mean_avt = if avt_values.is_empty() { 0.0 } else { avt_values.iter().sum::<f64>() / avt_values.len() as f64 };
+        let avt_spread = population_std(&avt_values, mean_avt);
+        let report = YearReport {
+            year: *year,
+            mean_avt,
+            avt_spread,
+            rate_index: if sum_tp > 0.0 { sum_ap / sum_tp } else { 1.0 },
+            combined_ratio: if total_premium > 0.0 { total_losses / total_premium } else { 0.0 },
+            solvent_count,
+            mean_headroom: if solvent_count > 0 { mean_headroom_acc / solvent_count as f64 } else { 0.0 },
+            cat_events: cat_event_count,
+            placements: bound_layers,
+            gross_premium: total_premium,
+            incurred_losses: total_losses,
+        };
+
+        *year += 1;
+        report
+    }
+
+    /// Run the market for `years` years, returning the per-year diagnostics.
+    pub fn run(&mut self, years: usize) -> Vec<YearReport> {
+        (0..years).map(|_| self.step_year()).collect()
+    }
+}
+
+impl YearReport {
+    /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
+    pub const CSV_HEADER: &'static str =
+        "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,mean_headroom,cat_events,placements,gross_premium,incurred_losses";
+
+    /// One CSV row of the year's diagnostics (no charting — the row is the
+    /// instrument reading a human reads the cycle's shape from).
+    pub fn csv_row(&self) -> String {
+        format!(
+            "{},{:.6},{:.6},{:.6},{:.6},{},{:.6},{},{},{:.6},{:.6}",
+            self.year,
+            self.mean_avt,
+            self.avt_spread,
+            self.rate_index,
+            self.combined_ratio,
+            self.solvent_count,
+            self.mean_headroom,
+            self.cat_events,
+            self.placements,
+            self.gross_premium,
+            self.incurred_losses,
+        )
+    }
+}
+
+/// A calibrated **reference market** for the multi-decade cycle demonstration (the
+/// HITL run). A population of ten syndicates with heterogeneous share-appetites,
+/// AvT responsiveness, and hurdle rates; three brokers with different relationship
+/// portfolios; and two territories carrying their own heavy-tailed cat processes
+/// and insured cohorts. Capital is deliberately scarce relative to the cat
+/// exposure, so a shared shock collapses headroom and the hard phase emerges. The
+/// specific constants are calibration in the code — the *forms* are the design.
+pub fn demonstration_market(seed: u64) -> Market {
+    let appetites = [0.35, 0.4, 0.45, 0.5, 0.5, 0.55, 0.6, 0.65, 0.45, 0.55];
+    let syndicates: Vec<SyndicateAgent> = appetites
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| {
+            let genome = SyndicateGenome {
+                cat_model: CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 },
+                exposure: ExposurePolicy { return_period: 200.0, solvency_fraction: 0.45, line_fraction: 0.5, tail_trials: 120 },
+                pricing: PricingParams { hurdle_rate: 0.08 + 0.01 * (i % 4) as f64, credibility_k: 50.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 120 },
+                avt: AvtParams { headroom_responsiveness: 0.35 + 0.1 * (i % 3) as f64, feedback_responsiveness: 0.25, share_appetite: a },
+                distribution: DistributionParams { payout_fraction: 0.5, solvency_floor: 200.0 },
+                herding_susceptibility: 0.5,
+                target_line: 0.55,
+            };
+            SyndicateAgent::new(280.0, genome)
+        })
+        .collect();
+    let n = syndicates.len();
+    let brokers = vec![
+        Broker::new(vec![1.0; n], 0.85),
+        Broker::new((0..n).map(|i| 1.0 - 0.05 * i as f64).collect(), 0.88),
+        Broker::new((0..n).map(|i| 0.2 + 0.05 * i as f64).collect(), 0.82),
+    ];
+    let n_brokers = brokers.len();
+    let territory = |t: u32, freq: f64, count: usize| TerritoryMarket {
+        territory: Territory(t),
+        peril: CatastrophePeril { annual_frequency: freq, min_damage_fraction: 0.07, tail_alpha: 1.35 },
+        insureds: (0..count)
+            .map(|i| MarketInsured {
+                asset: Asset { sum_insured: 100.0, territory: Territory(t) },
+                risk_aversion: 2.0,
+                broker: BrokerId(i % n_brokers),
+            })
+            .collect(),
+    };
+    Market::new(
+        syndicates,
+        brokers,
+        vec![territory(0, 0.4, 16), territory(1, 0.4, 14)],
+        AttritionalPeril { occurrence_probability: 0.25, mean_damage_fraction: 0.06 },
+        0.15,
+        4,
+        Rng::seeded(seed),
+    )
+}
+
+/// Attribute a panel's settlements back to the agents' loss/premium tallies. The
+/// substrate guarantees the loss-settlement invariants on the settlements; this
+/// re-checks them as the engine's hard gate (no claim above its share, no negative
+/// settlement or shortfall) so a violation anywhere in a run panics loudly.
+fn attribute(settlements: &[EventSettlement], panel: &Panel, agents: &mut [SyndicateAgent]) {
+    for es in settlements {
+        for (entry, settled) in panel.entries.iter().zip(&es.claim) {
+            assert!(settled.settled >= 0.0 && settled.shortfall >= 0.0, "settlement is non-negative");
+            agents[entry.syndicate.0].losses += settled.settled;
+        }
+        for (entry, credit) in panel.entries.iter().zip(&es.reinstatement_credits) {
+            agents[entry.syndicate.0].premium += credit;
+        }
+    }
+}
+
+/// Population standard deviation about a supplied `mean` (zero for fewer than two
+/// samples).
+fn population_std(values: &[f64], mean: f64) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    variance.sqrt()
 }
 
 #[cfg(test)]
@@ -3381,5 +4157,453 @@ mod tests {
         assert!((triple_cost - (premium + layer.limit)).abs() < 1e-9);
         assert!(triple_cost > 3.0 * single_cost + layer.limit);
         assert!(triple_cost > 2.0 * clustered_cost, "the third event escalates the cost again");
+    }
+
+    fn neutral_avt_params() -> AvtParams {
+        AvtParams { headroom_responsiveness: 0.25, feedback_responsiveness: 0.25, share_appetite: 0.5 }
+    }
+
+    #[test]
+    fn avt_relaxes_slowly_toward_the_headroom_implied_target() {
+        // At normal headroom the headroom-implied target is exactly 1 (price at the
+        // TP floor), and with the win-rate sitting on the syndicate's share-appetite
+        // the feedback channel is silent. A syndicate currently asking above the floor
+        // therefore relaxes DOWN toward 1 — but slowly, not in a single jump.
+        let params = neutral_avt_params();
+        let next = updated_avt(1.5, NORMAL_HEADROOM, params.share_appetite, &params);
+
+        // It moved toward 1 from 1.5 ...
+        assert!(next < 1.5, "AvT relaxes down toward the floor, got {next}");
+        // ... but did not snap to it: the multiplier is slow-moving.
+        assert!(next > 1.0, "AvT does not jump to the target in one year, got {next}");
+        // The relaxation is exactly the responsiveness fraction of the gap to target.
+        assert!((next - 1.375).abs() < 1e-9, "expected 1.5 + 0.25*(1.0-1.5) = 1.375, got {next}");
+    }
+
+    #[test]
+    fn the_placement_feedback_channel_homeostatically_chases_the_share_appetite() {
+        // Hold AvT on the floor at normal headroom so the headroom channel is silent
+        // (target 1, current 1, gap 0) and only the feedback channel moves the ask.
+        let params = neutral_avt_params(); // share_appetite = 0.5
+        let on_floor = 1.0;
+
+        // Winning MORE than appetite lifts AvT to give margin back ...
+        let winning = updated_avt(on_floor, NORMAL_HEADROOM, 0.9, &params);
+        assert!(winning > on_floor, "over-winning lifts the ask, got {winning}");
+        assert!((winning - (1.0 + 0.25 * (0.9 - 0.5))).abs() < 1e-9);
+
+        // ... winning LESS than appetite cuts it to compete ...
+        let losing = updated_avt(on_floor, NORMAL_HEADROOM, 0.1, &params);
+        assert!(losing < on_floor, "under-winning cuts the ask, got {losing}");
+
+        // ... and sitting exactly on appetite leaves the floor untouched.
+        let neutral = updated_avt(on_floor, NORMAL_HEADROOM, params.share_appetite, &params);
+        assert!((neutral - on_floor).abs() < 1e-9, "on-appetite is a rest point, got {neutral}");
+    }
+
+    #[test]
+    fn the_headroom_target_anchors_at_the_floor_and_hardens_as_capacity_tightens() {
+        // Normal capacity utilisation targets exactly the TP floor.
+        assert!((headroom_target(NORMAL_HEADROOM) - 1.0).abs() < 1e-9);
+        // Abundant headroom (idle capital) targets BELOW 1 — undercut to win business.
+        assert!(headroom_target(0.9) < 1.0, "abundant headroom softens the ask");
+        // Scarce headroom (a full book) targets ABOVE 1 — hold out for rate.
+        assert!(headroom_target(0.1) > 1.0, "scarce headroom hardens the ask");
+        // Monotone decreasing: the tighter the capacity, the higher the target.
+        assert!(headroom_target(0.1) > headroom_target(0.5));
+        assert!(headroom_target(0.5) > headroom_target(0.9));
+    }
+
+    #[test]
+    fn the_two_avt_channels_combine_additively() {
+        // With both inputs off their rest points, the year's increment is exactly the
+        // sum of the independent channels — they are separate reads (own capital state
+        // vs own price discovery), so summing double-counts nothing.
+        let params = neutral_avt_params();
+        let current = 1.2;
+        let headroom = 0.2; // scarce → headroom target above 1
+        let win_rate = 0.8; // above appetite → feedback positive
+
+        let headroom_channel = params.headroom_responsiveness * (headroom_target(headroom) - current);
+        let feedback_channel = params.feedback_responsiveness * (win_rate - params.share_appetite);
+        let expected = current + headroom_channel + feedback_channel;
+
+        let next = updated_avt(current, headroom, win_rate, &params);
+        assert!((next - expected).abs() < 1e-9, "channels must sum, got {next} vs {expected}");
+    }
+
+    #[test]
+    fn avt_is_floored_at_zero_so_the_ask_never_goes_negative() {
+        // A syndicate already on the floor, drowning in idle capacity and losing every
+        // placement, would be driven below zero by an unclamped update — a negative
+        // price is nonsense, so the multiplier floors at zero.
+        let aggressive = AvtParams { headroom_responsiveness: 2.0, feedback_responsiveness: 2.0, share_appetite: 0.9 };
+        let next = updated_avt(0.05, 1.0, 0.0, &aggressive);
+        assert!(next >= 0.0, "AvT never goes negative, got {next}");
+    }
+
+    #[test]
+    fn an_empty_book_has_full_capacity_headroom() {
+        // Headroom is the free cat-aggregate budget as a fraction of the whole
+        // budget. An idle syndicate with no book has consumed none of it, so its
+        // headroom is 1 — maximally abundant capital, the soft end of the cycle.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let policy = ExposurePolicy { return_period: 200.0, solvency_fraction: 0.5, line_fraction: 0.5, tail_trials: 4_000 };
+        let syndicate = Syndicate::with_capital(100.0); // cat budget = 0.5 × 100 = 50
+        let book = NetBook { lines: vec![] };
+        let mut rng = Rng::seeded(7);
+
+        let headroom = policy.capacity_headroom(&syndicate, &book, &model, &mut rng);
+        assert!((headroom - 1.0).abs() < 1e-9, "an empty book is all free budget, got {headroom}");
+    }
+
+    #[test]
+    fn a_capital_drawdown_collapses_capacity_headroom() {
+        // The budget scales with current capital, so holding the book fixed and
+        // depleting capital eats the free headroom — the structural channel by which
+        // a catastrophe hardens an exposed syndicate. Insolvency leaves none at all.
+        let model = CatModel { annual_frequency: 0.6, min_damage_fraction: 0.02, tail_alpha: 1.4 };
+        let policy = ExposurePolicy { return_period: 200.0, solvency_fraction: 0.5, line_fraction: 0.5, tail_trials: 4_000 };
+        let book = NetBook { lines: vec![NetLine { territory: Territory(0), net_limit: 40.0 }] };
+        let headroom_at = |capital: f64| {
+            let mut rng = Rng::seeded(11);
+            policy.capacity_headroom(&Syndicate::with_capital(capital), &book, &model, &mut rng)
+        };
+
+        let healthy = headroom_at(100.0);
+        let depleted = headroom_at(50.0);
+        let insolvent = headroom_at(0.0);
+
+        assert!(healthy > depleted, "a drawdown must shrink headroom: {healthy} !> {depleted}");
+        assert!(depleted > insolvent, "deeper depletion shrinks it further: {depleted} !> {insolvent}");
+        assert_eq!(insolvent, 0.0, "an insolvent syndicate has no capacity headroom");
+    }
+
+    fn offer(id: usize, quote: f64, share: f64) -> SubscriptionOffer {
+        SubscriptionOffer {
+            syndicate: SyndicateId(id),
+            quote,
+            decision: UnderwritingDecision::Accept,
+            offered_share: share,
+        }
+    }
+
+    #[test]
+    fn a_follower_subscribes_to_the_firm_order_only_at_or_below_it() {
+        // The lead's quote is the layer's firm order — the single price the insured
+        // pays. A follower subscribes when its anchored quote sits at or below that
+        // firm order (it will write at the lead's terms); a follower whose anchored
+        // quote exceeds the firm order will not write that cheap, and drops off.
+        let lead = offer(0, 100.0, 0.3); // firm order = 100
+        let followers = [
+            offer(1, 90.0, 0.3),  // below firm order → subscribes
+            offer(2, 100.0, 0.2), // exactly at firm order → subscribes
+            offer(3, 110.0, 0.3), // above firm order → does not subscribe
+        ];
+
+        let panel = form_panel(lead, &followers);
+        let members: Vec<usize> = panel.entries.iter().map(|e| e.syndicate.0).collect();
+
+        assert_eq!(members, vec![0, 1, 2], "only the lead and the at/below-firm followers subscribe");
+    }
+
+    #[test]
+    fn a_follower_declining_on_exposure_never_subscribes_however_cheap_the_firm_order() {
+        // Herding moves price, never capacity discipline: a follower whose own
+        // exposure limits decline the risk drops off the panel even though its
+        // anchored quote sits comfortably below the firm order.
+        let lead = offer(0, 100.0, 0.4);
+        let declined = SubscriptionOffer {
+            syndicate: SyndicateId(1),
+            quote: 50.0, // far below the firm order — would subscribe on price alone
+            decision: UnderwritingDecision::Decline(DeclineReason::CatAggregate),
+            offered_share: 0.4,
+        };
+
+        let panel = form_panel(lead, &[declined]);
+        let members: Vec<usize> = panel.entries.iter().map(|e| e.syndicate.0).collect();
+        assert_eq!(members, vec![0], "the capacity-declined follower stays off the panel");
+    }
+
+    #[test]
+    fn capacity_first_fill_caps_the_panel_at_the_full_layer() {
+        // Offers fill the layer in order; the share that completes the layer is
+        // trimmed to fit exactly, and willing offers beyond a full layer are not
+        // needed. The placed portion never exceeds the whole layer.
+        let lead = offer(0, 100.0, 0.5);
+        let followers = [
+            offer(1, 100.0, 0.4), // takes 0.4 → running total 0.9
+            offer(2, 100.0, 0.3), // only 0.1 left → trimmed to 0.1, total 1.0
+            offer(3, 100.0, 0.3), // layer already full → unused
+        ];
+
+        let panel = form_panel(lead, &followers);
+        assert!((panel.placed_portion() - 1.0).abs() < 1e-9, "a full layer places exactly 1.0");
+        let ids: Vec<usize> = panel.entries.iter().map(|e| e.syndicate.0).collect();
+        assert_eq!(ids, vec![0, 1, 2], "the surplus offer (3) is dropped once the layer fills");
+        let shares: Vec<f64> = panel.entries.iter().map(|e| e.share).collect();
+        assert!((shares[2] - 0.1).abs() < 1e-9, "the completing share is trimmed to 0.1, got {}", shares[2]);
+    }
+
+    #[test]
+    fn a_layer_with_insufficient_willing_capacity_is_left_partially_placed() {
+        // When the willing subscribers cannot fill the layer, it is partially placed
+        // — the panel's placed portion falls short of 1.0 and the insured carries the
+        // gap (restructure or retain).
+        let lead = offer(0, 100.0, 0.3);
+        let followers = [
+            offer(1, 100.0, 0.2),
+            offer(2, 130.0, 0.4), // above firm order → does not subscribe, so capacity is short
+        ];
+
+        let panel = form_panel(lead, &followers);
+        assert!((panel.placed_portion() - 0.5).abs() < 1e-9, "only 0.3 + 0.2 places, got {}", panel.placed_portion());
+        assert!(panel.placed_portion() < 1.0, "the layer is left partially placed");
+    }
+
+    #[test]
+    fn a_profitable_well_capitalised_year_distributes_a_fraction_of_the_profit() {
+        // Year-end distribution releases the genome payout fraction of the year's
+        // underwriting profit to capital providers — the only thing that stops
+        // capital accumulating without bound and lets the market re-soften.
+        let params = DistributionParams { payout_fraction: 0.6, solvency_floor: 100.0 };
+        let released = distribution(1_000.0, 200.0, &params);
+        assert!((released - 120.0).abs() < 1e-9, "0.6 × 200 profit = 120, got {released}");
+    }
+
+    #[test]
+    fn distributions_are_suppressed_in_loss_years() {
+        // A loss year releases nothing — there is no profit to distribute, and the
+        // capital must absorb the loss, not be paid out.
+        let params = DistributionParams { payout_fraction: 0.6, solvency_floor: 100.0 };
+        assert_eq!(distribution(1_000.0, -50.0, &params), 0.0, "a loss year distributes nothing");
+        assert_eq!(distribution(1_000.0, 0.0, &params), 0.0, "a break-even year distributes nothing");
+    }
+
+    #[test]
+    fn an_impaired_syndicate_below_the_solvency_floor_rebuilds_before_distributing() {
+        // Even a profitable year releases nothing while capital sits below the
+        // solvency floor: the impaired syndicate rebuilds first.
+        let params = DistributionParams { payout_fraction: 0.6, solvency_floor: 100.0 };
+        assert_eq!(distribution(80.0, 200.0, &params), 0.0, "below the floor, profit is retained to rebuild");
+    }
+
+    #[test]
+    fn a_distribution_never_drives_capital_below_the_solvency_floor() {
+        // A thin-but-solvent syndicate with a big nominal profit only releases down
+        // to the floor — the payout is capped by the capital available above it.
+        let params = DistributionParams { payout_fraction: 0.9, solvency_floor: 100.0 };
+        // 0.9 × 500 = 450 desired, but only 120 − 100 = 20 sits above the floor.
+        let released = distribution(120.0, 500.0, &params);
+        assert!((released - 20.0).abs() < 1e-9, "capped at the headroom above the floor, got {released}");
+        assert!(120.0 - released >= params.solvency_floor, "capital never falls below the floor");
+    }
+
+    // --- The annual market engine -------------------------------------------
+
+    fn test_genome(appetite: f64) -> SyndicateGenome {
+        SyndicateGenome {
+            cat_model: CatModel { annual_frequency: 0.5, min_damage_fraction: 0.05, tail_alpha: 1.5 },
+            exposure: ExposurePolicy { return_period: 200.0, solvency_fraction: 0.6, line_fraction: 0.4, tail_trials: 120 },
+            pricing: PricingParams { hurdle_rate: 0.1, credibility_k: 50.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 120 },
+            avt: AvtParams { headroom_responsiveness: 0.3, feedback_responsiveness: 0.4, share_appetite: appetite },
+            distribution: DistributionParams { payout_fraction: 0.5, solvency_floor: 200.0 },
+            herding_susceptibility: 0.5,
+            target_line: 0.34,
+        }
+    }
+
+    fn small_market(seed: u64) -> Market {
+        // A handful of syndicates with heterogeneous share-appetites, two brokers,
+        // and two territories each carrying a cohort of insureds. Small enough to
+        // step quickly, real enough to exercise cats, panels, and the year-end loop.
+        let syndicates: Vec<SyndicateAgent> = [0.45, 0.5, 0.55, 0.5]
+            .iter()
+            .map(|&a| SyndicateAgent::new(1_000.0, test_genome(a)))
+            .collect();
+        let n = syndicates.len();
+        let brokers = vec![
+            Broker::new(vec![1.0, 0.5, 0.2, 0.1], 0.85),
+            Broker::new(vec![0.1, 0.2, 0.5, 1.0], 0.85),
+        ];
+        let n_brokers = brokers.len();
+        let territory_market = |t: u32, freq: f64| TerritoryMarket {
+            territory: Territory(t),
+            peril: CatastrophePeril { annual_frequency: freq, min_damage_fraction: 0.05, tail_alpha: 1.5 },
+            insureds: (0..8)
+                .map(|i| MarketInsured {
+                    asset: Asset { sum_insured: 100.0, territory: Territory(t) },
+                    risk_aversion: 1.6,
+                    broker: BrokerId(i % n_brokers),
+                })
+                .collect(),
+        };
+        Market::new(
+            syndicates,
+            brokers,
+            vec![territory_market(0, 0.4), territory_market(1, 0.4)],
+            AttritionalPeril { occurrence_probability: 0.2, mean_damage_fraction: 0.05 },
+            0.15,
+            n.min(3),
+            Rng::seeded(seed),
+        )
+    }
+
+    #[test]
+    fn the_annual_loop_steps_a_year_binds_cover_and_re_prices_avt() {
+        // The tracer: one turn of the whole annual loop. Demand meets supply, some
+        // cover binds, premium is earned, and the year-end re-set leaves every
+        // solvent syndicate carrying an AvT it can quote next year from.
+        let mut market = small_market(1);
+        let report = market.step_year();
+
+        assert_eq!(report.year, 0, "the first step reports year 0");
+        assert!(report.solvent_count > 0, "syndicates start solvent");
+        assert!(report.placements > 0, "demand and supply meet, so cover binds");
+        assert!(report.gross_premium > 0.0, "binding cover earns premium");
+        assert!(report.mean_avt > 0.0, "every syndicate carries a positive ask multiplier");
+        assert_eq!(market.year(), 1, "stepping advances the calendar");
+    }
+
+    #[test]
+    fn a_shared_catastrophe_hardens_exposed_syndicates_headroom_and_avt_together() {
+        // Criterion 5 / #2: a shared occurrence strikes every syndicate exposed to
+        // the zone at once. With the feedback channel silenced to isolate the
+        // headroom channel, the correlated capital drawdown collapses EVERY exposed
+        // syndicate's headroom together and lifts EVERY one's AvT target above the
+        // floor together — market-wide hardening as the aggregate of purely local
+        // states, with no coordinator and no market-phase variable.
+        let model = CatModel { annual_frequency: 0.5, min_damage_fraction: 0.05, tail_alpha: 1.5 };
+        let policy = ExposurePolicy { return_period: 200.0, solvency_fraction: 0.6, line_fraction: 0.6, tail_trials: 3_000 };
+        // Headroom channel only: feedback_responsiveness = 0.
+        let params = AvtParams { headroom_responsiveness: 0.5, feedback_responsiveness: 0.0, share_appetite: 0.5 };
+        // Three syndicates, each holding the same book in the same zone.
+        let book = NetBook { lines: vec![NetLine { territory: Territory(0), net_limit: 30.0 }] };
+        let mut syndicates = vec![Syndicate::with_capital(200.0); 3];
+
+        let read = |s: &Syndicate, rng_seed: u64| {
+            let mut rng = Rng::seeded(rng_seed);
+            policy.capacity_headroom(s, &book, &model, &mut rng)
+        };
+        // Pre-cat: abundant capital → high headroom, AvT relaxing at or below the floor.
+        let pre_headroom: Vec<f64> = (0..3).map(|i| read(&syndicates[i], 42 + i as u64)).collect();
+        let pre_avt: Vec<f64> = pre_headroom.iter().map(|&h| updated_avt(1.0, h, 0.5, &params)).collect();
+
+        // The shared catastrophe: one occurrence debits every exposed syndicate.
+        for s in &mut syndicates {
+            s.settle(150.0); // 200 → 50, together
+        }
+
+        // Post-cat: the same book now sits against a much smaller budget.
+        let post_headroom: Vec<f64> = (0..3).map(|i| read(&syndicates[i], 42 + i as u64)).collect();
+        let post_avt: Vec<f64> = post_headroom.iter().map(|&h| updated_avt(1.0, h, 0.5, &params)).collect();
+
+        for i in 0..3 {
+            assert!(post_headroom[i] < pre_headroom[i], "syndicate {i} headroom must collapse: {} !< {}", post_headroom[i], pre_headroom[i]);
+            assert!(post_avt[i] > pre_avt[i], "syndicate {i} AvT must harden: {} !> {}", post_avt[i], pre_avt[i]);
+            assert!(post_avt[i] > 1.0, "syndicate {i} holds out above the floor post-cat, got {}", post_avt[i]);
+        }
+    }
+
+    #[test]
+    fn a_multi_decade_run_stays_physical_and_holds_the_loss_settlement_invariants() {
+        // The hard gate. Stepping the real substrate for decades routes every loss
+        // through the settlement cascade, whose invariants `attribute` re-checks on
+        // each settlement — so completing the run at all means they held throughout.
+        // On top of that: capital never goes negative (the zero floor), and every
+        // diagnostic reading is finite and in range.
+        let mut market = small_market(7);
+        let reports = market.run(40);
+
+        assert_eq!(reports.len(), 40);
+        for id in 0..4 {
+            assert!(market.capital(SyndicateId(id)) >= 0.0, "capital never goes below the zero floor");
+        }
+        for r in &reports {
+            assert!(r.combined_ratio >= 0.0 && r.combined_ratio.is_finite(), "combined ratio is physical: {}", r.combined_ratio);
+            assert!(r.mean_avt >= 0.0 && r.mean_avt.is_finite(), "mean AvT is physical: {}", r.mean_avt);
+            assert!((0.0..=1.0).contains(&r.mean_headroom), "headroom is a fraction: {}", r.mean_headroom);
+            assert!(r.year < 40);
+        }
+        assert!(reports.iter().any(|r| r.placements > 0), "cover binds over the run");
+        assert!(reports.iter().any(|r| r.cat_events > 0), "the true cat process fires over the run");
+    }
+
+    #[test]
+    fn the_engines_loss_architecture_preserves_the_risk_pooling_invariant() {
+        // The other half of the gate: the engine's attritional peril pools (aggregate
+        // CV falls ~1/√N) while its catastrophe peril — a single shared occurrence —
+        // does not compress with pool size. If this fails the loss architecture under
+        // the run is wrong and no emergent cycle on top of it is trustworthy.
+        let attritional = AttritionalPeril { occurrence_probability: 0.2, mean_damage_fraction: 0.05 };
+        let cat = CatastrophePeril { annual_frequency: 0.4, min_damage_fraction: 0.05, tail_alpha: 1.5 };
+        let si = 100.0;
+        let trials = 6_000;
+        let mut rng = Rng::seeded(99);
+
+        // Attritional: each quadrupling of N roughly halves the CV.
+        let cv_small = coefficient_of_variation(&attritional_aggregate_samples(200, si, &attritional, trials, &mut rng));
+        let cv_large = coefficient_of_variation(&attritional_aggregate_samples(800, si, &attritional, trials, &mut rng));
+        assert!(cv_large < 0.65 * cv_small, "attritional must pool: {cv_large} not well below {cv_small}");
+
+        // Catastrophe (one shared occurrence): CV stays ~flat as the pool grows.
+        let cat_small = coefficient_of_variation(&catastrophe_aggregate_samples(1, 200, si, &cat, trials, &mut rng));
+        let cat_large = coefficient_of_variation(&catastrophe_aggregate_samples(1, 800, si, &cat, trials, &mut rng));
+        assert!(cat_large > 0.85 * cat_small, "catastrophe CV must not compress with N: {cat_large} vs {cat_small}");
+    }
+
+    #[test]
+    fn a_multi_decade_run_oscillates_in_rate_and_is_combined_ratio_bimodal() {
+        // Criterion 4: over decades the market rate oscillates on a multi-year cycle
+        // and the combined ratio is bimodal — benign years cluster low, cat years
+        // spike high. Both emerge purely from the population of local AvT rules
+        // colliding with the true loss process; nothing here is hardcoded.
+        let mut market = demonstration_market(2024);
+        let reports = market.run(60);
+
+        let rate: Vec<f64> = reports.iter().map(|r| r.rate_index).collect();
+        let mean_rate = rate.iter().sum::<f64>() / rate.len() as f64;
+
+        // A hard phase (rate above the technical floor) AND a soft phase (rate
+        // competed below it) both appear — the market is not stuck on one side.
+        let hard = rate.iter().cloned().fold(f64::MIN, f64::max);
+        let soft = rate.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(hard > 1.05, "a hard phase emerges (rate above TP): max {hard}");
+        assert!(soft < 0.97, "a soft phase emerges (rate below TP): min {soft}");
+
+        // Multi-year oscillation: the rate crosses its own mean many times rather
+        // than drifting monotonically.
+        let crossings = rate
+            .windows(2)
+            .filter(|w| (w[0] - mean_rate) * (w[1] - mean_rate) < 0.0)
+            .count();
+        assert!(crossings >= 6, "the rate oscillates on a multi-year cycle, only {crossings} mean-crossings");
+
+        // The mean AvT itself spans soft and hard over the run.
+        let mean_avt: Vec<f64> = reports.iter().map(|r| r.mean_avt).collect();
+        let avt_hi = mean_avt.iter().cloned().fold(f64::MIN, f64::max);
+        let avt_lo = mean_avt.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(avt_hi > 1.0 && avt_lo < 0.85, "mean AvT swings soft↔hard: {avt_lo}..{avt_hi}");
+
+        // Combined-ratio bimodality: a dominant benign mode (low median) and a
+        // distinct minority of cat years that spike well above unity.
+        let mut crs: Vec<f64> = reports.iter().map(|r| r.combined_ratio).collect();
+        crs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = crs[crs.len() / 2];
+        let max_cr = *crs.last().unwrap();
+        let cat_years = crs.iter().filter(|&&c| c > 1.0).count();
+        assert!(median < 0.5, "benign years dominate (low median CR): {median}");
+        assert!(max_cr > 1.5, "cat years spike the CR well above unity: {max_cr}");
+        assert!((4..=24).contains(&cat_years), "cat years are a real minority, got {cat_years} of 60");
+    }
+
+    #[test]
+    fn a_year_report_emits_a_csv_row_matching_its_header() {
+        let mut market = small_market(3);
+        let report = market.step_year();
+        let header_cols = YearReport::CSV_HEADER.split(',').count();
+        let row_cols = report.csv_row().split(',').count();
+        assert_eq!(header_cols, row_cols, "every header column has a value");
+        assert!(report.csv_row().starts_with("0,"), "the row leads with the year");
     }
 }

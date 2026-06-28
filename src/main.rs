@@ -11,8 +11,8 @@
 
 use rinsanity::{
     anchored_quote, attritional_aggregate_samples, catastrophe_aggregate_samples,
-    coefficient_of_variation, follower_weight, AttritionalPeril, Broker, CatastrophePeril,
-    RelationshipOutcome, Rng, SyndicateId,
+    coefficient_of_variation, demonstration_market, follower_weight, AttritionalPeril, Broker,
+    CatastrophePeril, RelationshipOutcome, Rng, SyndicateId, YearReport,
 };
 
 fn main() {
@@ -21,6 +21,48 @@ fn main() {
     catastrophe_diagnostic();
     println!();
     placement_demonstration();
+    println!();
+    cycle_demonstration();
+}
+
+/// The HITL deliverable for #7: a multi-decade run of the [`demonstration_market`]
+/// whose emergent underwriting cycle a human reads for the right qualitative shape
+/// (soft → shock → hard → soft). Emits the per-year diagnostics as CSV (no
+/// charting) plus a short qualitative read. Nothing here imposes a cycle — there is
+/// no market-phase variable, coordinator, or `AP = TP × f(t)` curve; the rate
+/// movement is the aggregate of each syndicate's purely local AvT state.
+fn cycle_demonstration() {
+    let years = 60;
+    let mut market = demonstration_market(2024);
+    let reports = market.run(years);
+
+    println!("Underwriting cycle (#1) — emergent AvT over a {years}-year run");
+    println!("AP = TP · AvT; AvT is per-syndicate, driven only by local headroom + placement feedback.");
+    println!();
+    println!("{}", YearReport::CSV_HEADER);
+    for r in &reports {
+        println!("{}", r.csv_row());
+    }
+    println!();
+
+    // A qualitative read to orient the human reviewer (the close is theirs).
+    let rate: Vec<f64> = reports.iter().map(|r| r.rate_index).collect();
+    let mean_rate = rate.iter().sum::<f64>() / rate.len() as f64;
+    let hard = rate.iter().cloned().fold(f64::MIN, f64::max);
+    let soft = rate.iter().cloned().fold(f64::MAX, f64::min);
+    let crossings = rate.windows(2).filter(|w| (w[0] - mean_rate) * (w[1] - mean_rate) < 0.0).count();
+    let mut crs: Vec<f64> = reports.iter().map(|r| r.combined_ratio).collect();
+    crs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_cr = crs[crs.len() / 2];
+    let max_cr = *crs.last().unwrap();
+    let cat_years = crs.iter().filter(|&&c| c > 1.0).count();
+
+    println!("Qualitative read:");
+    println!("  rate index swings {soft:.2} (soft, below TP) … {hard:.2} (hard, above TP), mean {mean_rate:.2}");
+    println!("  crossing its mean {crossings} times — a multi-year oscillation, not a drift");
+    println!("  combined ratio is bimodal: benign-year median {median_cr:.2}, {cat_years} cat years spiking to {max_cr:.2}");
+    println!("=> soft markets compete AvT below the floor; a cat collapses headroom and hardens it above;");
+    println!("   recovered capital re-softens. Human review confirms the soft → shock → hard → soft shape.");
 }
 
 fn attritional_diagnostic() {

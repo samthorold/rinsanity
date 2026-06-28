@@ -2194,6 +2194,85 @@ impl Market {
     }
 }
 
+impl YearReport {
+    /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
+    pub const CSV_HEADER: &'static str =
+        "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,mean_headroom,cat_events,placements,gross_premium,incurred_losses";
+
+    /// One CSV row of the year's diagnostics (no charting — the row is the
+    /// instrument reading a human reads the cycle's shape from).
+    pub fn csv_row(&self) -> String {
+        format!(
+            "{},{:.6},{:.6},{:.6},{:.6},{},{:.6},{},{},{:.6},{:.6}",
+            self.year,
+            self.mean_avt,
+            self.avt_spread,
+            self.rate_index,
+            self.combined_ratio,
+            self.solvent_count,
+            self.mean_headroom,
+            self.cat_events,
+            self.placements,
+            self.gross_premium,
+            self.incurred_losses,
+        )
+    }
+}
+
+/// A calibrated **reference market** for the multi-decade cycle demonstration (the
+/// HITL run). A population of ten syndicates with heterogeneous share-appetites,
+/// AvT responsiveness, and hurdle rates; three brokers with different relationship
+/// portfolios; and two territories carrying their own heavy-tailed cat processes
+/// and insured cohorts. Capital is deliberately scarce relative to the cat
+/// exposure, so a shared shock collapses headroom and the hard phase emerges. The
+/// specific constants are calibration in the code — the *forms* are the design.
+pub fn demonstration_market(seed: u64) -> Market {
+    let appetites = [0.35, 0.4, 0.45, 0.5, 0.5, 0.55, 0.6, 0.65, 0.45, 0.55];
+    let syndicates: Vec<SyndicateAgent> = appetites
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| {
+            let genome = SyndicateGenome {
+                cat_model: CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 },
+                exposure: ExposurePolicy { return_period: 200.0, solvency_fraction: 0.45, line_fraction: 0.5, tail_trials: 120 },
+                pricing: PricingParams { hurdle_rate: 0.08 + 0.01 * (i % 4) as f64, credibility_k: 50.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 120 },
+                avt: AvtParams { headroom_responsiveness: 0.35 + 0.1 * (i % 3) as f64, feedback_responsiveness: 0.25, share_appetite: a },
+                distribution: DistributionParams { payout_fraction: 0.5, solvency_floor: 200.0 },
+                herding_susceptibility: 0.5,
+                target_line: 0.55,
+            };
+            SyndicateAgent::new(280.0, genome)
+        })
+        .collect();
+    let n = syndicates.len();
+    let brokers = vec![
+        Broker::new(vec![1.0; n], 0.85),
+        Broker::new((0..n).map(|i| 1.0 - 0.05 * i as f64).collect(), 0.88),
+        Broker::new((0..n).map(|i| 0.2 + 0.05 * i as f64).collect(), 0.82),
+    ];
+    let n_brokers = brokers.len();
+    let territory = |t: u32, freq: f64, count: usize| TerritoryMarket {
+        territory: Territory(t),
+        peril: CatastrophePeril { annual_frequency: freq, min_damage_fraction: 0.07, tail_alpha: 1.35 },
+        insureds: (0..count)
+            .map(|i| MarketInsured {
+                asset: Asset { sum_insured: 100.0, territory: Territory(t) },
+                risk_aversion: 2.0,
+                broker: BrokerId(i % n_brokers),
+            })
+            .collect(),
+    };
+    Market::new(
+        syndicates,
+        brokers,
+        vec![territory(0, 0.4, 16), territory(1, 0.4, 14)],
+        AttritionalPeril { occurrence_probability: 0.25, mean_damage_fraction: 0.06 },
+        0.15,
+        4,
+        Rng::seeded(seed),
+    )
+}
+
 /// Attribute a panel's settlements back to the agents' loss/premium tallies. The
 /// substrate guarantees the loss-settlement invariants on the settlements; this
 /// re-checks them as the engine's hard gate (no claim above its share, no negative
@@ -4471,5 +4550,60 @@ mod tests {
         let cat_small = coefficient_of_variation(&catastrophe_aggregate_samples(1, 200, si, &cat, trials, &mut rng));
         let cat_large = coefficient_of_variation(&catastrophe_aggregate_samples(1, 800, si, &cat, trials, &mut rng));
         assert!(cat_large > 0.85 * cat_small, "catastrophe CV must not compress with N: {cat_large} vs {cat_small}");
+    }
+
+    #[test]
+    fn a_multi_decade_run_oscillates_in_rate_and_is_combined_ratio_bimodal() {
+        // Criterion 4: over decades the market rate oscillates on a multi-year cycle
+        // and the combined ratio is bimodal — benign years cluster low, cat years
+        // spike high. Both emerge purely from the population of local AvT rules
+        // colliding with the true loss process; nothing here is hardcoded.
+        let mut market = demonstration_market(2024);
+        let reports = market.run(60);
+
+        let rate: Vec<f64> = reports.iter().map(|r| r.rate_index).collect();
+        let mean_rate = rate.iter().sum::<f64>() / rate.len() as f64;
+
+        // A hard phase (rate above the technical floor) AND a soft phase (rate
+        // competed below it) both appear — the market is not stuck on one side.
+        let hard = rate.iter().cloned().fold(f64::MIN, f64::max);
+        let soft = rate.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(hard > 1.05, "a hard phase emerges (rate above TP): max {hard}");
+        assert!(soft < 0.97, "a soft phase emerges (rate below TP): min {soft}");
+
+        // Multi-year oscillation: the rate crosses its own mean many times rather
+        // than drifting monotonically.
+        let crossings = rate
+            .windows(2)
+            .filter(|w| (w[0] - mean_rate) * (w[1] - mean_rate) < 0.0)
+            .count();
+        assert!(crossings >= 6, "the rate oscillates on a multi-year cycle, only {crossings} mean-crossings");
+
+        // The mean AvT itself spans soft and hard over the run.
+        let mean_avt: Vec<f64> = reports.iter().map(|r| r.mean_avt).collect();
+        let avt_hi = mean_avt.iter().cloned().fold(f64::MIN, f64::max);
+        let avt_lo = mean_avt.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(avt_hi > 1.0 && avt_lo < 0.85, "mean AvT swings soft↔hard: {avt_lo}..{avt_hi}");
+
+        // Combined-ratio bimodality: a dominant benign mode (low median) and a
+        // distinct minority of cat years that spike well above unity.
+        let mut crs: Vec<f64> = reports.iter().map(|r| r.combined_ratio).collect();
+        crs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = crs[crs.len() / 2];
+        let max_cr = *crs.last().unwrap();
+        let cat_years = crs.iter().filter(|&&c| c > 1.0).count();
+        assert!(median < 0.5, "benign years dominate (low median CR): {median}");
+        assert!(max_cr > 1.5, "cat years spike the CR well above unity: {max_cr}");
+        assert!((4..=24).contains(&cat_years), "cat years are a real minority, got {cat_years} of 60");
+    }
+
+    #[test]
+    fn a_year_report_emits_a_csv_row_matching_its_header() {
+        let mut market = small_market(3);
+        let report = market.step_year();
+        let header_cols = YearReport::CSV_HEADER.split(',').count();
+        let row_cols = report.csv_row().split(',').count();
+        assert_eq!(header_cols, row_cols, "every header column has a value");
+        assert!(report.csv_row().starts_with("0,"), "the row leads with the year");
     }
 }

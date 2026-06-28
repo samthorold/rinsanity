@@ -1824,6 +1824,7 @@ pub struct TerritoryMarket {
 /// built from — one row per simulated year.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct YearReport {
+    /// Zero-based simulation year this row reports (the run's first year is `0`).
     pub year: usize,
     /// Mean AvT multiplier across solvent syndicates.
     pub mean_avt: f64,
@@ -1836,6 +1837,8 @@ pub struct YearReport {
     /// Incurred losses over net earned premium — the headline whose bimodality
     /// (benign vs cat years) is the cycle diagnostic.
     pub combined_ratio: f64,
+    /// Number of syndicates still solvent at year-end (the population that sets
+    /// the AvT and headroom aggregates above).
     pub solvent_count: usize,
     /// Mean post-distribution capacity headroom across solvent syndicates.
     pub mean_headroom: f64,
@@ -2199,24 +2202,74 @@ impl YearReport {
     pub const CSV_HEADER: &'static str =
         "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,mean_headroom,cat_events,placements,gross_premium,incurred_losses";
 
+    /// The year's diagnostics as ordered `(column, value)` pairs — the single
+    /// source of truth for column order and per-field formatting that both
+    /// [`csv_row`](Self::csv_row) and [`reports_to_json`] render from, so the CSV
+    /// and JSON emissions can never drift out of sync. Every value is a bare JSON
+    /// number (no quoting needed); the keys match [`CSV_HEADER`](Self::CSV_HEADER).
+    fn columns(&self) -> [(&'static str, String); 11] {
+        [
+            ("year", self.year.to_string()),
+            ("mean_avt", format!("{:.6}", self.mean_avt)),
+            ("avt_spread", format!("{:.6}", self.avt_spread)),
+            ("rate_index", format!("{:.6}", self.rate_index)),
+            ("combined_ratio", format!("{:.6}", self.combined_ratio)),
+            ("solvent_count", self.solvent_count.to_string()),
+            ("mean_headroom", format!("{:.6}", self.mean_headroom)),
+            ("cat_events", self.cat_events.to_string()),
+            ("placements", self.placements.to_string()),
+            ("gross_premium", format!("{:.6}", self.gross_premium)),
+            ("incurred_losses", format!("{:.6}", self.incurred_losses)),
+        ]
+    }
+
     /// One CSV row of the year's diagnostics (no charting — the row is the
     /// instrument reading a human reads the cycle's shape from).
     pub fn csv_row(&self) -> String {
-        format!(
-            "{},{:.6},{:.6},{:.6},{:.6},{},{:.6},{},{},{:.6},{:.6}",
-            self.year,
-            self.mean_avt,
-            self.avt_spread,
-            self.rate_index,
-            self.combined_ratio,
-            self.solvent_count,
-            self.mean_headroom,
-            self.cat_events,
-            self.placements,
-            self.gross_premium,
-            self.incurred_losses,
-        )
+        self.columns().map(|(_, v)| v).join(",")
     }
+}
+
+/// Render a run's per-year diagnostics as machine-readable CSV: the documented
+/// [`YearReport::CSV_HEADER`] followed by one [`csv_row`](YearReport::csv_row)
+/// per report, newline-separated and nothing else. This is the single emission
+/// code path shared by the `cycle` CLI subcommand and the tests, so the binary's
+/// output and the unit-tested string are byte-for-byte the same.
+pub fn reports_to_csv(reports: &[YearReport]) -> String {
+    let mut out = String::from(YearReport::CSV_HEADER);
+    for r in reports {
+        out.push('\n');
+        out.push_str(&r.csv_row());
+    }
+    out
+}
+
+/// Render a run's per-year diagnostics as a JSON array of objects — one object
+/// per year, keyed by the documented [`YearReport::CSV_HEADER`] columns. Every
+/// value is a bare JSON number (the same formatted cell the CSV emits, via
+/// [`YearReport::columns`]), so CSV and JSON never disagree. Hand-rolled to keep
+/// the crate dependency-free; the columns are all numeric so no string escaping
+/// is required.
+pub fn reports_to_json(reports: &[YearReport]) -> String {
+    let mut out = String::from("[");
+    for (i, r) in reports.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        for (j, (key, value)) in r.columns().iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(key);
+            out.push_str("\":");
+            out.push_str(value);
+        }
+        out.push('}');
+    }
+    out.push(']');
+    out
 }
 
 /// A calibrated **reference market** for the multi-decade cycle demonstration (the
@@ -4605,5 +4658,51 @@ mod tests {
         let row_cols = report.csv_row().split(',').count();
         assert_eq!(header_cols, row_cols, "every header column has a value");
         assert!(report.csv_row().starts_with("0,"), "the row leads with the year");
+    }
+
+    #[test]
+    fn reports_to_csv_is_the_header_then_exactly_one_data_line_per_report() {
+        // The machine-readable emission an agent consumes: the first line is the
+        // documented header, then exactly one csv_row per report and nothing else.
+        let mut market = small_market(3);
+        let reports = market.run(5);
+        let csv = reports_to_csv(&reports);
+
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), reports.len() + 1, "header + one row per year");
+        assert_eq!(lines[0], YearReport::CSV_HEADER, "first line is the header");
+        // Every data line round-trips the report's own csv_row, in order.
+        for (line, report) in lines[1..].iter().zip(&reports) {
+            assert_eq!(*line, report.csv_row(), "data line matches the report's csv_row");
+        }
+    }
+
+    #[test]
+    fn reports_to_json_is_an_array_of_objects_keyed_by_the_documented_columns() {
+        let mut market = small_market(3);
+        let reports = market.run(4);
+        let json = reports_to_json(&reports);
+
+        // A JSON array: one object per report.
+        assert!(json.starts_with('['), "JSON is an array");
+        assert!(json.ends_with(']'), "JSON is an array");
+        assert_eq!(json.matches('{').count(), reports.len(), "one object per year");
+        assert_eq!(json.matches('}').count(), reports.len(), "one object per year");
+
+        // The key set is exactly the documented CSV columns, once per object.
+        let keys: Vec<&str> = YearReport::CSV_HEADER.split(',').collect();
+        for key in &keys {
+            let needle = format!("\"{key}\":");
+            assert_eq!(json.matches(&needle).count(), reports.len(), "key {key} appears once per object");
+        }
+
+        // Values round-trip: each column's value in the first object equals the
+        // same column read off the first report's csv_row (same one code path).
+        let first_row = reports[0].csv_row();
+        let first_cells: Vec<&str> = first_row.split(',').collect();
+        for (key, cell) in keys.iter().zip(&first_cells) {
+            let pair = format!("\"{key}\":{cell}");
+            assert!(json.contains(&pair), "expected {pair} in JSON");
+        }
     }
 }

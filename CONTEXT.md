@@ -54,6 +54,27 @@ An underwriting year's open period: the year of occurrence plus two development 
 **RITC (reinsurance-to-close)**:
 The close of an underwriting year at the end of its open period: the remaining estimate crystallises onto the true ultimate and the year's **final distribution** is released. An open year's profit is not distributable — RITC is what gates it.
 
+**Treaty**:
+An outward reinsurance contract: an **excess-of-loss layer on a primary's aggregate portfolio loss**, subscribed by a panel of reinsurers. Structurally the same layer-and-panel the substrate already owns, pointed at portfolio loss rather than an asset.
+_Avoid_: treating reinsurance as a fixed net-retention fraction; a treaty is a layer with a finite-capital counterparty behind it.
+
+**Reinsurer**:
+A syndicate whose inwards risks are other syndicates' aggregate losses. Not a separate agent class — the same finite capital with its zero floor, portfolio tail measure, TP-style pricing, and insolvency-into-runoff lifecycle.
+
+**Retention**:
+The primary's attachment on its treaty — the aggregate loss it keeps before the treaty responds. Sized off its own current capital at renewal, ahead of the year's writing.
+
+**Gross / net**:
+**Gross** is the loss the substrate actually debited a primary; **net** is what remains after reinsurance recoveries *actually received*. The regulatory exposure limits and the portfolio tail measure bind on **net**; the gross figure is tracked alongside, because net is only as good as the reinsurers standing behind it.
+_Avoid_: a single blended figure — the distinction is what makes reinsurance contagion expressible.
+
+**Retained shortfall**:
+A recovery a primary was **due but never received**, because the reinsurer ran out of capital. It falls on the **ceding primary** — deliberately a different path from primary insolvency, where the shortfall falls on the *insured*. The retained shortfall is the contagion channel.
+_Avoid_: calling it a "default loss"; the reinsurer is not in breach, it is exhausted, and liability is several, not joint.
+
+**Ceded premium**:
+The reinsurance premium a primary pays out — an explicit deduction in the gross-to-net statement between gross written and net earned premium, never folded into a blended expense ratio.
+
 **Float**:
 The premium a syndicate holds between writing business and paying claims on it, which earns the market yield while held.
 

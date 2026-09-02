@@ -37,6 +37,23 @@ _Avoid_: treating it as a cycle-phase signal; nothing reads it to decide the mar
 The profitability a syndicate acts on: its underwriting result **plus** its investment income. It is what distributions are released against and what fresh capital reads off the supply curve. Each syndicate's own, computed from its own book and balance — never a market-wide broadcast.
 _Avoid_: "return" unqualified when the underwriting result alone is meant.
 
+**IBNR reserve**:
+A syndicate's *estimate* of the outstanding liability on a claim that has occurred but not yet run off — the incurred-but-not-reported half of the claim, the near-term settled part being the other. A belief, not a fact: the substrate's true outstanding is the ground truth it develops toward.
+_Avoid_: treating the booked reserve as the amount actually owed.
+
+**Reserving bias**:
+A syndicate's systematic fractional error in the IBNR reserve it books against its true outstanding liability. Negative is optimistic (under-reserved), positive conservative. The agent's estimation error, a genome trait selection acts on — never a property of the loss.
+_Avoid_: calling favourable or adverse development itself a "bias"; the bias is the estimate, the development is the correction.
+
+**Reserve development**:
+The movement of a booked IBNR reserve toward the true ultimate as an underwriting year ages. Positive movement is **adverse development** (strengthening, a debit to capital); negative is **favourable development** (a release, a credit). It is the lagged capital impact of a loss that already happened.
+
+**Three-year account**:
+An underwriting year's open period: the year of occurrence plus two development years. Its result accumulates as it develops and cannot be distributed while it is open.
+
+**RITC (reinsurance-to-close)**:
+The close of an underwriting year at the end of its open period: the remaining estimate crystallises onto the true ultimate and the year's **final distribution** is released. An open year's profit is not distributable — RITC is what gates it.
+
 **Float**:
 The premium a syndicate holds between writing business and paying claims on it, which earns the market yield while held.
 

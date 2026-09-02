@@ -1760,6 +1760,13 @@ pub struct SyndicateGenome {
     pub herding_susceptibility: f64,
     /// The share of any one layer's limit the syndicate offers to subscribe.
     pub target_line: f64,
+    /// The syndicate's systematic **reserving bias**: the fractional error in the
+    /// IBNR reserve it books against its true outstanding liability. Negative is
+    /// optimistic (under-reserved, releasing apparent profit now and paying for it
+    /// at development); positive is conservative. This is the agent's estimation
+    /// error, not a property of the loss — the truth is the substrate's — and it is
+    /// selectable (#12), so the market can punish the over-optimistic.
+    pub reserving_bias: f64,
 }
 
 /// A **syndicate agent**: its genome plus the slow-moving and within-year state it
@@ -1785,8 +1792,21 @@ pub struct SyndicateAgent {
     /// Net earned premium this year (placement premium net of expense, plus
     /// reinstatement income).
     pub premium: f64,
-    /// Claims incurred this year.
+    /// Claims incurred this calendar year: the near-term settled part plus the
+    /// IBNR reserve booked on this year's occurrences, plus every development
+    /// movement on prior underwriting years still open. This is the calendar-year
+    /// incurred the combined ratio reads — so a mis-reserved year flatters it now
+    /// and steps it up when the truth arrives.
     pub losses: f64,
+    /// Development movements booked this calendar year on prior underwriting
+    /// years: positive adverse, negative favourable. Included in `losses`, held
+    /// separately so the current underwriting year's own result excludes it.
+    pub development: f64,
+    /// The open **underwriting year accounts** (the 3-year account): one per year
+    /// still inside its open period, each carrying its IBNR reserve and the result
+    /// its final distribution is gated on. They survive `reset_year` — that is the
+    /// whole point of a multi-year account.
+    pub accounts: Vec<UnderwritingYearAccount>,
 }
 
 impl SyndicateAgent {
@@ -1802,7 +1822,61 @@ impl SyndicateAgent {
             won: 0,
             premium: 0.0,
             losses: 0.0,
+            development: 0.0,
+            accounts: Vec::new(),
         }
+    }
+
+    /// The syndicate's total booked IBNR across its open underwriting years — the
+    /// liability it believes it still carries.
+    pub fn outstanding_reserves(&self) -> f64 {
+        self.accounts.iter().map(|a| a.booked_reserve()).sum()
+    }
+
+    /// Roll the syndicate's **3-year account** at year-end and return the capital
+    /// movements the caller must apply.
+    ///
+    /// Three things happen, in order:
+    /// 1. every open underwriting year develops one step — its estimate walks
+    ///    toward the true ultimate, and the movement is booked into this calendar
+    ///    year's incurred and against that year's own result;
+    /// 2. any year reaching **RITC** closes, and its crystallised result leaves
+    ///    with the return — an open year's profit is not distributable;
+    /// 3. this underwriting year opens its account: the claims `paid` split into
+    ///    the near-term settled part and an IBNR reserve booked at the syndicate's
+    ///    own biased estimate, with the year's result (premium less its own
+    ///    incurred, plus the `income` its float earned) held until that account
+    ///    closes in turn.
+    ///
+    /// Capital already carries the full `paid` amount, so the only balance-sheet
+    /// adjustment on opening is the estimation error itself: optimism hands
+    /// capital back now and owes it at development, conservatism the reverse.
+    fn roll_underwriting_year(&mut self, year: usize, paid: f64, income: f64) -> ReservingRoll {
+        let mut development = 0.0;
+        for account in self.accounts.iter_mut() {
+            development += account.develop();
+        }
+        self.development = development;
+        self.losses += development;
+
+        let mut closed: Vec<f64> = Vec::new();
+        self.accounts.retain(|account| {
+            if account.is_closed() {
+                closed.push(account.result);
+                false
+            } else {
+                true
+            }
+        });
+
+        let true_outstanding = ibnr_outstanding(paid);
+        let mut account = UnderwritingYearAccount::open(year, true_outstanding, self.genome.reserving_bias);
+        let booking = account.booked_reserve() - true_outstanding;
+        self.losses += booking;
+        account.result = self.premium - (paid + booking) + income;
+        self.accounts.push(account);
+
+        ReservingRoll { development, booking, closed }
     }
 
     fn reset_year(&mut self) {
@@ -1811,7 +1885,18 @@ impl SyndicateAgent {
         self.won = 0;
         self.premium = 0.0;
         self.losses = 0.0;
+        self.development = 0.0;
     }
+}
+
+/// What one year-end roll of a syndicate's 3-year account owes its balance sheet:
+/// the development movement on the years still open, the booking adjustment for
+/// the year just opened (both signed — positive debits capital), and the
+/// crystallised results of the years that reached RITC and may now distribute.
+struct ReservingRoll {
+    development: f64,
+    booking: f64,
+    closed: Vec<f64>,
 }
 
 /// The **population distribution** a market's syndicate genomes are drawn from: a
@@ -1865,6 +1950,10 @@ impl GenomePopulation {
             },
             herding_susceptibility: jitter(c.herding_susceptibility),
             target_line: jitter(c.target_line),
+            // Reserving bias jitters **additively**, not fractionally: it is a
+            // signed error centred near zero, and a multiplicative jitter would
+            // degenerate to no dispersion at all at a zero-centred bias.
+            reserving_bias: c.reserving_bias + self.spread * (2.0 * rng.uniform() - 1.0),
         }
     }
 }
@@ -1967,6 +2056,127 @@ pub fn investment_income(rate: f64, opening_capital: f64, underwriting_result: f
 /// while opening capital earns the full year.
 pub const FLOAT_EARNING_FRACTION: f64 = 0.5;
 
+/// The fraction of a claim that **settles near-term**, in the year the loss
+/// occurs. The remainder is incurred-but-not-reported: an outstanding liability
+/// the syndicate can only *estimate*, and which develops toward its true ultimate
+/// over the underwriting year's open period.
+pub const NEAR_TERM_SETTLED_FRACTION: f64 = 0.55;
+
+/// The **true outstanding** part of a year's claims — the ground-truth liability
+/// still to run off once the near-term settled part is paid. This is substrate
+/// truth: no agent observes it. What an agent carries on its balance sheet is its
+/// [`booked_reserve`] estimate of it.
+pub fn ibnr_outstanding(incurred_claims: f64) -> f64 {
+    (1.0 - NEAR_TERM_SETTLED_FRACTION) * incurred_claims.max(0.0)
+}
+
+/// The **IBNR reserve** a syndicate books against a `true_outstanding` liability:
+/// its *estimate* of ultimate loss, distorted by its own systematic
+/// `reserving_bias` (negative = optimistic / under-reserved, positive =
+/// conservative / over-reserved). A reserve is never negative.
+///
+/// This is the belief half of the truth/belief split — the same separation the cat
+/// process / cat model pair already enforces. The gap between this estimate and
+/// the true outstanding is exactly what later development has to close.
+pub fn booked_reserve(true_outstanding: f64, reserving_bias: f64) -> f64 {
+    (true_outstanding * (1.0 + reserving_bias)).max(0.0)
+}
+
+/// The **open period** of an underwriting year: the Lloyd's 3-year account. The
+/// year of occurrence plus two development years, at the end of which
+/// reinsurance-to-close crystallises whatever is left.
+pub const OPEN_PERIOD_YEARS: usize = 3;
+
+/// The fraction of the outstanding estimation error that closes at the **first**
+/// development year. The remainder falls at RITC, so a mis-reserved year lands as
+/// two lagged shocks 12 and 24 months after the loss rather than one.
+pub const RESERVE_DEVELOPMENT_SPEED: f64 = 0.5;
+
+/// One syndicate's **underwriting year account** — the 3-year account.
+///
+/// It holds two numbers that must never be confused: the syndicate's own
+/// `booked_reserve` (its *estimate* of the outstanding liability, the only one it
+/// acts on) and the substrate's `true_outstanding` (ground truth, which no agent
+/// observes). Development is the estimate walking toward the truth; the movement
+/// each step is the year's development charge, debiting capital when adverse and
+/// crediting it when favourable. At the end of the open period **RITC** crystallises
+/// the remainder in one step and the year closes.
+///
+/// It also carries the underwriting year's `result`, accumulated as the account
+/// develops. That result is what the year's **final distribution** is released
+/// against — an open year's profit cannot be distributed, so RITC gates it.
+///
+/// The estimation error currently modelled is exactly the syndicate's systematic
+/// [`reserving_bias`](SyndicateGenome::reserving_bias): an unbiased reserver books
+/// the truth and develops nothing. Idiosyncratic reserving noise on top of the
+/// bias is a further seam, not a change of form — development is already the gap
+/// between estimate and realised ultimate closing, never a scripted release rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnderwritingYearAccount {
+    /// The underwriting year this account belongs to.
+    pub underwriting_year: usize,
+    /// The year's result as booked so far: the occurrence year's total return,
+    /// adjusted by every development movement since. Distributed at RITC.
+    pub result: f64,
+    /// The syndicate's booked estimate of the outstanding liability (belief).
+    booked: f64,
+    /// The substrate's true remaining liability (ground truth, unobservable).
+    true_outstanding: f64,
+    /// Development age in years: `0` on opening, `OPEN_PERIOD_YEARS - 1` at RITC.
+    age: usize,
+}
+
+impl UnderwritingYearAccount {
+    /// Open an account for `underwriting_year` against a `true_outstanding`
+    /// liability, booking the syndicate's biased estimate of it.
+    pub fn open(underwriting_year: usize, true_outstanding: f64, reserving_bias: f64) -> Self {
+        UnderwritingYearAccount {
+            underwriting_year,
+            result: 0.0,
+            booked: booked_reserve(true_outstanding, reserving_bias),
+            true_outstanding,
+            age: 0,
+        }
+    }
+
+    /// The syndicate's current booked estimate of its outstanding liability.
+    pub fn booked_reserve(&self) -> f64 {
+        self.booked
+    }
+
+    /// Whether the account has reached RITC and closed.
+    pub fn is_closed(&self) -> bool {
+        self.age >= OPEN_PERIOD_YEARS - 1
+    }
+
+    /// Advance the account one development year, returning the **development
+    /// movement**: positive is adverse (strengthening, a debit to capital),
+    /// negative is favourable (a release, a credit). The movement is also booked
+    /// against the year's `result`, so the account's distributable profit reflects
+    /// every true-up.
+    ///
+    /// Before the open period ends the estimate converges partway
+    /// ([`RESERVE_DEVELOPMENT_SPEED`]); at the final step **RITC** crystallises the
+    /// whole remaining gap, so cumulative development over the account's life is
+    /// exactly the initial estimation error and total capital impact is the true
+    /// ultimate.
+    pub fn develop(&mut self) -> f64 {
+        if self.is_closed() {
+            return 0.0;
+        }
+        self.age += 1;
+        let target = if self.is_closed() {
+            self.true_outstanding
+        } else {
+            self.booked + RESERVE_DEVELOPMENT_SPEED * (self.true_outstanding - self.booked)
+        };
+        let movement = target - self.booked;
+        self.booked = target;
+        self.result -= movement;
+        movement
+    }
+}
+
 /// A demand-side **insured** in the market: an asset to cover, a risk-aversion
 /// loading (its WTP is risk-aversion × expected loss), and the broker it places
 /// through.
@@ -2025,6 +2235,15 @@ pub struct YearReport {
     /// Total investment income credited to capital this year — the second half of
     /// the total-return signal agents act on.
     pub investment_income: f64,
+    /// Net reserve development booked this year across the market: positive is
+    /// adverse (prior years strengthening — a lagged shock with no fresh cat),
+    /// negative is favourable (releases). Included in `incurred_losses`.
+    pub reserve_development: f64,
+    /// Total IBNR still booked on open underwriting years at year-end.
+    pub outstanding_reserves: f64,
+    /// Capital released to providers this year. Only **closed** underwriting years
+    /// distribute, so this is zero until the first account reaches RITC.
+    pub distributions: f64,
 }
 
 /// A bound tower for one insured, held through the loss phase: the asset it covers
@@ -2125,6 +2344,26 @@ impl Market {
     }
 
     /// The market's capital-supply regime, if endogenous entry is wired (#8).
+    /// Set every syndicate's **reserving bias** — the founders' and the entrant
+    /// population's alike — to a single value. The controlled-study lever for #13:
+    /// holding the seed and every other genome trait fixed and moving only the
+    /// bias makes the optimistic-vs-honest comparison genuinely other-things-equal.
+    pub fn with_reserving_bias(mut self, bias: f64) -> Self {
+        for agent in self.agents.iter_mut() {
+            agent.genome.reserving_bias = bias;
+        }
+        if let Some(supply) = self.capital_supply.as_mut() {
+            supply.population.centre.reserving_bias = bias;
+        }
+        self
+    }
+
+    /// The market's total booked IBNR across every syndicate's open underwriting
+    /// years.
+    pub fn outstanding_reserves(&self) -> f64 {
+        self.agents.iter().map(|a| a.outstanding_reserves()).sum()
+    }
+
     pub fn capital_supply(&self) -> Option<CapitalSupply> {
         self.capital_supply
     }
@@ -2425,15 +2664,22 @@ impl Market {
         let mut total_losses = 0.0;
         let mut total_investment = 0.0;
 
+        let mut total_development = 0.0;
+        let mut total_reserves = 0.0;
+        let mut total_distributions = 0.0;
+
         for (i, agent) in agents.iter_mut().enumerate() {
             total_premium += agent.premium;
-            total_losses += agent.losses;
+            // What the substrate actually paid out this year. Only the near-term
+            // part of it was truly due now; the rest is an outstanding liability
+            // the syndicate can only estimate.
+            let paid = agent.losses;
 
             // Investment income (#9): opening capital earns a full year at the
-            // exogenous yield, and the year's premium float — net of the losses
-            // that ran off against it — earns the part-year it was held for.
-            let underwriting = agent.premium - agent.losses;
-            let income = investment_income(yield_rate, opening_capitals[i], underwriting);
+            // exogenous yield, and the year's premium float — net of the claims
+            // actually PAID out of it — earns the part-year it was held for. Float
+            // is cash, so an unpaid IBNR reserve does not shrink it.
+            let income = investment_income(yield_rate, opening_capitals[i], agent.premium - paid);
             if income > 0.0 {
                 capitals[i].credit(income);
             } else if income < 0.0 {
@@ -2442,16 +2688,32 @@ impl Market {
             }
             total_investment += income;
 
-            // Distributions release profit above the floor, suppressed in loss
-            // years — debited before AvT reads headroom. The result they read is
-            // the TOTAL return: underwriting plus investment income, so a
-            // high-yield regime keeps capital flowing out even when underwriting
-            // alone was thin.
-            let result = underwriting + income;
-            let payout = distribution(capitals[i].capital(), result, &agent.genome.distribution);
-            if payout > 0.0 {
-                capitals[i].settle(payout);
+            // --- The 3-year account rolls (#13) -------------------------------
+            // Open years develop toward the true ultimate, years reaching RITC
+            // close, and this year's claims split into settled + IBNR. Every
+            // movement is a real capital debit or credit arriving 12 and 24 months
+            // after the loss — the lagged shock that can extend a hard market with
+            // no fresh catastrophe — and each goes through the zero floor.
+            let roll = agent.roll_underwriting_year(*year, paid, income);
+            apply_to_capital(&mut capitals[i], roll.development);
+            apply_to_capital(&mut capitals[i], roll.booking);
+            total_losses += agent.losses;
+
+            // Distributions release the crystallised profit of the years that just
+            // closed — RITC is what gates an underwriting year's final release —
+            // above the floor and suppressed in loss years, debited before AvT
+            // reads headroom. The result they read is the TOTAL return:
+            // underwriting plus investment income, so a high-yield regime keeps
+            // capital flowing out even when underwriting alone was thin.
+            for result in roll.closed {
+                let payout = distribution(capitals[i].capital(), result, &agent.genome.distribution);
+                if payout > 0.0 {
+                    capitals[i].settle(payout);
+                    total_distributions += payout;
+                }
             }
+            total_development += roll.development;
+            total_reserves += agent.outstanding_reserves();
 
             // AvT re-set off post-distribution headroom + realised win-rate.
             let headroom = agent.genome.exposure.capacity_headroom(&capitals[i], &agent.book, &agent.genome.cat_model, rng);
@@ -2523,6 +2785,9 @@ impl Market {
             incurred_losses: total_losses,
             yield_rate,
             investment_income: total_investment,
+            reserve_development: total_development,
+            outstanding_reserves: total_reserves,
+            distributions: total_distributions,
         };
 
         *year += 1;
@@ -2538,14 +2803,14 @@ impl Market {
 impl YearReport {
     /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
     pub const CSV_HEADER: &'static str =
-        "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,mean_headroom,cat_events,placements,gross_premium,incurred_losses,yield_rate,investment_income";
+        "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,mean_headroom,cat_events,placements,gross_premium,incurred_losses,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions";
 
     /// The year's diagnostics as ordered `(column, value)` pairs — the single
     /// source of truth for column order and per-field formatting that both
     /// [`csv_row`](Self::csv_row) and [`reports_to_json`] render from, so the CSV
     /// and JSON emissions can never drift out of sync. Every value is a bare JSON
     /// number (no quoting needed); the keys match [`CSV_HEADER`](Self::CSV_HEADER).
-    fn columns(&self) -> [(&'static str, String); 14] {
+    fn columns(&self) -> [(&'static str, String); 17] {
         [
             ("year", self.year.to_string()),
             ("mean_avt", format!("{:.6}", self.mean_avt)),
@@ -2561,6 +2826,9 @@ impl YearReport {
             ("incurred_losses", format!("{:.6}", self.incurred_losses)),
             ("yield_rate", format!("{:.6}", self.yield_rate)),
             ("investment_income", format!("{:.6}", self.investment_income)),
+            ("reserve_development", format!("{:.6}", self.reserve_development)),
+            ("outstanding_reserves", format!("{:.6}", self.outstanding_reserves)),
+            ("distributions", format!("{:.6}", self.distributions)),
         ]
     }
 
@@ -2613,6 +2881,21 @@ pub fn reports_to_json(reports: &[YearReport]) -> String {
     out
 }
 
+/// The reference market's **central genome** — the mid-population syndicate the
+/// demonstration market's founders and its entrants are both jittered around.
+pub fn demonstration_genome() -> SyndicateGenome {
+    SyndicateGenome {
+        cat_model: CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 },
+        exposure: ExposurePolicy { return_period: 200.0, solvency_fraction: 0.45, line_fraction: 0.5, tail_trials: 120 },
+        pricing: PricingParams { hurdle_rate: 0.09, credibility_k: 50.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 120 },
+        avt: AvtParams { headroom_responsiveness: 0.45, feedback_responsiveness: 0.25, share_appetite: 0.5 },
+        distribution: DistributionParams { payout_fraction: 0.5, solvency_floor: 200.0 },
+        herding_susceptibility: 0.5,
+        target_line: 0.55,
+        reserving_bias: 0.0,
+    }
+}
+
 /// A calibrated **reference market** for the multi-decade cycle demonstration (the
 /// HITL run). A population of ten syndicates with heterogeneous share-appetites,
 /// AvT responsiveness, and hurdle rates; three brokers with different relationship
@@ -2624,13 +2907,14 @@ pub fn demonstration_market(seed: u64) -> Market {
     let appetites = [0.35, 0.4, 0.45, 0.5, 0.5, 0.55, 0.6, 0.65, 0.45, 0.55];
     let genome_of = |i: usize, a: f64| -> SyndicateGenome {
         SyndicateGenome {
-            cat_model: CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 },
-            exposure: ExposurePolicy { return_period: 200.0, solvency_fraction: 0.45, line_fraction: 0.5, tail_trials: 120 },
-            pricing: PricingParams { hurdle_rate: 0.08 + 0.01 * (i % 4) as f64, credibility_k: 50.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 120 },
+            pricing: PricingParams { hurdle_rate: 0.08 + 0.01 * (i % 4) as f64, ..demonstration_genome().pricing },
             avt: AvtParams { headroom_responsiveness: 0.35 + 0.1 * (i % 3) as f64, feedback_responsiveness: 0.25, share_appetite: a },
-            distribution: DistributionParams { payout_fraction: 0.5, solvency_floor: 200.0 },
-            herding_susceptibility: 0.5,
-            target_line: 0.55,
+            // Reserving bias is heterogeneous from the start and centred on zero:
+            // the founders span optimists and conservatives, so development is
+            // real for most of them without the population being systematically
+            // wrong. Selection (#12) is what would move that centre.
+            reserving_bias: -0.10 + 0.05 * (i % 5) as f64,
+            ..demonstration_genome()
         }
     };
     let syndicates: Vec<SyndicateAgent> = appetites
@@ -2706,6 +2990,20 @@ fn attribute(settlements: &[EventSettlement], panel: &Panel, agents: &mut [Syndi
         for (entry, credit) in panel.entries.iter().zip(&es.reinstatement_credits) {
             agents[entry.syndicate.0].premium += credit;
         }
+    }
+}
+
+/// Apply a signed reserve movement to capital: a positive amount is a debit
+/// (adverse development or a conservative booking), a negative one a credit
+/// (favourable development or an optimistic booking). Debits go through
+/// [`Syndicate::settle`], so the **hard zero floor** binds on development exactly
+/// as it does on a claim — an exhausted syndicate cannot pay adverse development
+/// either, and the shortfall is unrecovered.
+fn apply_to_capital(syndicate: &mut Syndicate, movement: f64) {
+    if movement > 0.0 {
+        syndicate.settle(movement);
+    } else if movement < 0.0 {
+        syndicate.credit(-movement);
     }
 }
 
@@ -4860,6 +5158,7 @@ mod tests {
             distribution: DistributionParams { payout_fraction: 0.5, solvency_floor: 200.0 },
             herding_susceptibility: 0.5,
             target_line: 0.34,
+            reserving_bias: 0.0,
         }
     }
 
@@ -5354,20 +5653,22 @@ mod tests {
         // is the income credited. Were distributions blind to it, every penny of
         // income would be retained and the capital gap would equal the income
         // exactly; because they read the total return, part of it is released.
+        // The release is gated by RITC (#13), so the run is carried to the close of
+        // the first underwriting year account before the capital gap is read.
         let flat = YieldProcess { mean: 0.08, persistence: 0.0, volatility: 0.0, initial: 0.08, seed: 3 };
 
         let mut uninvested = small_market(7);
-        uninvested.step_year();
+        uninvested.run(OPEN_PERIOD_YEARS);
         let mut invested = small_market(7).with_yield_process(flat);
-        let report = invested.step_year();
+        let reports = invested.run(OPEN_PERIOD_YEARS);
+        let income: f64 = reports.iter().map(|r| r.investment_income).sum();
 
         let retained = roster_capital(&invested) - roster_capital(&uninvested);
-        assert!(report.investment_income > 0.0, "the year credited investment income");
+        assert!(income > 0.0, "the run credited investment income");
         assert!(retained > 0.0, "some of the income is retained as capital: {retained}");
         assert!(
-            retained < report.investment_income - 1e-9,
-            "and some is distributed out on the total return: retained {retained} !< income {}",
-            report.investment_income
+            retained < income - 1e-9,
+            "and some is distributed out on the total return once the year closes: retained {retained} !< income {income}"
         );
     }
 
@@ -5494,5 +5795,288 @@ mod tests {
         assert_eq!(investment_income(rate, 100.0, -5_000.0), 0.0, "a wiped-out balance earns nothing, never a negative base");
         assert!(investment_income(-0.01, 1_000.0, 0.0) < 0.0, "a negative macro rate charges for holding capital");
         assert_eq!(investment_income(0.0, 1_000.0, 200.0), 0.0, "a zero-yield environment credits nothing");
+    }
+
+    #[test]
+    fn a_claim_splits_into_a_near_term_settled_part_and_an_ibnr_reserve() {
+        let claim = 1_000.0;
+        let outstanding = ibnr_outstanding(claim);
+        let settled = claim - outstanding;
+        assert!(settled > 0.0 && outstanding > 0.0, "both halves of the split are real");
+        assert!(
+            (settled + outstanding - claim).abs() < 1e-9,
+            "the split is exhaustive: settled + IBNR outstanding is the whole claim"
+        );
+        // An unbiased reserver books exactly the true outstanding.
+        assert!(
+            (booked_reserve(outstanding, 0.0) - outstanding).abs() < 1e-9,
+            "an unbiased estimate of ultimate equals the true outstanding"
+        );
+    }
+
+    #[test]
+    fn reserving_bias_makes_the_booked_reserve_optimistic_or_conservative() {
+        let truth = 500.0;
+        let optimistic = booked_reserve(truth, -0.2);
+        let conservative = booked_reserve(truth, 0.2);
+        assert!(optimistic < truth, "an optimistic reserver under-books its liability");
+        assert!(conservative > truth, "a conservative reserver over-books it");
+        assert_eq!(
+            booked_reserve(truth, -5.0),
+            0.0,
+            "however optimistic, a reserve is never a negative liability"
+        );
+    }
+
+    #[test]
+    fn the_three_year_account_develops_toward_the_true_ultimate_and_ritc_closes_it() {
+        // An optimistic reserver opens the year under-booked: its estimate sits
+        // below the true outstanding, so the development still owed is adverse.
+        let truth = 1_000.0;
+        let mut account = UnderwritingYearAccount::open(7, truth, -0.3);
+        assert_eq!(account.underwriting_year, 7);
+        assert!(account.booked_reserve() < truth, "opened optimistically under-booked");
+        assert!(!account.is_closed(), "the year opens open");
+
+        let mut movements = Vec::new();
+        while !account.is_closed() {
+            movements.push(account.develop());
+        }
+
+        assert_eq!(movements.len(), OPEN_PERIOD_YEARS - 1, "development runs over the open period");
+        assert!(
+            movements.iter().all(|m| *m > 0.0),
+            "under-reserving develops adversely: every movement strengthens, {movements:?}"
+        );
+        assert!(
+            movements[0] < movements.iter().sum::<f64>(),
+            "the shock is lagged across development years, not all at age 1"
+        );
+        assert!(
+            (account.booked_reserve() - truth).abs() < 1e-9,
+            "RITC crystallises the estimate onto the true ultimate"
+        );
+        assert!(
+            (movements.iter().sum::<f64>() - (truth - booked_reserve(truth, -0.3))).abs() < 1e-9,
+            "cumulative development is exactly the initial estimation error"
+        );
+    }
+
+    #[test]
+    fn reserving_bias_is_a_selectable_genome_trait_drawn_across_the_population() {
+        let centre = demonstration_genome();
+        let population = GenomePopulation { centre, spread: 0.2 };
+        let mut rng = Rng::seeded(11);
+        let biases: Vec<f64> = (0..40).map(|_| population.sample(&mut rng).reserving_bias).collect();
+        let min = biases.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = biases.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(max > min, "the population carries a spread of reserving bias for selection to act on");
+        assert!(
+            biases.iter().any(|b| *b < centre.reserving_bias) && biases.iter().any(|b| *b > centre.reserving_bias),
+            "the spread straddles the population's central bias: optimists and conservatives both"
+        );
+        assert!(
+            biases.iter().all(|b| (b - centre.reserving_bias).abs() <= 0.2 + 1e-9),
+            "bias jitters additively within the population spread, {min} to {max}"
+        );
+    }
+
+    #[test]
+    fn ibnr_reserving_defers_loss_impact_without_changing_the_true_total() {
+        // Other things equal — same seed, same population — only the reserving
+        // bias differs.
+        let mut optimistic = demonstration_market(4).with_reserving_bias(-0.35);
+        let mut unbiased = demonstration_market(4).with_reserving_bias(0.0);
+        let opt = optimistic.run(10);
+        let base = unbiased.run(10);
+
+        assert!(
+            base.iter().all(|r| r.reserve_development.abs() < 1e-9),
+            "an unbiased reserver's estimate is already the truth: nothing develops"
+        );
+        assert!(
+            opt.iter().map(|r| r.reserve_development).sum::<f64>() > 0.0,
+            "under-reserving comes back as adverse development"
+        );
+        assert!(
+            opt.iter().any(|r| r.outstanding_reserves > 0.0),
+            "the market carries booked IBNR on its open underwriting years"
+        );
+        // The first year is identical in everything but the reserving: same seed,
+        // same placements, same true claims — so the deferral shows cleanly.
+        assert!(
+            opt[0].incurred_losses < base[0].incurred_losses,
+            "the occurrence year books less: {} !< {}",
+            opt[0].incurred_losses,
+            base[0].incurred_losses
+        );
+        assert!(
+            opt[0].combined_ratio < base[0].combined_ratio,
+            "and the optimist's headline combined ratio flatters it in year one"
+        );
+    }
+
+    #[test]
+    fn ritc_close_gates_the_underwriting_years_final_distribution() {
+        // An open year's profit cannot be released: nothing is distributed until
+        // the first underwriting year account reaches RITC at the end of its open
+        // period, however profitable the intervening years were.
+        let reports = demonstration_market(2).run(6);
+        for report in &reports[..OPEN_PERIOD_YEARS - 1] {
+            assert_eq!(
+                report.distributions, 0.0,
+                "year {} is still inside every open account's period, nothing may be released",
+                report.year
+            );
+        }
+        assert!(
+            reports[OPEN_PERIOD_YEARS - 1].distributions > 0.0,
+            "the first account closes and releases its crystallised profit"
+        );
+        assert!(
+            reports.iter().skip(OPEN_PERIOD_YEARS - 1).any(|r| r.distributions > 0.0),
+            "closed years keep releasing thereafter"
+        );
+    }
+
+    #[test]
+    fn adverse_development_hardens_a_cat_free_year_with_no_fresh_catastrophe() {
+        // #13: the second shock. A catastrophe lands in year 0 and the syndicate
+        // under-reserves the IBNR half of it. The next two years see NO fresh
+        // catastrophe at all — yet the estimate's true-up debits capital again,
+        // collapsing headroom further and lifting the AvT target the syndicate
+        // will ask next renewal. The hard market extends with no new event.
+        let bias = -0.4;
+        let policy = ExposurePolicy { return_period: 200.0, solvency_fraction: 0.45, line_fraction: 0.5, tail_trials: 200 };
+        let model = CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 };
+        let book = NetBook { lines: vec![NetLine { territory: Territory(0), net_limit: 300.0 }] };
+        let mut rng = Rng::seeded(31);
+        let headroom = |s: &Syndicate, rng: &mut Rng| policy.capacity_headroom(s, &book, &model, rng);
+
+        // Year 0: the catastrophe claim is paid, then split — the near-term part
+        // stays paid and the rest is re-booked as this syndicate's biased IBNR.
+        let claim = 600.0;
+        let mut optimist = Syndicate::with_capital(1_400.0);
+        let mut honest = Syndicate::with_capital(1_400.0);
+        optimist.settle(claim);
+        honest.settle(claim);
+        let true_outstanding = ibnr_outstanding(claim);
+        let mut opt_account = UnderwritingYearAccount::open(0, true_outstanding, bias);
+        let mut honest_account = UnderwritingYearAccount::open(0, true_outstanding, 0.0);
+        // Under-booking hands capital back now: an optimist leaves the cat year
+        // stronger than the truth warrants.
+        optimist.credit(true_outstanding - opt_account.booked_reserve());
+        assert!(optimist.capital() > honest.capital(), "optimism flatters the cat year's balance sheet");
+
+        let after_cat = headroom(&optimist, &mut rng);
+        let ask_after_cat = headroom_target(after_cat);
+        let capital_after_cat = optimist.capital();
+
+        // Years 1 and 2: no catastrophe, no attritional loss, no premium — nothing
+        // happens except the reserve developing toward the truth.
+        let mut charges = Vec::new();
+        while !opt_account.is_closed() {
+            let movement = opt_account.develop();
+            honest_account.develop();
+            assert!(movement > 0.0, "the true-up on an under-reserved year is adverse");
+            optimist.settle(movement);
+            charges.push(movement);
+        }
+        assert_eq!(charges.len(), OPEN_PERIOD_YEARS - 1, "the shock arrives over the open period, not at once");
+
+        let after_development = headroom(&optimist, &mut rng);
+        assert!(
+            optimist.capital() < capital_after_cat,
+            "a cat-free year still debits capital: {} !< {capital_after_cat}",
+            optimist.capital()
+        );
+        assert!(
+            after_development < after_cat,
+            "headroom tightens again with no fresh catastrophe: {after_development} !< {after_cat}"
+        );
+        assert!(
+            headroom_target(after_development) > ask_after_cat,
+            "and the AvT target the syndicate will ask rises: {} !> {ask_after_cat}",
+            headroom_target(after_development)
+        );
+        // RITC crystallises: the deferral changed the timing, never the total.
+        assert!(
+            (optimist.capital() - honest.capital()).abs() < 1e-9,
+            "over the account's life the optimist pays exactly the true ultimate"
+        );
+    }
+
+    #[test]
+    fn the_market_carries_adverse_development_into_years_with_no_catastrophe() {
+        // The same lagged shock as it shows up in the running market: years with no
+        // catastrophe at all whose entire incurred loss is prior-year development.
+        let reports = demonstration_market(1).with_reserving_bias(-0.4).run(12);
+        let quiet: Vec<&YearReport> = reports.iter().filter(|r| r.cat_events == 0 && r.year > 0).collect();
+        assert!(!quiet.is_empty(), "the run contains catastrophe-free years");
+        assert!(
+            quiet.iter().all(|r| r.reserve_development > 0.0),
+            "every quiet year still carries an adverse charge from prior underwriting years"
+        );
+    }
+
+    #[test]
+    fn optimistic_reserving_masks_the_bad_year_then_steps_the_combined_ratio_up() {
+        // #13, other things equal: same seeds, same population, same everything —
+        // only the reserving bias moves. Around each run's worst catastrophe year:
+        //   * the optimist's headline combined ratio is FLATTERED in the loss year
+        //     (apparent profit released by under-booking the IBNR), and
+        //   * it STEPS UP in the following year, when the true-up lands with no
+        //     fresh loss to hide behind — the releases exhausting.
+        let (mut masked, mut stepped, mut trials) = (0, 0, 0);
+        for seed in 0..8u64 {
+            let optimist = demonstration_market(seed).with_reserving_bias(-0.4).run(8);
+            let honest = demonstration_market(seed).with_reserving_bias(0.0).run(8);
+            let worst = (0..6).max_by_key(|&i| honest[i].cat_events).expect("a non-empty window");
+            if honest[worst].cat_events < 2 {
+                continue; // no real shock this seed: nothing to mask
+            }
+            trials += 1;
+            if optimist[worst].combined_ratio < honest[worst].combined_ratio {
+                masked += 1;
+            }
+            if optimist[worst + 1].combined_ratio > honest[worst + 1].combined_ratio {
+                stepped += 1;
+            }
+        }
+        assert!(trials >= 5, "the seeds produced enough catastrophe years to compare, got {trials}");
+        assert!(
+            masked * 4 >= trials * 3,
+            "optimistic reserving masks the loss year's combined ratio in most runs: {masked}/{trials}"
+        );
+        assert!(
+            stepped * 4 >= trials * 3,
+            "and the combined ratio steps up the year after, when the true-up lands: {stepped}/{trials}"
+        );
+    }
+
+    #[test]
+    fn lagged_development_still_respects_the_hard_zero_floor() {
+        // Adverse development is a capital debit like any other: an exhausted
+        // syndicate in runoff cannot pay it, the balance floors at zero, and the
+        // remainder is an unrecovered shortfall borne by the insured — never
+        // redistributed to co-subscribers (several, not joint).
+        let mut spent = Syndicate::with_capital(40.0);
+        let mut account = UnderwritingYearAccount::open(0, 1_000.0, -0.9);
+        spent.credit(1_000.0 - account.booked_reserve()); // the optimist's booking
+        spent.settle(spent.capital() - 40.0); // ... and then the year wipes it out
+        assert_eq!(spent.capital(), 40.0);
+
+        let mut shortfall = 0.0;
+        while !account.is_closed() {
+            let settlement = spent.settle(account.develop());
+            shortfall += settlement.shortfall;
+        }
+        assert_eq!(spent.capital(), 0.0, "capital floors at zero, never below");
+        assert!(shortfall > 0.0, "the unpayable development is an unrecovered shortfall");
+        assert!(!spent.is_solvent(), "and the syndicate stays in runoff");
+
+        // The market's own engine holds the same line over a full run.
+        let reports = demonstration_market(3).with_reserving_bias(-0.6).run(10);
+        assert!(reports.iter().all(|r| r.outstanding_reserves >= 0.0), "a reserve is never a negative liability");
     }
 }

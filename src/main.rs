@@ -191,6 +191,11 @@ fn cycle_demonstration() {
     let investment: f64 = reports.iter().map(|r| r.investment_income).sum();
     let underwriting: f64 = reports.iter().map(|r| r.gross_premium - r.incurred_losses).sum();
     println!("  exogenous yield averaged {mean_yield:.3}: {investment:.0} of investment income against {underwriting:.0} of underwriting result");
+    let development: f64 = reports.iter().map(|r| r.reserve_development).sum();
+    let quiet_adverse = reports.iter().filter(|r| r.cat_events == 0 && r.reserve_development > 0.0).count();
+    let distributed: f64 = reports.iter().map(|r| r.distributions).sum();
+    println!("  reserve development totalled {development:+.0} on the 3-year account, adverse in {quiet_adverse} catastrophe-free years");
+    println!("  {distributed:.0} distributed, released only as each underwriting year reached RITC");
     println!("=> soft markets compete AvT below the floor; a cat collapses headroom and hardens it above;");
     println!("   recovered capital re-softens. Human review confirms the soft → shock → hard → soft shape.");
 }

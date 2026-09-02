@@ -856,6 +856,28 @@ pub fn portfolio_tail_loss(
     trials: usize,
     rng: &mut Rng,
 ) -> f64 {
+    net_portfolio_tail_loss(book, model, None, return_period, trials, rng)
+}
+
+/// The portfolio tail measure read **net of outward reinsurance**: identical to
+/// [`portfolio_tail_loss`], except that each simulated year's aggregate portfolio
+/// loss is ceded through the `treaty` layer before the return-period quantile is
+/// taken. `None` is the gross measure, draw for draw.
+///
+/// The cession must happen **inside** the simulation, not to the gross quantile:
+/// a treaty is a layer on the *aggregate*, so which years it bites in — and where
+/// its limit exhausts — is a property of the whole simulated distribution.
+/// Structural commitment #1 lives here: the exposure limits bind on this net
+/// figure, so a primary's headroom, its lines, and its pricing all reflect what it
+/// actually retains — and lose that relief the moment a reinsurer stops paying.
+pub fn net_portfolio_tail_loss(
+    book: &NetBook,
+    model: &CatModel,
+    treaty: Option<&Layer>,
+    return_period: f64,
+    trials: usize,
+    rng: &mut Rng,
+) -> f64 {
     let zones: Vec<f64> = book.zones().iter().map(|&z| book.zone_exposure(z)).collect();
     if zones.is_empty() || trials == 0 {
         return 0.0;
@@ -876,8 +898,99 @@ pub fn portfolio_tail_loss(
                 })
                 .sum::<f64>() // cross-zone: independent draws diversify
         })
+        .map(|gross| match treaty {
+            // A treaty is a layer on the AGGREGATE portfolio loss: the year's
+            // whole gross aggregate flows up it and the recovery is retained out.
+            Some(layer) => gross - layer.insured_loss(gross),
+            None => gross,
+        })
         .collect();
     tail_quantile(aggregates, return_period)
+}
+
+/// An **outward reinsurance treaty**: an excess-of-loss layer on a *primary's
+/// aggregate portfolio loss*, subscribed by a panel of reinsurers. There is no
+/// bespoke reinsurance contract type — the treaty reuses the substrate's [`Layer`]
+/// (attachment, limit) and [`Panel`] (several liability, pro-rata shares) exactly
+/// as an inwards placement does; the only difference is what the layer sits over.
+///
+/// Reinsurers are **shared**: the same reinsurer id appears on many primaries'
+/// panels, which is what makes one reinsurer's failure a correlated shock across
+/// primaries rather than a private one (#11).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReinsuranceTreaty {
+    /// The layer the treaty covers, sitting over the primary's aggregate loss:
+    /// `attachment` is the primary's retention, `limit` the cover above it.
+    pub layer: Layer,
+    /// The reinsurer panel, indexed into the market's reinsurer capital roster.
+    pub panel: Panel,
+}
+
+/// How a primary **structures and places** its outward programme each year: the
+/// retention and cover it buys, expressed as fractions of its own *current
+/// capital*, and how wide a reinsurer panel it spreads the treaty over.
+///
+/// Sizing off capital rather than off the book is what keeps the placement free of
+/// circularity — the programme is bought at renewal, before the year's business is
+/// written, and the exposure limits then bind on the net figure the treaty creates.
+/// It also means a capital-depleted primary buys a *smaller* treaty, so a cat that
+/// hurts primaries and reinsurers together tightens both sides at once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReinsuranceProgramme {
+    /// The primary's retention as a fraction of its capital — the treaty's attachment.
+    pub retention_fraction: f64,
+    /// The cover bought above the retention, as a fraction of capital — the limit.
+    pub limit_fraction: f64,
+    /// How many reinsurers the treaty is spread across. A wider panel diversifies
+    /// counterparty risk; because the pool of reinsurers is small and **shared**,
+    /// it also couples primaries together more tightly.
+    pub panel_size: usize,
+    /// The share of the treaty each subscribing reinsurer takes.
+    pub reinsurer_line: f64,
+}
+
+/// What a treaty actually delivered against a primary's aggregate loss: the
+/// amount the reinsurers **paid**, and the **shortfall** they could not.
+///
+/// The shortfall is the contagion channel. It is a deliberately different path
+/// from primary insolvency, where the shortfall falls on the *insured*: here it
+/// falls back on the **ceding primary**, which had already booked the recovery as
+/// part of its net retention.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreatyRecovery {
+    /// The recovery actually paid by the reinsurer panel and credited to the primary.
+    pub recovered: f64,
+    /// The part of the due recovery the panel could not fund — the primary retains it.
+    pub shortfall: f64,
+    /// What each panel member paid and failed to pay, in panel order — the same
+    /// per-member [`Settlement`] an inwards panel produces, so a reinsurer's own
+    /// loss tally is built from the substrate's settlements exactly as a primary's is.
+    pub settlements: Vec<Settlement>,
+}
+
+impl ReinsuranceTreaty {
+    /// The recovery **due** under the treaty for an aggregate portfolio loss:
+    /// the layer's insured loss on that aggregate, pro-rated by the placed
+    /// portion of the panel (an unplaced sliver is retained, exactly as on an
+    /// inwards layer).
+    pub fn recovery_due(&self, aggregate_loss: f64) -> f64 {
+        self.layer.insured_loss(aggregate_loss) * self.panel.placed_portion()
+    }
+
+    /// Settle the treaty against the reinsurer capital roster and report what was
+    /// actually recovered. The panel settles **severally**, through the substrate's
+    /// own zero floor: a reinsurer that cannot pay pays `min(share, capital)` and
+    /// the remainder is a shortfall that stays with the ceding primary — it is
+    /// never redistributed to the solvent co-reinsurers.
+    pub fn recover(&self, aggregate_loss: f64, reinsurers: &mut [Syndicate]) -> TreatyRecovery {
+        let due = self.layer.insured_loss(aggregate_loss);
+        let settlements = self.panel.settle(due, reinsurers);
+        TreatyRecovery {
+            recovered: settlements.iter().map(|s| s.settled).sum(),
+            shortfall: settlements.iter().map(|s| s.shortfall).sum(),
+            settlements,
+        }
+    }
 }
 
 /// Why a syndicate **declined** a risk under its exposure limits.
@@ -931,6 +1044,25 @@ impl ExposurePolicy {
         candidate: NetLine,
         rng: &mut Rng,
     ) -> UnderwritingDecision {
+        self.assess_net(syndicate, book, model, None, candidate, rng)
+    }
+
+    /// [`assess`](Self::assess) with the syndicate's outward reinsurance in view:
+    /// the cat-aggregate test is read on the **net** portfolio tail measure, the
+    /// primary's aggregate loss ceded through its `treaty` layer. Structural
+    /// commitment #1 — the limits bind on net — is realised here, so buying cover
+    /// genuinely buys writing capacity, and losing a reinsurer takes it back.
+    /// The per-risk line limit is unchanged: it is a working-layer cap on the line
+    /// itself, not an aggregate measure.
+    pub fn assess_net(
+        &self,
+        syndicate: &Syndicate,
+        book: &NetBook,
+        model: &CatModel,
+        treaty: Option<&Layer>,
+        candidate: NetLine,
+        rng: &mut Rng,
+    ) -> UnderwritingDecision {
         if !syndicate.is_solvent() {
             return UnderwritingDecision::Decline(DeclineReason::Insolvent);
         }
@@ -940,7 +1072,7 @@ impl ExposurePolicy {
         }
         let mut post_addition = book.clone();
         post_addition.lines.push(candidate);
-        let tail = portfolio_tail_loss(&post_addition, model, self.return_period, self.tail_trials, rng);
+        let tail = net_portfolio_tail_loss(&post_addition, model, treaty, self.return_period, self.tail_trials, rng);
         if tail > self.solvency_fraction * capital {
             return UnderwritingDecision::Decline(DeclineReason::CatAggregate);
         }
@@ -966,11 +1098,27 @@ impl ExposurePolicy {
         model: &CatModel,
         rng: &mut Rng,
     ) -> f64 {
+        self.capacity_headroom_net(syndicate, book, model, None, rng)
+    }
+
+    /// [`capacity_headroom`](Self::capacity_headroom) net of outward reinsurance:
+    /// the consumed budget is the **net** portfolio tail measure. A treaty frees
+    /// headroom, which softens the syndicate's AvT — and when a reinsurer fails
+    /// and the cover goes, the headroom collapses and the ask hardens, with no
+    /// cycle-phase variable anywhere in the path.
+    pub fn capacity_headroom_net(
+        &self,
+        syndicate: &Syndicate,
+        book: &NetBook,
+        model: &CatModel,
+        treaty: Option<&Layer>,
+        rng: &mut Rng,
+    ) -> f64 {
         let budget = self.solvency_fraction * syndicate.capital();
         if budget <= 0.0 {
             return 0.0; // no loss-absorbing capital → no capacity to write
         }
-        let consumed = portfolio_tail_loss(book, model, self.return_period, self.tail_trials, rng);
+        let consumed = net_portfolio_tail_loss(book, model, treaty, self.return_period, self.tail_trials, rng);
         ((budget - consumed) / budget).clamp(0.0, 1.0)
     }
 }
@@ -1792,6 +1940,28 @@ pub struct SyndicateAgent {
     /// Net earned premium this year (placement premium net of expense, plus
     /// reinstatement income).
     pub premium: f64,
+    /// **Gross** claims the substrate actually debited this calendar year, before
+    /// any outward reinsurance recovery. The exposure limits do not read this —
+    /// they read net — but it is tracked throughout, because the gross book is what
+    /// a primary genuinely controls and net is only as good as its reinsurers.
+    pub gross_losses: f64,
+    /// Reinsurance recoveries actually **received** this year (not merely due): the
+    /// paid part of the treaty settlement. The unpaid part is the shortfall the
+    /// primary retains, and it never appears here.
+    pub recoveries: f64,
+    /// Recoveries that were due to this primary but **not paid**, accumulated over
+    /// the whole run. It survives `reset_year`: it is the running total of what
+    /// counterparty failure alone has cost this syndicate, and the attribution the
+    /// contagion arc is read from.
+    pub retained_shortfall: f64,
+    /// Reinsurance premium **ceded** out this year — an explicit deduction in the
+    /// gross-to-net statement, not a blended expense ratio.
+    pub ceded_premium: f64,
+    /// The primary's outward reinsurance treaty for the current year, if it buys
+    /// cover: a layer on its own aggregate portfolio loss, placed with a panel of
+    /// shared reinsurers. `None` is an unreinsured syndicate — and a reinsurer,
+    /// which buys no retrocession.
+    pub treaty: Option<ReinsuranceTreaty>,
     /// Claims incurred this calendar year: the near-term settled part plus the
     /// IBNR reserve booked on this year's occurrences, plus every development
     /// movement on prior underwriting years still open. This is the calendar-year
@@ -1822,9 +1992,23 @@ impl SyndicateAgent {
             won: 0,
             premium: 0.0,
             losses: 0.0,
+            gross_losses: 0.0,
+            recoveries: 0.0,
+            retained_shortfall: 0.0,
+            ceded_premium: 0.0,
+            treaty: None,
             development: 0.0,
             accounts: Vec::new(),
         }
+    }
+
+    /// Close the year's gross-to-net loss statement: net incurred is the gross the
+    /// substrate debited less the recoveries actually **received**. Called once
+    /// after the loss phase, before the reserving roll — everything downstream
+    /// (the 3-year account, the combined ratio, the total-return signal) reads the
+    /// net figure, so an unpaid recovery lands on the primary's own result.
+    fn settle_net_incurred(&mut self) {
+        self.losses = self.gross_losses - self.recoveries;
     }
 
     /// The syndicate's total booked IBNR across its open underwriting years — the
@@ -1885,6 +2069,9 @@ impl SyndicateAgent {
         self.won = 0;
         self.premium = 0.0;
         self.losses = 0.0;
+        self.gross_losses = 0.0;
+        self.recoveries = 0.0;
+        self.ceded_premium = 0.0;
         self.development = 0.0;
     }
 }
@@ -2227,8 +2414,26 @@ pub struct YearReport {
     pub placements: usize,
     /// Total net earned premium this year.
     pub gross_premium: f64,
-    /// Total incurred losses this year.
+    /// Total incurred losses this year, **net** of reinsurance recoveries — the
+    /// figure the combined ratio and the total-return signal read.
     pub incurred_losses: f64,
+    /// Total **gross** incurred losses this year, before outward reinsurance. Equal
+    /// to `incurred_losses` in a market with no reinsurance wired.
+    pub gross_incurred_losses: f64,
+    /// Reinsurance premium ceded out by primaries this year.
+    pub ceded_premium: f64,
+    /// Reinsurance recoveries actually received by primaries this year.
+    pub reinsurance_recoveries: f64,
+    /// Recoveries that were **due but not paid** because a reinsurer ran out of
+    /// capital — the contagion channel (#11). The ceding primaries retain this.
+    pub reinsurance_shortfall: f64,
+    /// How many **distinct primaries** were left short by a reinsurer this year.
+    /// A count above one is the correlated secondary shock itself: several cedents
+    /// losing an expected recovery in the same instant because they were relying on
+    /// the same balance sheet.
+    pub cedents_short: usize,
+    /// Reinsurers still solvent at year-end. Zero in a market with no reinsurance.
+    pub solvent_reinsurers: usize,
     /// The exogenous market yield this year's investment return was earned at
     /// (#9). Zero in a market with no yield process wired.
     pub yield_rate: f64,
@@ -2281,6 +2486,16 @@ pub struct Market {
     /// The exogenous market-yield regime, if this market has investment income
     /// wired (#9), together with the current rate and the path's own generator.
     investment: Option<(YieldProcess, f64, Rng)>,
+    /// The **reinsurers** (#11). They are syndicate agents in every respect — the
+    /// same finite capital with its hard zero floor, the same portfolio tail
+    /// measure over a net book of zone lines, the same TP-style pricing, the same
+    /// insolvency-into-runoff lifecycle — and are held in their own roster only
+    /// because what they write is *other syndicates' aggregate losses* rather than
+    /// single assets. A separate reinsurer class would be redundant.
+    reinsurers: Vec<SyndicateAgent>,
+    reinsurer_capitals: Vec<Syndicate>,
+    /// How primaries structure and place their outward programme, if wired.
+    programme: Option<ReinsuranceProgramme>,
 }
 
 impl Market {
@@ -2310,6 +2525,9 @@ impl Market {
             forming: Vec::new(),
             unformed_capital: 0.0,
             investment: None,
+            reinsurers: Vec::new(),
+            reinsurer_capitals: Vec::new(),
+            programme: None,
         }
     }
 
@@ -2341,6 +2559,58 @@ impl Market {
     pub fn with_capital_supply(mut self, supply: CapitalSupply) -> Self {
         self.capital_supply = Some(supply);
         self
+    }
+
+    /// Wire **outward reinsurance** (#11) onto the market: a shared pool of
+    /// finite-capital `reinsurers` and the `programme` every primary buys at
+    /// renewal. From here on each primary cedes a layer of its own aggregate
+    /// portfolio loss, its exposure limits bind on the resulting net figure, and a
+    /// reinsurer that runs out of capital stops paying — stripping the expected
+    /// recovery from every primary on its panels at once.
+    ///
+    /// The reinsurers are ordinary [`SyndicateAgent`]s: same genome, same capital
+    /// with its zero floor, same portfolio tail measure, same runoff on insolvency.
+    pub fn with_reinsurance(
+        mut self,
+        programme: ReinsuranceProgramme,
+        reinsurers: Vec<SyndicateAgent>,
+    ) -> Self {
+        self.reinsurer_capitals = reinsurers
+            .iter()
+            .map(|a| Syndicate::with_capital(a.initial_capital))
+            .collect();
+        self.reinsurers = reinsurers;
+        self.programme = Some(programme);
+        self
+    }
+
+    /// How many reinsurers are in the shared pool.
+    pub fn reinsurer_count(&self) -> usize {
+        self.reinsurers.len()
+    }
+
+    /// A reinsurer's current capital balance. Zero means it is in runoff and pays
+    /// nothing more on the treaties it wrote.
+    pub fn reinsurer_capital(&self, id: SyndicateId) -> f64 {
+        self.reinsurer_capitals[id.0].capital()
+    }
+
+    /// A reinsurer's current AvT multiplier — the ask it quotes treaties at, over
+    /// its own technical premium. It moves on exactly the same headroom channel a
+    /// primary's does.
+    pub fn reinsurer_avt(&self, id: SyndicateId) -> f64 {
+        self.reinsurers[id.0].avt
+    }
+
+    /// The recoveries a primary was due but never received, accumulated over the
+    /// run — what counterparty failure alone has cost it.
+    pub fn retained_shortfall(&self, id: SyndicateId) -> f64 {
+        self.agents[id.0].retained_shortfall
+    }
+
+    /// A primary's outward treaty for the year just placed, if it buys cover.
+    pub fn treaty(&self, id: SyndicateId) -> Option<&ReinsuranceTreaty> {
+        self.agents[id.0].treaty.as_ref()
     }
 
     /// The market's capital-supply regime, if endogenous entry is wired (#8).
@@ -2400,7 +2670,13 @@ impl Market {
     pub fn headroom(&self, id: SyndicateId) -> f64 {
         let agent = &self.agents[id.0];
         let mut rng = Rng::seeded(0x4845_4144 ^ id.0 as u64 ^ self.year as u64);
-        agent.genome.exposure.capacity_headroom(&self.capitals[id.0], &agent.book, &agent.genome.cat_model, &mut rng)
+        agent.genome.exposure.capacity_headroom_net(
+            &self.capitals[id.0],
+            &agent.book,
+            &agent.genome.cat_model,
+            agent.treaty.as_ref().map(|t| &t.layer),
+            &mut rng,
+        )
     }
 
     /// Step the whole market forward one year and return the year's diagnostics:
@@ -2423,6 +2699,9 @@ impl Market {
             forming,
             unformed_capital,
             investment,
+            reinsurers,
+            reinsurer_capitals,
+            programme,
         } = self;
         let expense_ratio = *expense_ratio;
         let panel_size = *panel_size;
@@ -2470,8 +2749,37 @@ impl Market {
         let opening_capitals: Vec<f64> = capitals.iter().map(|c| c.capital()).collect();
         let opening_capital: f64 = opening_capitals.iter().sum();
 
+        // The book each primary carried into renewal, kept before the reset: it is
+        // what the outward programme is quoted against. Reinsurance is bought at
+        // renewal, ahead of the year's writing, so it can only be priced off the
+        // exposure the primary is coming from — never off the book it has not
+        // written yet, which would be circular.
+        let prior_books: Vec<NetBook> = agents.iter().map(|a| a.book.clone()).collect();
+
         for agent in agents.iter_mut() {
             agent.reset_year();
+        }
+        for reinsurer in reinsurers.iter_mut() {
+            reinsurer.reset_year();
+        }
+
+        // --- Outward reinsurance renews ---------------------------------------
+        // Each solvent primary buys a layer on its own aggregate portfolio loss,
+        // sized off its CURRENT capital, from a panel drawn out of the shared
+        // reinsurer pool. The panels deliberately OVERLAP: the pool is small and
+        // every reinsurer sits on several primaries' treaties, which is the
+        // structure reinsurance contagion needs (#11) — with a private reinsurer
+        // per primary there is nothing to transmit.
+        if let Some(programme) = programme.as_ref() {
+            place_outward_programmes(
+                programme,
+                agents,
+                capitals,
+                reinsurers,
+                reinsurer_capitals,
+                &prior_books,
+                rng,
+            );
         }
 
         // --- Placement (renewal): the annual cohort places its towers ----------
@@ -2558,7 +2866,14 @@ impl Market {
                     for (pos, &id) in shortlist.iter().enumerate() {
                         let agent = &agents[id.0];
                         let candidate = NetLine { territory: tm.territory, net_limit: agent.genome.target_line * band.limit };
-                        let decision = agent.genome.exposure.assess(&capitals[id.0], &agent.book, &agent.genome.cat_model, candidate, rng);
+                        let decision = agent.genome.exposure.assess_net(
+                            &capitals[id.0],
+                            &agent.book,
+                            &agent.genome.cat_model,
+                            agent.treaty.as_ref().map(|t| &t.layer),
+                            candidate,
+                            rng,
+                        );
                         let offer = if pos == 0 {
                             SubscriptionOffer { syndicate: id, quote: firm_order, decision, offered_share: agent.genome.target_line }
                         } else {
@@ -2656,6 +2971,44 @@ impl Market {
             }
         }
 
+        // --- Outward reinsurance recovers -------------------------------------
+        // A treaty is a layer on the primary's AGGREGATE portfolio loss, so it can
+        // only be settled once the year's losses are all in. The panel settles
+        // severally through the substrate's zero floor: a reinsurer pays
+        // `min(share, capital)` and the unpaid remainder falls back on the CEDING
+        // PRIMARY — a different path from primary insolvency, where the shortfall
+        // falls on the insured. Because reinsurers are shared, one failure strips
+        // expected recoveries from several primaries in the same instant (#11).
+        let mut total_recoveries = 0.0;
+        let mut total_shortfall = 0.0;
+        let mut cedents_short = 0usize;
+        for agent in agents.iter_mut() {
+            let Some(treaty) = agent.treaty.clone() else {
+                continue;
+            };
+            let recovery = treaty.recover(agent.gross_losses, reinsurer_capitals);
+            agent.recoveries = recovery.recovered;
+            agent.retained_shortfall += recovery.shortfall;
+            total_recoveries += recovery.recovered;
+            total_shortfall += recovery.shortfall;
+            if recovery.shortfall > 0.0 {
+                cedents_short += 1;
+            }
+            // The claim lands on each reinsurer's own loss tally, from the very same
+            // settlements — a reinsurer books an inwards loss the way a primary does.
+            for (entry, settled) in treaty.panel.entries.iter().zip(&recovery.settlements) {
+                reinsurers[entry.syndicate.0].gross_losses += settled.settled;
+            }
+        }
+        for (i, agent) in agents.iter_mut().enumerate() {
+            if agent.recoveries > 0.0 {
+                capitals[i].credit(agent.recoveries);
+            }
+            agent.settle_net_incurred();
+        }
+        let total_ceded: f64 = agents.iter().map(|a| a.ceded_premium).sum();
+        let solvent_reinsurers = reinsurer_capitals.iter().filter(|r| r.is_solvent()).count();
+
         // --- Year-end: tally → distributions → AvT → relationships → roll ------
         let mut mean_headroom_acc = 0.0;
         let mut solvent_count = 0usize;
@@ -2716,7 +3069,13 @@ impl Market {
             total_reserves += agent.outstanding_reserves();
 
             // AvT re-set off post-distribution headroom + realised win-rate.
-            let headroom = agent.genome.exposure.capacity_headroom(&capitals[i], &agent.book, &agent.genome.cat_model, rng);
+            let headroom = agent.genome.exposure.capacity_headroom_net(
+                &capitals[i],
+                &agent.book,
+                &agent.genome.cat_model,
+                agent.treaty.as_ref().map(|t| &t.layer),
+                rng,
+            );
             let win_rate = if agent.shortlisted > 0 {
                 agent.won as f64 / agent.shortlisted as f64
             } else {
@@ -2729,6 +3088,27 @@ impl Market {
                 mean_headroom_acc += headroom;
                 avt_values.push(agent.avt);
             }
+        }
+
+        // --- Reinsurers roll -------------------------------------------------
+        // The same year-end the primaries just went through, on the same code: the
+        // reinsurer's net incurred closes, and its AvT is re-set off its OWN
+        // post-loss capacity headroom over the treaty limits it has taken on. A
+        // reinsurer stretched by a cat therefore hardens its treaty pricing next
+        // renewal — reinsurance-side hardening emerges from the same local channel,
+        // not from any market-wide phase. Its placement feedback is neutral: it is
+        // approached with a share of every treaty it is panelled on, so it has no
+        // win-rate to read.
+        for (j, reinsurer) in reinsurers.iter_mut().enumerate() {
+            reinsurer.settle_net_incurred();
+            let headroom = reinsurer.genome.exposure.capacity_headroom(
+                &reinsurer_capitals[j],
+                &reinsurer.book,
+                &reinsurer.genome.cat_model,
+                rng,
+            );
+            let appetite = reinsurer.genome.avt.share_appetite;
+            reinsurer.avt = updated_avt(reinsurer.avt, headroom, appetite, &reinsurer.genome.avt);
         }
 
         // Relationships update slowly from the year's experience (aggregate read).
@@ -2783,6 +3163,15 @@ impl Market {
             placements: bound_layers,
             gross_premium: total_premium,
             incurred_losses: total_losses,
+            // Gross calendar-year incurred is the net figure with the recoveries
+            // added back: reserve development and the booking adjustment sit on the
+            // net retention, so they belong to both sides of the statement.
+            gross_incurred_losses: total_losses + total_recoveries,
+            ceded_premium: total_ceded,
+            reinsurance_recoveries: total_recoveries,
+            reinsurance_shortfall: total_shortfall,
+            cedents_short,
+            solvent_reinsurers,
             yield_rate,
             investment_income: total_investment,
             reserve_development: total_development,
@@ -2802,15 +3191,14 @@ impl Market {
 
 impl YearReport {
     /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
-    pub const CSV_HEADER: &'static str =
-        "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,mean_headroom,cat_events,placements,gross_premium,incurred_losses,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions";
+    pub const CSV_HEADER: &'static str = "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,mean_headroom,cat_events,placements,gross_premium,incurred_losses,gross_incurred_losses,ceded_premium,reinsurance_recoveries,reinsurance_shortfall,cedents_short,solvent_reinsurers,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions";
 
     /// The year's diagnostics as ordered `(column, value)` pairs — the single
     /// source of truth for column order and per-field formatting that both
     /// [`csv_row`](Self::csv_row) and [`reports_to_json`] render from, so the CSV
     /// and JSON emissions can never drift out of sync. Every value is a bare JSON
     /// number (no quoting needed); the keys match [`CSV_HEADER`](Self::CSV_HEADER).
-    fn columns(&self) -> [(&'static str, String); 17] {
+    fn columns(&self) -> [(&'static str, String); 23] {
         [
             ("year", self.year.to_string()),
             ("mean_avt", format!("{:.6}", self.mean_avt)),
@@ -2824,6 +3212,21 @@ impl YearReport {
             ("placements", self.placements.to_string()),
             ("gross_premium", format!("{:.6}", self.gross_premium)),
             ("incurred_losses", format!("{:.6}", self.incurred_losses)),
+            (
+                "gross_incurred_losses",
+                format!("{:.6}", self.gross_incurred_losses),
+            ),
+            ("ceded_premium", format!("{:.6}", self.ceded_premium)),
+            (
+                "reinsurance_recoveries",
+                format!("{:.6}", self.reinsurance_recoveries),
+            ),
+            (
+                "reinsurance_shortfall",
+                format!("{:.6}", self.reinsurance_shortfall),
+            ),
+            ("cedents_short", self.cedents_short.to_string()),
+            ("solvent_reinsurers", self.solvent_reinsurers.to_string()),
             ("yield_rate", format!("{:.6}", self.yield_rate)),
             ("investment_income", format!("{:.6}", self.investment_income)),
             ("reserve_development", format!("{:.6}", self.reserve_development)),
@@ -2977,6 +3380,100 @@ pub const BASELINE_YIELD: YieldProcess =
 /// the demonstration market.
 const FOUNDING_CAPITAL: f64 = 280.0;
 
+/// Place every solvent primary's **outward reinsurance programme** for the year.
+///
+/// Each primary buys one layer on its own aggregate portfolio loss, sized off its
+/// *current* capital, from a panel drawn out of the shared reinsurer pool; the
+/// ceded premium leaves its capital and its net earned premium and arrives as the
+/// reinsurers' own income; and each reinsurer books its share of the treaty limit
+/// into its net book, zone by zone, so its portfolio tail measure sees the same
+/// accumulation the primaries do.
+///
+/// Everything here is existing machinery pointed at portfolio loss: [`Layer`],
+/// [`Panel`], [`technical_premium`], the syndicate capital balance. There is no
+/// reinsurer-specific pricing, capital, or settlement code anywhere.
+#[allow(clippy::too_many_arguments)]
+fn place_outward_programmes(
+    programme: &ReinsuranceProgramme,
+    agents: &mut [SyndicateAgent],
+    capitals: &mut [Syndicate],
+    reinsurers: &mut [SyndicateAgent],
+    reinsurer_capitals: &mut [Syndicate],
+    prior_books: &[NetBook],
+    rng: &mut Rng,
+) {
+    let solvent_reinsurers: Vec<usize> = reinsurer_capitals
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_solvent())
+        .map(|(i, _)| i)
+        .collect();
+    for i in 0..agents.len() {
+        agents[i].treaty = None;
+        let capital = capitals[i].capital();
+        if capital <= 0.0 || solvent_reinsurers.is_empty() || programme.panel_size == 0 {
+            continue;
+        }
+        let layer = Layer {
+            attachment: programme.retention_fraction * capital,
+            limit: programme.limit_fraction * capital,
+        };
+        if layer.limit <= 0.0 {
+            continue;
+        }
+        // The panel: a rotating window over the shared pool, so consecutive
+        // primaries' panels overlap rather than partition it.
+        let panel_ids: Vec<SyndicateId> = (0..programme.panel_size.min(solvent_reinsurers.len()))
+            .map(|k| SyndicateId(solvent_reinsurers[(i + k) % solvent_reinsurers.len()]))
+            .collect();
+        let panel = Panel::subscribe(&panel_ids, programme.reinsurer_line * panel_ids.len() as f64);
+
+        // The primary's aggregate exposure the treaty sits over, and how it
+        // splits across zones — the reinsurer books its share of the limit
+        // zone by zone, so its own portfolio tail measure sees the same
+        // accumulation the primaries do.
+        let zones = prior_books[i].zones();
+        let total_exposure: f64 = zones.iter().map(|&z| prior_books[i].zone_exposure(z)).sum();
+        let exposure = if total_exposure > 0.0 { total_exposure } else { layer.attachment + layer.limit };
+
+        // The lead reinsurer quotes TP-style off ITS OWN cat model, book and
+        // hurdle rate — the identical pricing path a primary uses on an
+        // inwards layer, pointed at portfolio loss instead of an asset.
+        let lead = &reinsurers[panel_ids[0].0];
+        let risk = LayerExposure {
+            layer,
+            exposure,
+            territory: zones.first().copied().unwrap_or(Territory(0)),
+            reinstatement: ReinstatementTerms::none(),
+        };
+        let experience = AttritionalExperience { own_burning_cost: 0.0, benchmark: 0.0, volume: 10.0 };
+        let tp = technical_premium(&risk, &lead.book, &lead.genome.cat_model, &experience, &lead.genome.pricing, rng)
+            .technical_premium;
+        let ceded = tp * lead.avt * panel.placed_portion();
+
+        // Ceded premium is an explicit deduction in the gross-to-net
+        // statement: it leaves the primary's capital and its NEP, and
+        // arrives as the reinsurers' own premium income.
+        capitals[i].settle(ceded);
+        agents[i].ceded_premium = ceded;
+        agents[i].premium -= ceded;
+        for entry in &panel.entries {
+            let share = if panel.placed_portion() > 0.0 { entry.share / panel.placed_portion() } else { 0.0 };
+            reinsurer_capitals[entry.syndicate.0].credit(share * ceded);
+            reinsurers[entry.syndicate.0].premium += share * ceded;
+            // The reinsurer's share of the limit, spread across the primary's
+            // zones in proportion to where that exposure actually sits.
+            if total_exposure > 0.0 {
+                for &z in &zones {
+                    let weight = prior_books[i].zone_exposure(z) / total_exposure;
+                    reinsurers[entry.syndicate.0].book.lines.push(NetLine { territory: z, net_limit: entry.share * layer.limit * weight });
+                }
+            }
+        }
+        agents[i].treaty = Some(ReinsuranceTreaty { layer, panel });
+    }
+}
+
 /// Attribute a panel's settlements back to the agents' loss/premium tallies. The
 /// substrate guarantees the loss-settlement invariants on the settlements; this
 /// re-checks them as the engine's hard gate (no claim above its share, no negative
@@ -2985,7 +3482,7 @@ fn attribute(settlements: &[EventSettlement], panel: &Panel, agents: &mut [Syndi
     for es in settlements {
         for (entry, settled) in panel.entries.iter().zip(&es.claim) {
             assert!(settled.settled >= 0.0 && settled.shortfall >= 0.0, "settlement is non-negative");
-            agents[entry.syndicate.0].losses += settled.settled;
+            agents[entry.syndicate.0].gross_losses += settled.settled;
         }
         for (entry, credit) in panel.entries.iter().zip(&es.reinstatement_credits) {
             agents[entry.syndicate.0].premium += credit;
@@ -6078,5 +6575,533 @@ mod tests {
         // The market's own engine holds the same line over a full run.
         let reports = demonstration_market(3).with_reserving_bias(-0.6).run(10);
         assert!(reports.iter().all(|r| r.outstanding_reserves >= 0.0), "a reserve is never a negative liability");
+    }
+
+    #[test]
+    fn a_treaty_recovers_the_layer_of_the_primarys_aggregate_portfolio_loss() {
+        // A reinsurance treaty is structurally a LAYER on a primary's aggregate
+        // portfolio loss — no bespoke machinery, the same attachment/limit form
+        // the substrate already owns. Below the retention nothing recovers; above
+        // it the treaty pays the excess up to its limit and no further.
+        let mut reinsurers = vec![Syndicate::with_capital(1_000.0)];
+        let treaty = ReinsuranceTreaty {
+            layer: Layer {
+                attachment: 100.0,
+                limit: 200.0,
+            },
+            panel: Panel::subscribe(&[SyndicateId(0)], 1.0),
+        };
+
+        // Under the retention: the primary keeps the whole loss.
+        assert_eq!(treaty.recover(80.0, &mut reinsurers).recovered, 0.0);
+        // Into the layer: the excess over the retention recovers.
+        let mid = treaty.recover(250.0, &mut reinsurers);
+        assert!((mid.recovered - 150.0).abs() < 1e-9);
+        assert_eq!(mid.shortfall, 0.0);
+        // Above the top: capped at the limit — the primary retains the rest.
+        let top = treaty.recover(1_000.0, &mut reinsurers);
+        assert!((top.recovered - 200.0).abs() < 1e-9);
+        // The reinsurer's capital carried both recoveries.
+        assert!((reinsurers[0].capital() - (1_000.0 - 350.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_reinsurer_that_cannot_pay_leaves_the_shortfall_with_the_ceding_primary() {
+        // The zero floor and SEVERAL liability survive on the reinsurance panel:
+        // a thin reinsurer pays min(share, capital) and the remainder is a
+        // shortfall the CEDING PRIMARY retains — never redistributed to the
+        // solvent co-reinsurer. This is the different path from primary
+        // insolvency, where the shortfall falls on the insured.
+        let mut reinsurers = vec![
+            Syndicate::with_capital(40.0),
+            Syndicate::with_capital(1_000.0),
+        ];
+        let treaty = ReinsuranceTreaty {
+            layer: Layer {
+                attachment: 100.0,
+                limit: 400.0,
+            },
+            panel: Panel::subscribe(&[SyndicateId(0), SyndicateId(1)], 1.0),
+        };
+
+        // A 500 aggregate loss pierces the whole layer: 400 due, 200 per share.
+        let recovery = treaty.recover(500.0, &mut reinsurers);
+        assert!((treaty.recovery_due(500.0) - 400.0).abs() < 1e-9);
+        assert!(
+            (recovery.recovered - 240.0).abs() < 1e-9,
+            "40 from the thin one, 200 from the deep one"
+        );
+        assert!(
+            (recovery.shortfall - 160.0).abs() < 1e-9,
+            "the primary retains what the thin reinsurer could not pay"
+        );
+        assert_eq!(
+            reinsurers[0].capital(),
+            0.0,
+            "the thin reinsurer is exhausted, not negative"
+        );
+        assert!(
+            !reinsurers[0].is_solvent(),
+            "an exhausted reinsurer is in runoff"
+        );
+        assert!(
+            (reinsurers[1].capital() - 800.0).abs() < 1e-9,
+            "the solvent co-reinsurer paid only its own share"
+        );
+    }
+
+    #[test]
+    fn the_portfolio_tail_measure_reads_net_of_the_treaty() {
+        // Gross vs net: the treaty is a layer on the primary's portfolio loss, so
+        // it applies INSIDE the tail measure — each simulated year's aggregate is
+        // ceded before the return-period quantile is read. The net tail is the
+        // gross tail less the layer's recovery on it, and exhausting the treaty's
+        // limit is exactly where the net figure stops improving.
+        let book = NetBook {
+            lines: vec![NetLine {
+                territory: Territory(0),
+                net_limit: 500.0,
+            }],
+        };
+        let model = CatModel {
+            annual_frequency: 0.8,
+            min_damage_fraction: 0.05,
+            tail_alpha: 1.3,
+        };
+
+        let mut rng = Rng::seeded(11);
+        let gross = portfolio_tail_loss(&book, &model, 100.0, 400, &mut rng);
+        let mut rng = Rng::seeded(11);
+        let net = net_portfolio_tail_loss(
+            &book,
+            &model,
+            Some(&Layer {
+                attachment: 50.0,
+                limit: 200.0,
+            }),
+            100.0,
+            400,
+            &mut rng,
+        );
+        assert!(gross > 0.0);
+        assert!(
+            net < gross,
+            "cession reduces the retained tail: net {net} vs gross {gross}"
+        );
+
+        // No treaty is the gross measure, exactly — the same draws, the same answer.
+        let mut rng = Rng::seeded(11);
+        let none = net_portfolio_tail_loss(&book, &model, None, 100.0, 400, &mut rng);
+        assert!((none - gross).abs() < 1e-12);
+    }
+
+    #[test]
+    fn exposure_limits_bind_on_the_net_figure_so_reinsurance_buys_headroom() {
+        // Structural commitment #1: the regulatory exposure limits are computed on
+        // a NET (post-reinsurance) basis. A risk the syndicate must decline on its
+        // gross cat aggregate becomes writable once a treaty caps the aggregate —
+        // and the headroom the AvT multiplier reads widens the same way. The gross
+        // figure is still there; it is simply not what the limit binds on.
+        let policy = ExposurePolicy {
+            return_period: 100.0,
+            solvency_fraction: 0.4,
+            line_fraction: 0.9,
+            tail_trials: 300,
+        };
+        let syndicate = Syndicate::with_capital(500.0);
+        let model = CatModel {
+            annual_frequency: 0.9,
+            min_damage_fraction: 0.06,
+            tail_alpha: 1.3,
+        };
+        let book = NetBook {
+            lines: vec![NetLine {
+                territory: Territory(0),
+                net_limit: 400.0,
+            }],
+        };
+        let candidate = NetLine {
+            territory: Territory(0),
+            net_limit: 300.0,
+        };
+        let treaty = Layer {
+            attachment: 120.0,
+            limit: 800.0,
+        };
+
+        let mut rng = Rng::seeded(7);
+        assert_eq!(
+            policy.assess(&syndicate, &book, &model, candidate, &mut rng),
+            UnderwritingDecision::Decline(DeclineReason::CatAggregate),
+            "gross, the accumulation breaches the cat aggregate"
+        );
+        let mut rng = Rng::seeded(7);
+        assert_eq!(
+            policy.assess_net(
+                &syndicate,
+                &book,
+                &model,
+                Some(&treaty),
+                candidate,
+                &mut rng
+            ),
+            UnderwritingDecision::Accept,
+            "net of the treaty the same accumulation is coverable"
+        );
+
+        let mut rng = Rng::seeded(7);
+        let gross_headroom = policy.capacity_headroom(&syndicate, &book, &model, &mut rng);
+        let mut rng = Rng::seeded(7);
+        let net_headroom =
+            policy.capacity_headroom_net(&syndicate, &book, &model, Some(&treaty), &mut rng);
+        assert!(
+            net_headroom > gross_headroom,
+            "net {net_headroom} vs gross {gross_headroom}"
+        );
+    }
+
+    #[test]
+    fn a_primary_tracks_gross_and_net_incurred_separately() {
+        // The gross/net distinction is intrinsic to the accounting, not something
+        // that only appears once reinsurance is bought. With no outward cover the
+        // two figures coincide — and both are real, non-zero readings.
+        let reports = demonstration_market(5).run(6);
+        assert!(
+            reports.iter().any(|r| r.gross_incurred_losses > 0.0),
+            "the reference market incurs losses"
+        );
+        for r in &reports {
+            assert!(
+                (r.gross_incurred_losses - r.incurred_losses).abs() < 1e-9,
+                "unreinsured, gross and net incurred are the same figure"
+            );
+            assert_eq!(r.reinsurance_recoveries, 0.0);
+            assert_eq!(r.ceded_premium, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_reinsured_market_cedes_premium_and_recovers_on_its_aggregate() {
+        // The market engine places each primary's treaty at renewal, cedes the
+        // reinsurance premium out of net earned premium, and settles recoveries on
+        // the aggregate once the year's losses are in. Reinsurers reuse the
+        // syndicate substrate wholesale — they are `SyndicateAgent`s over a capital
+        // roster of their own.
+        let reinsurers: Vec<SyndicateAgent> = (0..3)
+            .map(|_| SyndicateAgent::new(900.0, demonstration_genome()))
+            .collect();
+        let programme = ReinsuranceProgramme {
+            retention_fraction: 0.15,
+            limit_fraction: 0.6,
+            panel_size: 2,
+            reinsurer_line: 0.5,
+        };
+        let mut market = demonstration_market(5).with_reinsurance(programme, reinsurers);
+        let reports = market.run(8);
+
+        assert_eq!(market.reinsurer_count(), 3);
+        assert!(
+            reports.iter().all(|r| r.solvent_reinsurers > 0),
+            "well-capitalised reinsurers survive a benign run"
+        );
+        assert!(
+            reports.iter().all(|r| r.ceded_premium > 0.0),
+            "every year cedes premium out"
+        );
+        assert!(
+            reports.iter().any(|r| r.reinsurance_recoveries > 0.0),
+            "a cat year recovers on the aggregate"
+        );
+        for r in &reports {
+            assert!(
+                r.gross_incurred_losses >= r.incurred_losses - 1e-9,
+                "net incurred never exceeds gross"
+            );
+        }
+        // The reinsurers took on real risk: at least one of them paid something out.
+        let paid_out = (0..3).any(|i| market.reinsurer_capital(SyndicateId(i)) != 900.0);
+        assert!(
+            paid_out,
+            "reinsurer capital moves with the premium it earns and the claims it pays"
+        );
+    }
+
+    #[test]
+    fn a_reinsurer_reprices_off_its_own_headroom_like_any_syndicate() {
+        // Reinsurers reuse the AvT machinery too: a reinsurer whose capital is thin
+        // against the treaty limits it has taken on runs a filled book, reads low
+        // headroom, and lifts its ask — so reinsurance hardens after a cat with no
+        // cycle-phase variable and no broadcast signal anywhere. A well-capitalised
+        // pool over the same market does not.
+        let programme = ReinsuranceProgramme {
+            retention_fraction: 0.15,
+            limit_fraction: 0.6,
+            panel_size: 2,
+            reinsurer_line: 0.5,
+        };
+        let ask = |capital: f64| {
+            let reinsurers: Vec<SyndicateAgent> = (0..3)
+                .map(|_| SyndicateAgent::new(capital, demonstration_genome()))
+                .collect();
+            let mut market = demonstration_market(5).with_reinsurance(programme, reinsurers);
+            market.run(6);
+            market.reinsurer_avt(SyndicateId(0))
+        };
+        let thin = ask(320.0);
+        let deep = ask(4_000.0);
+        assert!(
+            thin > deep,
+            "the stretched reinsurer asks more: thin {thin} vs deep {deep}"
+        );
+        assert!(
+            deep > 0.0 && thin > 1.0,
+            "the stretched reinsurer sits above its technical floor, the idle one softens below it"
+        );
+    }
+
+    #[test]
+    fn reinsurers_are_shared_across_primaries() {
+        // The treaty panels drawn from the pool OVERLAP: a single reinsurer sits on
+        // several primaries' programmes at once. That sharing is the structure
+        // contagion needs — with a private reinsurer per primary a failure would be
+        // a purely local event.
+        let reinsurers: Vec<SyndicateAgent> = (0..3)
+            .map(|_| SyndicateAgent::new(900.0, demonstration_genome()))
+            .collect();
+        let programme = ReinsuranceProgramme {
+            retention_fraction: 0.15,
+            limit_fraction: 0.6,
+            panel_size: 2,
+            reinsurer_line: 0.5,
+        };
+        let mut market = demonstration_market(5).with_reinsurance(programme, reinsurers);
+        market.run(1);
+
+        let mut cedents_of = vec![0usize; 3];
+        for i in 0..market.roster_size() {
+            if let Some(treaty) = market.treaty(SyndicateId(i)) {
+                for entry in &treaty.panel.entries {
+                    cedents_of[entry.syndicate.0] += 1;
+                }
+            }
+        }
+        assert!(
+            cedents_of.iter().all(|&c| c > 1),
+            "every reinsurer covers more than one primary: {cedents_of:?}"
+        );
+    }
+
+    #[test]
+    fn a_shared_reinsurers_insolvency_strips_recoveries_from_several_primaries_at_once() {
+        // Reinsurance contagion (#11), mechanism first. Two primaries cede to the
+        // SAME reinsurer. A bad year exhausts it on the first primary's treaty, and
+        // the second — whose GROSS book was well controlled, comfortably inside its
+        // own capital once the recovery it had bought is counted — is left holding
+        // a loss it never retained and goes insolvent.
+        let mut reinsurers = vec![Syndicate::with_capital(50.0)];
+        let layer = Layer {
+            attachment: 100.0,
+            limit: 400.0,
+        };
+        let treaty = |p: SyndicateId| ReinsuranceTreaty {
+            layer,
+            panel: Panel::subscribe(&[p], 1.0),
+        };
+
+        // Primary A: a heavy gross year, deep capital — it survives either way.
+        let a = treaty(SyndicateId(0)).recover(500.0, &mut reinsurers);
+        assert!(
+            (a.recovered - 50.0).abs() < 1e-9,
+            "the reinsurer pays what it has and no more"
+        );
+        assert!((a.shortfall - 350.0).abs() < 1e-9);
+        assert!(
+            !reinsurers[0].is_solvent(),
+            "the shared reinsurer is exhausted and in runoff"
+        );
+
+        // Primary B: a modest gross year of 300 against 120 of capital. It bought
+        // cover attaching at 100, so its intended NET retention was 100 — well
+        // inside its capital. The recovery is simply not there.
+        let mut primary_b = Syndicate::with_capital(120.0);
+        let b = treaty(SyndicateId(0)).recover(300.0, &mut reinsurers);
+        assert_eq!(b.recovered, 0.0, "nothing is left for the second cedent");
+        assert!(
+            (b.shortfall - 200.0).abs() < 1e-9,
+            "the whole due recovery is stripped"
+        );
+
+        let intended_net = 300.0 - treaty(SyndicateId(0)).recovery_due(300.0);
+        assert!(
+            intended_net < primary_b.capital(),
+            "gross was well controlled: intended net {intended_net} inside capital"
+        );
+        primary_b.settle(300.0 - b.recovered);
+        assert!(
+            !primary_b.is_solvent(),
+            "the counterparty failure, not its own book, put B into runoff"
+        );
+    }
+    /// A market built to make reinsurance contagion (#11) legible: primaries close
+    /// enough to the edge that a lost recovery matters, a heavy-tailed cat process,
+    /// and a **small shared pool** of reinsurers whose cat model understates the
+    /// truth (thin tail, low frequency), so they underprice the treaties they write.
+    /// The only lever the arms differ on is the reinsurers' **capital**.
+    fn contagion_scenario(reinsurer_capital: f64) -> Market {
+        let n = 8usize;
+        let primaries: Vec<SyndicateAgent> = (0..n)
+            .map(|i| {
+                SyndicateAgent::new(
+                    100.0,
+                    SyndicateGenome {
+                        avt: AvtParams {
+                            headroom_responsiveness: 0.35 + 0.1 * (i % 3) as f64,
+                            feedback_responsiveness: 0.25,
+                            share_appetite: 0.35 + 0.05 * (i % 5) as f64,
+                        },
+                        ..demonstration_genome()
+                    },
+                )
+            })
+            .collect();
+        let brokers = vec![
+            Broker::new(vec![1.0; n], 0.85),
+            Broker::new((0..n).map(|i| 1.0 - 0.05 * i as f64).collect(), 0.88),
+        ];
+        let territory = |t: u32, count: usize| TerritoryMarket {
+            territory: Territory(t),
+            peril: CatastrophePeril {
+                annual_frequency: 0.4,
+                min_damage_fraction: 0.07,
+                tail_alpha: 1.15,
+            },
+            insureds: (0..count)
+                .map(|i| MarketInsured {
+                    asset: Asset {
+                        sum_insured: 100.0,
+                        territory: Territory(t),
+                    },
+                    risk_aversion: 2.0,
+                    broker: BrokerId(i % 2),
+                })
+                .collect(),
+        };
+        // The reinsurers' cat model is systematically optimistic against the truth
+        // (frequency 0.15 against 0.4, tail alpha 2.2 against 1.15) — an ordinary
+        // cat-model error, not a special reinsurer rule.
+        let reinsurer_genome = SyndicateGenome {
+            cat_model: CatModel {
+                annual_frequency: 0.15,
+                min_damage_fraction: 0.05,
+                tail_alpha: 2.2,
+            },
+            ..demonstration_genome()
+        };
+        let reinsurers: Vec<SyndicateAgent> = (0..2)
+            .map(|_| SyndicateAgent::new(reinsurer_capital, reinsurer_genome))
+            .collect();
+        Market::new(
+            primaries,
+            brokers,
+            vec![territory(0, 16), territory(1, 14)],
+            AttritionalPeril {
+                occurrence_probability: 0.25,
+                mean_damage_fraction: 0.06,
+            },
+            0.15,
+            4,
+            Rng::seeded(25),
+        )
+        .with_reinsurance(
+            ReinsuranceProgramme {
+                retention_fraction: 0.10,
+                limit_fraction: 0.9,
+                panel_size: 2,
+                reinsurer_line: 0.5,
+            },
+            reinsurers,
+        )
+    }
+
+    #[test]
+    fn a_shared_reinsurers_failure_topples_primaries_whose_gross_book_was_controlled() {
+        // Reinsurance contagion (#11) through the market engine, as a controlled
+        // experiment: the SAME market, the same seed, the same reinsurers in every
+        // respect except how much capital they hold.
+        const PRIMARIES: usize = 8;
+        const FOUNDING: f64 = 100.0;
+
+        let mut thin = contagion_scenario(50.0);
+        let thin_reports = thin.run(25);
+        let mut deep = contagion_scenario(200_000.0);
+        let deep_reports = deep.run(25);
+
+        // 1. The shared reinsurers fail, and their failure is felt by SEVERAL
+        //    primaries in the same year — one balance sheet, many cedents.
+        assert_eq!(
+            thin_reports.last().unwrap().solvent_reinsurers,
+            0,
+            "the thin pool is wiped out"
+        );
+        let simultaneous = thin_reports.iter().map(|r| r.cedents_short).max().unwrap();
+        assert!(
+            simultaneous > 1,
+            "a single reinsurer failure strips {simultaneous} primaries at once"
+        );
+        assert!(
+            thin_reports
+                .iter()
+                .map(|r| r.reinsurance_shortfall)
+                .sum::<f64>()
+                > 0.0
+        );
+
+        // 2. Primaries go insolvent in the thin arm and not in the deep arm —
+        //    although the deep arm, with its cover intact, wrote a far LARGER gross
+        //    book. More gross exposure and no failures; less gross exposure and
+        //    failures. The difference is the counterparty, not the underwriting.
+        let failed = |m: &Market| {
+            (0..PRIMARIES)
+                .filter(|&i| m.capital(SyndicateId(i)) <= 0.0)
+                .count()
+        };
+        let gross = |rs: &[YearReport]| rs.iter().map(|r| r.gross_incurred_losses).sum::<f64>();
+        assert!(
+            failed(&thin) > 0,
+            "counterparty failure puts primaries into runoff"
+        );
+        assert_eq!(failed(&deep), 0, "with the cover honoured, nobody fails");
+        assert!(
+            gross(&deep_reports) > gross(&thin_reports),
+            "the surviving arm carried MORE gross loss ({:.0}) than the failing one ({:.0})",
+            gross(&deep_reports),
+            gross(&thin_reports)
+        );
+
+        // 3. Attribution: every primary that failed had been stripped of recoveries
+        //    worth more than its entire founding capital. Its gross book was inside
+        //    what it had arranged to retain; what killed it was the recovery that
+        //    never arrived.
+        for i in 0..PRIMARIES {
+            if thin.capital(SyndicateId(i)) <= 0.0 {
+                let stripped = thin.retained_shortfall(SyndicateId(i));
+                // Observed: primaries 2, 3 and 7 fail, denied 108, 97 and 101 of
+                // bought cover against 100 of founding capital apiece — close to a
+                // whole balance sheet each, from the counterparty alone.
+                assert!(
+                    stripped > 0.9 * FOUNDING,
+                    "primary {i} was denied {stripped:.0} of bought cover against {FOUNDING:.0} of founding capital"
+                );
+            }
+        }
+        // And the shock is genuinely shared: more than one cedent carries a stripped
+        // recovery by the end of the run.
+        let stripped_cedents = (0..PRIMARIES)
+            .filter(|&i| thin.retained_shortfall(SyndicateId(i)) > 0.0)
+            .count();
+        assert!(
+            stripped_cedents > 1,
+            "only {stripped_cedents} cedent(s) were left short"
+        );
     }
 }

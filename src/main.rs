@@ -19,14 +19,15 @@ use rinsanity::{
     anchored_quote, attritional_aggregate_samples, catastrophe_aggregate_samples,
     coefficient_of_variation, demonstration_market, follower_weight, reports_to_csv,
     reports_to_json, AttritionalPeril, Broker, CatastrophePeril, RelationshipOutcome, Rng,
-    SyndicateId,
+    SyndicateId, YieldProcess, BASELINE_YIELD,
 };
 
 const USAGE: &str = "\
 rinsanity — emergent underwriting-cycle simulation
 
 USAGE:
-    rinsanity cycle [--seed <u64>] [--years <usize>] [--format csv|json] [--out <path>]
+    rinsanity cycle [--seed <u64>] [--years <usize>] [--yield-mean <f64>]
+                    [--format csv|json] [--out <path>]
     rinsanity diagnostics            # human demonstrations + qualitative cycle read
     rinsanity [--explain]            # alias for diagnostics (default)
 
@@ -37,6 +38,10 @@ cycle:
 
     --seed   <u64>      RNG seed for the demonstration market (default 2024)
     --years  <usize>    number of years to simulate (default 60)
+    --yield-mean <f64>  long-run mean of the exogenous market yield (#9). The macro
+                        environment is a scenario input: holding --seed fixed and
+                        varying only this is the controlled high-yield vs low-yield
+                        experiment (default 0.045, the calibrated baseline)
     --format csv|json   csv (header + rows) or json (array of objects) (default csv)
     --out    <path>     write to a file instead of stdout
 ";
@@ -74,6 +79,7 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
     let mut years: usize = 60;
     let mut format = Format::Csv;
     let mut out: Option<String> = None;
+    let mut yield_mean: Option<f64> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -90,6 +96,11 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
                 years = value(i)?.parse().map_err(|_| format!("invalid --years '{}'", value(i).unwrap()))?;
                 i += 2;
             }
+            "--yield-mean" => {
+                let raw = value(i)?;
+                yield_mean = Some(raw.parse().map_err(|_| format!("invalid --yield-mean '{raw}'"))?);
+                i += 2;
+            }
             "--format" => {
                 format = value(i)?.parse()?;
                 i += 2;
@@ -102,7 +113,13 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let reports = demonstration_market(seed).run(years);
+    // The yield path keeps its own generator, so overriding the regime shifts the
+    // macro environment and nothing else — the underwriting world is untouched.
+    let mut market = demonstration_market(seed);
+    if let Some(mean) = yield_mean {
+        market = market.with_yield_process(YieldProcess { mean, initial: mean, ..BASELINE_YIELD });
+    }
+    let reports = market.run(years);
     let body = match format {
         Format::Csv => reports_to_csv(&reports),
         Format::Json => reports_to_json(&reports),
@@ -170,6 +187,10 @@ fn cycle_demonstration() {
     println!("  crossing its mean {crossings} times — a multi-year oscillation, not a drift");
     println!("  combined ratio is bimodal: benign-year median {median_cr:.2}, {cat_years} cat years spiking to {max_cr:.2}");
     println!("  capacity {first_capacity} -> {last_capacity} syndicates: {entrants} lagged entrants came online in years {entry_years:?}");
+    let mean_yield = reports.iter().map(|r| r.yield_rate).sum::<f64>() / reports.len() as f64;
+    let investment: f64 = reports.iter().map(|r| r.investment_income).sum();
+    let underwriting: f64 = reports.iter().map(|r| r.gross_premium - r.incurred_losses).sum();
+    println!("  exogenous yield averaged {mean_yield:.3}: {investment:.0} of investment income against {underwriting:.0} of underwriting result");
     println!("=> soft markets compete AvT below the floor; a cat collapses headroom and hardens it above;");
     println!("   recovered capital re-softens. Human review confirms the soft → shock → hard → soft shape.");
 }

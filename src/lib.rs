@@ -369,6 +369,16 @@ impl Rng {
         // Use the top 53 bits for a double in [0, 1).
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
+
+    /// A standard normal draw (Box-Muller). Always consumes exactly two uniform
+    /// draws, so a stream's consumption does not depend on the values drawn.
+    pub fn standard_normal(&mut self) -> f64 {
+        // Box-Muller needs u1 > 0 for the logarithm; the smallest representable
+        // draw is nudged off zero rather than resampled, keeping consumption fixed.
+        let u1 = self.uniform().max(f64::MIN_POSITIVE);
+        let u2 = self.uniform();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
 }
 
 /// A syndicate's loss-absorbing capital: a persistent balance. Claim shares
@@ -1897,6 +1907,66 @@ pub fn committed_capital(observed_return: f64, supply: &CapitalSupply) -> f64 {
     ((observed_return - supply.hurdle_return) / supply.marginal_return_slope).max(0.0)
 }
 
+/// The **exogenous market-yield process** (#9): a mean-reverting AR(1) interest-rate
+/// path that capital and premium float earn their investment return at.
+///
+/// The yield is exogenous by design, not by simplification — the interest-rate
+/// environment is macroeconomic, genuinely outside the insurance market, an input
+/// the market responds to rather than a phenomenon it generates. It is the one
+/// place an external time series is faithful. Its path and parameters are
+/// **scenario inputs**: holding everything else fixed and shifting only the regime
+/// is the controlled study the design calls for.
+///
+/// It is emphatically **not** a cycle driver in disguise: nothing reads the yield
+/// to decide the market is hard or soft. It credits capital, and it reaches agents
+/// only through their own local total-return signal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct YieldProcess {
+    /// The long-run mean the rate reverts to.
+    pub mean: f64,
+    /// AR(1) persistence in `[0, 1)`: the fraction of the gap to `mean` that
+    /// survives each step. Higher → slower reversion, longer rate regimes.
+    pub persistence: f64,
+    /// Standard deviation of the annual innovation. Zero gives a deterministic
+    /// reversion path.
+    pub volatility: f64,
+    /// The rate the path starts at.
+    pub initial: f64,
+    /// Seed for the yield path's own generator. The path is drawn from a stream
+    /// independent of the market's, so shifting a market parameter does not
+    /// reshuffle the macro environment — which is what makes the high-yield vs
+    /// low-yield comparison genuinely other-things-equal.
+    pub seed: u64,
+}
+
+/// One step of the AR(1) yield recursion:
+/// `next = mean + persistence · (current − mean) + volatility · ε`, with `ε` a
+/// standard normal draw. With zero volatility it is pure geometric reversion.
+pub fn next_yield(current: f64, process: &YieldProcess, rng: &mut Rng) -> f64 {
+    let shock = rng.standard_normal();
+    process.mean + process.persistence * (current - process.mean) + process.volatility * shock
+}
+
+/// The **investment income** a syndicate earns over one year at the exogenous
+/// market `rate` (#9): its `opening_capital` earns the full year, and the year's
+/// premium **float** — the net underwriting flow written and run off across the
+/// year, so held for half of it on average — earns
+/// [`FLOAT_EARNING_FRACTION`] of it.
+///
+/// A run of losses that has already consumed the float leaves nothing invested
+/// rather than a negative balance, so the base is floored at zero. A negative
+/// macro rate legitimately produces negative income: the environment can charge
+/// for holding capital.
+pub fn investment_income(rate: f64, opening_capital: f64, underwriting_result: f64) -> f64 {
+    rate * (opening_capital + FLOAT_EARNING_FRACTION * underwriting_result).max(0.0)
+}
+
+/// The fraction of a year the **premium float** earns its investment return for
+/// (#9). Premium is written and losses run off across the year rather than at its
+/// start, so on average the year's net underwriting flow is held for half of it,
+/// while opening capital earns the full year.
+pub const FLOAT_EARNING_FRACTION: f64 = 0.5;
+
 /// A demand-side **insured** in the market: an asset to cover, a risk-aversion
 /// loading (its WTP is risk-aversion × expected loss), and the broker it places
 /// through.
@@ -1949,6 +2019,12 @@ pub struct YearReport {
     pub gross_premium: f64,
     /// Total incurred losses this year.
     pub incurred_losses: f64,
+    /// The exogenous market yield this year's investment return was earned at
+    /// (#9). Zero in a market with no yield process wired.
+    pub yield_rate: f64,
+    /// Total investment income credited to capital this year — the second half of
+    /// the total-return signal agents act on.
+    pub investment_income: f64,
 }
 
 /// A bound tower for one insured, held through the loss phase: the asset it covers
@@ -1983,6 +2059,9 @@ pub struct Market {
     /// Committed capital not yet large enough to found a syndicate — it waits in
     /// the formation queue and joins the next tranche that can fund one.
     unformed_capital: f64,
+    /// The exogenous market-yield regime, if this market has investment income
+    /// wired (#9), together with the current rate and the path's own generator.
+    investment: Option<(YieldProcess, f64, Rng)>,
 }
 
 impl Market {
@@ -2011,7 +2090,28 @@ impl Market {
             capital_supply: None,
             forming: Vec::new(),
             unformed_capital: 0.0,
+            investment: None,
         }
+    }
+
+    /// Wire the **exogenous market yield** (#9) onto the market: from here on,
+    /// each year capital and premium float earn an investment return at the
+    /// prevailing rate, the income credits capital, and it joins the underwriting
+    /// result in the total-return signal that drives distributions and entry.
+    ///
+    /// The path is drawn from its own generator, seeded off the process, so it is
+    /// independent of every underwriting draw — shifting the yield regime while
+    /// holding the market seed leaves the underwriting world untouched, which is
+    /// what makes the high-yield/low-yield comparison a controlled experiment.
+    pub fn with_yield_process(mut self, process: YieldProcess) -> Self {
+        let rng = Rng::seeded(process.seed);
+        self.investment = Some((process, process.initial, rng));
+        self
+    }
+
+    /// The market's exogenous yield regime, if investment income is wired (#9).
+    pub fn yield_process(&self) -> Option<YieldProcess> {
+        self.investment.as_ref().map(|(p, _, _)| *p)
     }
 
     /// Wire **endogenous entry** (#8) onto the market: from here on, each year-end
@@ -2083,6 +2183,7 @@ impl Market {
             capital_supply,
             forming,
             unformed_capital,
+            investment,
         } = self;
         let expense_ratio = *expense_ratio;
         let panel_size = *panel_size;
@@ -2113,8 +2214,22 @@ impl Market {
             }
         }
 
-        // Opening capital: the base the year's return on capital is measured over.
-        let opening_capital: f64 = capitals.iter().map(|c| c.capital()).sum();
+        // The year's exogenous market yield. It is advanced once per year off its
+        // OWN generator, before anything underwrites, so the macro environment is
+        // independent of every market draw. Nothing downstream reads it as a market
+        // signal: it only sets the rate capital and float earn at.
+        let yield_rate = match investment.as_mut() {
+            Some((process, rate, yield_rng)) => {
+                *rate = next_yield(*rate, process, yield_rng);
+                *rate
+            }
+            None => 0.0,
+        };
+
+        // Opening capital: the base the year's return on capital is measured over,
+        // and the balance that earns a full year of investment return.
+        let opening_capitals: Vec<f64> = capitals.iter().map(|c| c.capital()).collect();
+        let opening_capital: f64 = opening_capitals.iter().sum();
 
         for agent in agents.iter_mut() {
             agent.reset_year();
@@ -2308,14 +2423,31 @@ impl Market {
         let mut avt_values: Vec<f64> = Vec::new();
         let mut total_premium = 0.0;
         let mut total_losses = 0.0;
+        let mut total_investment = 0.0;
 
         for (i, agent) in agents.iter_mut().enumerate() {
             total_premium += agent.premium;
             total_losses += agent.losses;
 
+            // Investment income (#9): opening capital earns a full year at the
+            // exogenous yield, and the year's premium float — net of the losses
+            // that ran off against it — earns the part-year it was held for.
+            let underwriting = agent.premium - agent.losses;
+            let income = investment_income(yield_rate, opening_capitals[i], underwriting);
+            if income > 0.0 {
+                capitals[i].credit(income);
+            } else if income < 0.0 {
+                // A negative macro rate debits capital, subject to the zero floor.
+                capitals[i].settle(-income);
+            }
+            total_investment += income;
+
             // Distributions release profit above the floor, suppressed in loss
-            // years — debited before AvT reads headroom.
-            let result = agent.premium - agent.losses;
+            // years — debited before AvT reads headroom. The result they read is
+            // the TOTAL return: underwriting plus investment income, so a
+            // high-yield regime keeps capital flowing out even when underwriting
+            // alone was thin.
+            let result = underwriting + income;
             let payout = distribution(capitals[i].capital(), result, &agent.genome.distribution);
             if payout > 0.0 {
                 capitals[i].settle(payout);
@@ -2352,13 +2484,13 @@ impl Market {
         }
 
         // --- Entry: this year's return commits capital along the supply curve --
-        // The signal is the market's OWN realised total return on capital — for
-        // now the underwriting result alone (investment income joins it in #9).
-        // It is an observable market outcome, not a cycle phase: nothing here
-        // knows whether the market is hard or soft.
+        // The signal is the market's OWN realised **total** return on capital:
+        // underwriting result PLUS investment income (#9). It is an observable
+        // market outcome, not a cycle phase: nothing here knows whether the market
+        // is hard or soft.
         if let Some(supply) = capital_supply.as_ref() {
             let market_return = if opening_capital > 0.0 {
-                (total_premium - total_losses) / opening_capital
+                (total_premium - total_losses + total_investment) / opening_capital
             } else {
                 0.0
             };
@@ -2389,6 +2521,8 @@ impl Market {
             placements: bound_layers,
             gross_premium: total_premium,
             incurred_losses: total_losses,
+            yield_rate,
+            investment_income: total_investment,
         };
 
         *year += 1;
@@ -2404,14 +2538,14 @@ impl Market {
 impl YearReport {
     /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
     pub const CSV_HEADER: &'static str =
-        "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,mean_headroom,cat_events,placements,gross_premium,incurred_losses";
+        "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,mean_headroom,cat_events,placements,gross_premium,incurred_losses,yield_rate,investment_income";
 
     /// The year's diagnostics as ordered `(column, value)` pairs — the single
     /// source of truth for column order and per-field formatting that both
     /// [`csv_row`](Self::csv_row) and [`reports_to_json`] render from, so the CSV
     /// and JSON emissions can never drift out of sync. Every value is a bare JSON
     /// number (no quoting needed); the keys match [`CSV_HEADER`](Self::CSV_HEADER).
-    fn columns(&self) -> [(&'static str, String); 12] {
+    fn columns(&self) -> [(&'static str, String); 14] {
         [
             ("year", self.year.to_string()),
             ("mean_avt", format!("{:.6}", self.mean_avt)),
@@ -2425,6 +2559,8 @@ impl YearReport {
             ("placements", self.placements.to_string()),
             ("gross_premium", format!("{:.6}", self.gross_premium)),
             ("incurred_losses", format!("{:.6}", self.incurred_losses)),
+            ("yield_rate", format!("{:.6}", self.yield_rate)),
+            ("investment_income", format!("{:.6}", self.investment_income)),
         ]
     }
 
@@ -2541,7 +2677,17 @@ pub fn demonstration_market(seed: u64) -> Market {
         // mid-population genome, jittered across the founders' own spread.
         population: GenomePopulation { centre: genome_of(1, 0.5), spread: 0.25 },
     })
+    .with_yield_process(BASELINE_YIELD)
 }
+
+/// The reference market's **baseline macro environment** (#9): a moderate,
+/// persistent interest-rate regime. Persistence near 0.85 gives rate regimes that
+/// last several years — the empirical interest-rate cycle the underwriting cycle's
+/// period is documented to track. Like every other constant here it is calibration;
+/// the *form* (exogenous AR(1)) is the design. A scenario overrides it with
+/// [`Market::with_yield_process`].
+pub const BASELINE_YIELD: YieldProcess =
+    YieldProcess { mean: 0.045, persistence: 0.85, volatility: 0.012, initial: 0.045, seed: 0x59_49_45_4C_44 };
 
 /// The capital a founding syndicate — and every later entrant — is endowed with in
 /// the demonstration market.
@@ -5112,5 +5258,241 @@ mod tests {
             let pair = format!("\"{key}\":{cell}");
             assert!(json.contains(&pair), "expected {pair} in JSON");
         }
+    }
+
+    #[test]
+    fn a_yield_process_reverts_toward_its_long_run_mean() {
+        // #9: the market yield is EXOGENOUS and mean-reverting — a macro input the
+        // market responds to, never a phenomenon the market generates. With the
+        // shock silenced, the AR(1) recursion is pure reversion: each step closes
+        // `1 - persistence` of the gap to the long-run mean, and the level walks
+        // monotonically toward it without ever overshooting.
+        let process = YieldProcess { mean: 0.05, persistence: 0.8, volatility: 0.0, initial: 0.01, seed: 7 };
+        let mut rng = Rng::seeded(1);
+
+        let mut rate = process.initial;
+        let mut previous_gap = process.mean - rate;
+        for _ in 0..25 {
+            rate = next_yield(rate, &process, &mut rng);
+            let gap = process.mean - rate;
+            assert!(gap > -1e-12, "the level never overshoots the mean it reverts to: {rate}");
+            assert!(gap < previous_gap, "each step closes part of the gap: {gap} !< {previous_gap}");
+            assert!((gap - process.persistence * previous_gap).abs() < 1e-12, "the gap decays by exactly `persistence`");
+            previous_gap = gap;
+        }
+        assert!((rate - process.mean).abs() < 1e-3, "the level settles at the long-run mean: {rate}");
+    }
+
+    #[test]
+    fn a_volatile_yield_path_is_stationary_around_its_mean_and_reproducible_from_its_seed() {
+        // #9: with the shock live the path is a stationary AR(1) — it wanders on
+        // both sides of the long-run mean, its sample mean sits near it, and its
+        // dispersion matches the stationary standard deviation
+        // `volatility / sqrt(1 - persistence^2)`. Being seeded, the whole macro
+        // environment is reproducible: the same scenario input gives the same path.
+        let process = YieldProcess { mean: 0.04, persistence: 0.7, volatility: 0.015, initial: 0.04, seed: 11 };
+        let path = |seed: u64| {
+            let mut rng = Rng::seeded(seed);
+            let mut rate = process.initial;
+            (0..4_000).map(|_| { rate = next_yield(rate, &process, &mut rng); rate }).collect::<Vec<f64>>()
+        };
+
+        let p = path(process.seed);
+        assert_eq!(p, path(process.seed), "the same seed reproduces the same macro path");
+        assert!(p.iter().any(|&r| r > process.mean) && p.iter().any(|&r| r < process.mean), "the path wanders both sides of its mean");
+
+        let sample_mean = p.iter().sum::<f64>() / p.len() as f64;
+        assert!((sample_mean - process.mean).abs() < 0.002, "sample mean sits at the long-run mean: {sample_mean}");
+
+        let stationary_sd = process.volatility / (1.0 - process.persistence * process.persistence).sqrt();
+        let sample_sd = (p.iter().map(|r| (r - sample_mean).powi(2)).sum::<f64>() / p.len() as f64).sqrt();
+        assert!((sample_sd / stationary_sd - 1.0).abs() < 0.1, "dispersion matches the stationary sd: {sample_sd} vs {stationary_sd}");
+    }
+
+    /// Total capital across the whole roster — the base the market's own realised
+    /// return on capital is measured over.
+    fn roster_capital(market: &Market) -> f64 {
+        (0..market.roster_size()).map(|i| market.capital(SyndicateId(i))).sum()
+    }
+
+    #[test]
+    fn capital_and_float_earn_an_investment_return_at_the_exogenous_yield() {
+        // #9 tracer: wire an exogenous yield onto the market and capital earns on
+        // it. Two runs of the SAME market off the SAME seed differ in nothing but
+        // the macro environment — the yield path has its own stream, so every
+        // underwriting draw is identical — and the invested market ends richer.
+        // The year's rate and the income it credited are reported diagnostics.
+        let flat = YieldProcess { mean: 0.06, persistence: 0.0, volatility: 0.0, initial: 0.06, seed: 3 };
+
+        let mut uninvested = small_market(7);
+        let dry = uninvested.run(3);
+        let mut invested = small_market(7).with_yield_process(flat);
+        let wet = invested.run(3);
+
+        for (year, r) in wet.iter().enumerate() {
+            assert!((r.yield_rate - flat.mean).abs() < 1e-12, "year {year} earns at the exogenous yield: {}", r.yield_rate);
+            assert!(r.investment_income > 0.0, "year {year} credits investment income: {}", r.investment_income);
+        }
+        for r in &dry {
+            assert_eq!(r.yield_rate, 0.0, "a market with no yield process wired earns nothing");
+            assert_eq!(r.investment_income, 0.0, "and credits no investment income");
+        }
+
+        assert!(
+            roster_capital(&invested) > roster_capital(&uninvested),
+            "investment income credits capital: {} !> {}",
+            roster_capital(&invested),
+            roster_capital(&uninvested)
+        );
+    }
+
+    #[test]
+    fn distributions_release_profit_on_the_total_return_not_underwriting_alone() {
+        // #9: the profitability capital providers are paid out of is underwriting
+        // PLUS investment return. Over a single year the two runs' underwriting is
+        // bit-identical (the yield path has its own stream), so the ONLY difference
+        // is the income credited. Were distributions blind to it, every penny of
+        // income would be retained and the capital gap would equal the income
+        // exactly; because they read the total return, part of it is released.
+        let flat = YieldProcess { mean: 0.08, persistence: 0.0, volatility: 0.0, initial: 0.08, seed: 3 };
+
+        let mut uninvested = small_market(7);
+        uninvested.step_year();
+        let mut invested = small_market(7).with_yield_process(flat);
+        let report = invested.step_year();
+
+        let retained = roster_capital(&invested) - roster_capital(&uninvested);
+        assert!(report.investment_income > 0.0, "the year credited investment income");
+        assert!(retained > 0.0, "some of the income is retained as capital: {retained}");
+        assert!(
+            retained < report.investment_income - 1e-9,
+            "and some is distributed out on the total return: retained {retained} !< income {}",
+            report.investment_income
+        );
+    }
+
+    #[test]
+    fn entry_commits_capital_on_the_total_return_so_a_high_yield_regime_funds_entrants() {
+        // #9 × #8: the return fresh capital reads off the supply curve is the
+        // market's TOTAL return — underwriting plus investment. With the supply
+        // hurdle set above what this market's underwriting alone ever earns, no
+        // capital commits in a zero-yield world; the same market under a high-yield
+        // regime clears the hurdle on total return and funds entrants. Nothing here
+        // reads a cycle phase: the hurdle meets an observed return, as before.
+        let supply = || CapitalSupply {
+            hurdle_return: 0.05,
+            marginal_return_slope: 0.00001,
+            formation_lag: 1,
+            entrant_capital: 400.0,
+            population: GenomePopulation { centre: test_genome(0.5), spread: 0.25 },
+        };
+        let high_yield = YieldProcess { mean: 0.08, persistence: 0.0, volatility: 0.0, initial: 0.08, seed: 3 };
+
+        let dry = small_market(7).with_capital_supply(supply()).run(8);
+        let wet = small_market(7).with_capital_supply(supply()).with_yield_process(high_yield).run(8);
+
+        assert!(
+            dry.iter().all(|r| r.entrants == 0),
+            "underwriting alone never clears the hurdle, so no capital commits"
+        );
+        assert!(
+            wet.iter().any(|r| r.entrants > 0),
+            "investment income lifts the total return over the hurdle and funds entry"
+        );
+    }
+
+    #[test]
+    fn a_high_yield_regime_leaves_syndicates_softer_than_a_zero_yield_one() {
+        // #9's mechanism, at the agent's own local state: investment income credits
+        // capital, capital is what capacity headroom is measured against, and AvT
+        // is re-set off post-distribution headroom. So a richer macro environment
+        // reaches the ask the ONLY legitimate way — through each syndicate's own
+        // balance sheet — with no coordinator and no cycle-phase variable. Held
+        // against an identical zero-yield run, the high-yield market carries more
+        // headroom and asks less over the floor.
+        let high_yield = YieldProcess { mean: 0.09, persistence: 0.0, volatility: 0.0, initial: 0.09, seed: 3 };
+        let dry = small_market(7).run(15);
+        let wet = small_market(7).with_yield_process(high_yield).run(15);
+
+        let mean = |rs: &[YearReport], f: fn(&YearReport) -> f64| rs.iter().map(f).sum::<f64>() / rs.len() as f64;
+        let dry_headroom = mean(&dry, |r| r.mean_headroom);
+        let wet_headroom = mean(&wet, |r| r.mean_headroom);
+        let dry_avt = mean(&dry, |r| r.mean_avt);
+        let wet_avt = mean(&wet, |r| r.mean_avt);
+
+        assert!(wet_headroom > dry_headroom, "investment income buys capacity headroom: {wet_headroom} !> {dry_headroom}");
+        assert!(wet_avt < dry_avt, "and more headroom means a softer ask: {wet_avt} !< {dry_avt}");
+    }
+
+    /// The cycle's shape read off a run's rate index: its **amplitude** (dispersion
+    /// about the run's own mean) and its **period** (twice the mean gap between
+    /// crossings of that mean). Both are measured *after the fact* from an emitted
+    /// diagnostic — nothing in the model knows either number.
+    fn cycle_shape(reports: &[YearReport]) -> (f64, f64) {
+        let mean = reports.iter().map(|r| r.rate_index).sum::<f64>() / reports.len() as f64;
+        let amplitude = (reports.iter().map(|r| (r.rate_index - mean).powi(2)).sum::<f64>() / reports.len() as f64).sqrt();
+        let crossings = reports.windows(2).filter(|w| (w[0].rate_index - mean) * (w[1].rate_index - mean) < 0.0).count();
+        let period = if crossings == 0 { f64::INFINITY } else { 2.0 * reports.len() as f64 / crossings as f64 };
+        (amplitude, period)
+    }
+
+    #[test]
+    fn a_high_yield_regime_lengthens_and_damps_the_cycle_against_a_low_yield_one() {
+        // #9's headline claim, as a CONTROLLED experiment: the reference market,
+        // the same seeds, every parameter identical — the ONLY difference is the
+        // long-run mean of the exogenous yield. Because the yield path runs off its
+        // own generator, the low- and high-yield worlds share their underwriting
+        // draws exactly, so the comparison is genuinely other-things-equal.
+        //
+        // What we observe: the high-yield market runs SOFTER (investment income
+        // carries part of the cost of capital, so less has to come out of
+        // underwriting), its cycle is LONGER (each hard phase is relieved sooner
+        // and rebuilt capital re-softens over more years), and its rate index
+        // swings LESS. The cycle is still fully emergent — no phase variable
+        // anywhere; the yield only ever credits an agent's own capital.
+        let regime = |mean: f64| YieldProcess { mean, initial: mean, ..BASELINE_YIELD };
+        let run = |mean: f64, seed: u64| demonstration_market(seed).with_yield_process(regime(mean)).run(50);
+        let seeds = [2024u64, 2025];
+
+        let mut low = (0.0, 0.0, 0.0);
+        let mut high = (0.0, 0.0, 0.0);
+        for &seed in &seeds {
+            for (mean, acc) in [(0.0, &mut low), (0.03, &mut high)] {
+                let reports = run(mean, seed);
+                let (amplitude, period) = cycle_shape(&reports);
+                acc.0 += amplitude;
+                acc.1 += period;
+                acc.2 += reports.iter().map(|r| r.mean_avt).sum::<f64>() / reports.len() as f64;
+            }
+        }
+        let n = seeds.len() as f64;
+        let (low_amp, low_period, low_avt) = (low.0 / n, low.1 / n, low.2 / n);
+        let (high_amp, high_period, high_avt) = (high.0 / n, high.1 / n, high.2 / n);
+
+        assert!(high_avt < low_avt, "the high-yield market runs softer: AvT {high_avt:.3} !< {low_avt:.3}");
+        assert!(high_period > low_period, "and its cycle is longer: period {high_period:.2} !> {low_period:.2}");
+        assert!(high_amp < low_amp, "and its rate index swings less: amplitude {high_amp:.4} !< {low_amp:.4}");
+    }
+
+    #[test]
+    fn opening_capital_earns_the_full_year_and_premium_float_only_the_part_it_is_held() {
+        // #9: what actually earns. Capital is on the balance sheet from day one and
+        // earns the whole year; the year's net underwriting flow is written and run
+        // off across the year, so it earns the float fraction of it. A loss year
+        // deep enough to consume the float earns nothing rather than paying a
+        // negative return on a negative balance.
+        let rate = 0.05;
+        assert!((investment_income(rate, 1_000.0, 0.0) - 50.0).abs() < 1e-12, "opening capital earns the full year");
+        assert!(
+            (investment_income(rate, 1_000.0, 200.0) - rate * (1_000.0 + FLOAT_EARNING_FRACTION * 200.0)).abs() < 1e-12,
+            "the year's float earns the part-year it was held"
+        );
+        assert!(
+            investment_income(rate, 1_000.0, 200.0) < investment_income(rate, 1_200.0, 0.0),
+            "float written mid-year earns less than the same money held from the start"
+        );
+        assert_eq!(investment_income(rate, 100.0, -5_000.0), 0.0, "a wiped-out balance earns nothing, never a negative base");
+        assert!(investment_income(-0.01, 1_000.0, 0.0) < 0.0, "a negative macro rate charges for holding capital");
+        assert_eq!(investment_income(0.0, 1_000.0, 200.0), 0.0, "a zero-yield environment credits nothing");
     }
 }

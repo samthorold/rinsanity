@@ -29,6 +29,17 @@ A syndicate's vector of selectable per-syndicate parameters (AvT responsiveness,
 **Share-appetite**:
 The target win-rate a syndicate's placement-feedback loop seeks: it lifts its AvT multiplier when it wins more than this share and cuts it when it wins less. A selectable genome trait — high appetite chases volume and runs soft, low appetite holds margin.
 
+**Market yield**:
+The exogenous, mean-reverting rate at which a syndicate's capital and premium float earn investment return. Macroeconomic and genuinely outside the market — a scenario input the market responds to, never something the market generates.
+_Avoid_: treating it as a cycle-phase signal; nothing reads it to decide the market is hard or soft.
+
+**Total-return signal**:
+The profitability a syndicate acts on: its underwriting result **plus** its investment income. It is what distributions are released against and what fresh capital reads off the supply curve. Each syndicate's own, computed from its own book and balance — never a market-wide broadcast.
+_Avoid_: "return" unqualified when the underwriting result alone is meant.
+
+**Float**:
+The premium a syndicate holds between writing business and paying claims on it, which earns the market yield while held.
+
 ## Flagged ambiguities
 
 - **"Phenomenon"** was historically used for both substrate checks (e.g. risk pooling, §5 #0) and genuine emergent market behaviours. Resolved: substrate checks are **diagnostic invariants**; only emergent market behaviours are **phenomena**.

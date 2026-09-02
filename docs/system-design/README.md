@@ -224,6 +224,8 @@ The yield is **exogenous**, and this is correct modelling rather than a simplifi
 
 Investment income feeds the **total-return signal** agents act on — the profitability driving distributions, entry, and the AvT feedback loop is underwriting *plus* investment return, not underwriting alone. That is the mechanism by which a high-yield regime softens the hard-market signal.
 
+The signal reaches each mechanism **locally, through the balance sheet**, never as a broadcast. Distributions are released against the syndicate's own total return; entry reads the market's own realised total return off the supply curve; and the AvT loop is touched only because investment income credits capital, capacity headroom is measured against capital, and AvT is re-set off post-distribution headroom. No agent reads the yield to infer a market phase — the yield's only act is to credit or debit a balance.
+
 ## Reserve development — the 3-year account
 
 Claims do not all settle at once. At occurrence a claim splits into a **near-term settled** part and an **IBNR reserve** — an *estimate* of ultimate loss that **develops toward the true ultimate** over the underwriting year's ~3-year life. Each development period debits capital (adverse development, strengthening) or credits it (favourable development, release), with a lag. At the end of the open period, **reinsurance-to-close (RITC)** crystallises the remaining liability and closes the underwriting year.

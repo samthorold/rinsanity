@@ -160,10 +160,16 @@ fn cycle_demonstration() {
     let max_cr = *crs.last().unwrap();
     let cat_years = crs.iter().filter(|&&c| c > 1.0).count();
 
+    let entrants: usize = reports.iter().map(|r| r.entrants).sum();
+    let entry_years: Vec<usize> = reports.iter().filter(|r| r.entrants > 0).map(|r| r.year).collect();
+    let first_capacity = reports[0].solvent_count;
+    let last_capacity = reports.last().unwrap().solvent_count;
+
     println!("Qualitative read:");
     println!("  rate index swings {soft:.2} (soft, below TP) … {hard:.2} (hard, above TP), mean {mean_rate:.2}");
     println!("  crossing its mean {crossings} times — a multi-year oscillation, not a drift");
     println!("  combined ratio is bimodal: benign-year median {median_cr:.2}, {cat_years} cat years spiking to {max_cr:.2}");
+    println!("  capacity {first_capacity} -> {last_capacity} syndicates: {entrants} lagged entrants came online in years {entry_years:?}");
     println!("=> soft markets compete AvT below the floor; a cat collapses headroom and hardens it above;");
     println!("   recovered capital re-softens. Human review confirms the soft → shock → hard → soft shape.");
 }

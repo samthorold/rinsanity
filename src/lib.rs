@@ -1720,12 +1720,15 @@ pub fn experience_modifier(own_losses: f64, expected_losses: f64, n: f64, k: f64
 // multi-decade run — there is no market-phase variable, coordinator, or
 // `AP = TP × f(t)` curve anywhere in here.
 //
-// Deferred (seams documented, end-state design intact): endogenous entry and the
-// rising supply curve (#8 — so the pool only shrinks via insolvency and the run
-// horizon is bounded by attrition); experience rating (modifier ≡ 1, #9); the
-// decomposed GWP→NEP chain (a single expense ratio, reinsurance ceded = 0); and
-// the quarter-day renewal calendar (one annual cohort, all policies incept at 0
-// and expire at 1).
+// Capital turns over inside the loop: distributions release profit at year-end and
+// endogenous entry (#8) commits fresh capital along a rising supply curve, lagged
+// through formation. Exit stays emergent — a syndicate withdraws by pricing itself
+// out or by hitting the zero floor into runoff; there is no leave-the-market event.
+//
+// Deferred (seams documented, end-state design intact): experience rating
+// (modifier ≡ 1, #9); the decomposed GWP→NEP chain (a single expense ratio,
+// reinsurance ceded = 0); and the quarter-day renewal calendar (one annual cohort,
+// all policies incept at 0 and expire at 1).
 // ============================================================================
 
 /// A broker's identity within the market's roster — an index into the brokers.
@@ -1801,6 +1804,99 @@ impl SyndicateAgent {
     }
 }
 
+/// The **population distribution** a market's syndicate genomes are drawn from: a
+/// central genome plus a fractional `spread` of heterogeneity around its selectable
+/// traits. It is the distribution used at market formation, and it is the *only*
+/// source of an entrant's genome (#8) — entry deliberately carries no
+/// survivor-weighted inheritance and no mutation, which belong to selection over
+/// the genome (#12) and are built separately.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GenomePopulation {
+    /// The population's central genome — every draw jitters around this.
+    pub centre: SyndicateGenome,
+    /// Fractional dispersion: a trait is drawn uniformly on `centre · [1 ± spread]`.
+    pub spread: f64,
+}
+
+impl GenomePopulation {
+    /// Draw one genome from the population. Only the *selectable* traits vary —
+    /// the cat model (a syndicate's belief about the cat process, so entrants
+    /// inherit the population's spread of belief, not the truth), share-appetite,
+    /// hurdle rate, AvT responsiveness, herding susceptibility, target line, and
+    /// payout rule. Monte-Carlo trial counts and other numerical calibration are
+    /// carried across unchanged: they are not traits selection acts on.
+    pub fn sample(&self, rng: &mut Rng) -> SyndicateGenome {
+        let mut jitter = |base: f64| base * (1.0 + self.spread * (2.0 * rng.uniform() - 1.0));
+        let c = self.centre;
+        SyndicateGenome {
+            cat_model: CatModel {
+                annual_frequency: jitter(c.cat_model.annual_frequency),
+                min_damage_fraction: jitter(c.cat_model.min_damage_fraction),
+                tail_alpha: jitter(c.cat_model.tail_alpha),
+            },
+            exposure: ExposurePolicy {
+                solvency_fraction: jitter(c.exposure.solvency_fraction),
+                line_fraction: jitter(c.exposure.line_fraction),
+                ..c.exposure
+            },
+            pricing: PricingParams {
+                hurdle_rate: jitter(c.pricing.hurdle_rate),
+                target_loss_ratio: jitter(c.pricing.target_loss_ratio),
+                ..c.pricing
+            },
+            avt: AvtParams {
+                headroom_responsiveness: jitter(c.avt.headroom_responsiveness),
+                feedback_responsiveness: jitter(c.avt.feedback_responsiveness),
+                share_appetite: jitter(c.avt.share_appetite),
+            },
+            distribution: DistributionParams {
+                payout_fraction: jitter(c.distribution.payout_fraction),
+                solvency_floor: jitter(c.distribution.solvency_floor),
+            },
+            herding_susceptibility: jitter(c.herding_susceptibility),
+            target_line: jitter(c.target_line),
+        }
+    }
+}
+
+/// The market's **capital-supply curve** (#8): how much fresh capital commits to
+/// the market at a given observable return, and how long it takes to trade.
+///
+/// The curve **rises** — the easiest capital deploys first and each further unit
+/// demands a progressively higher expected return, so the marginal unit's required
+/// return is `hurdle_return + marginal_return_slope · quantity`. Below the hurdle
+/// nothing commits. Encoding a supply *curve* is legitimate the same way the
+/// technical premium is: it responds to the market's own realised return, never to
+/// a scripted spawn schedule or a designer-set cycle phase.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CapitalSupply {
+    /// The return on capital below which no new capital commits at all.
+    pub hurdle_return: f64,
+    /// How much extra return the marginal unit of capital demands — the slope of
+    /// the rising supply curve. Larger → capital is scarcer / slower to respond.
+    pub marginal_return_slope: f64,
+    /// Years between capital committing and the syndicate it funds writing its
+    /// first business. The lag is what lets a hard market sustain elevated rates
+    /// long enough to attract capital before that capital competes it away (#6).
+    pub formation_lag: usize,
+    /// The capital one new syndicate is founded with. Committed capital forms
+    /// whole syndicates; a remainder too small to found one does not trade.
+    pub entrant_capital: f64,
+    /// The distribution an entrant's genome is drawn from — the same population
+    /// the market was formed from.
+    pub population: GenomePopulation,
+}
+
+/// The capital that commits to the market at an `observed_return`, read off the
+/// rising supply curve: the quantity whose marginal unit is exactly indifferent,
+/// `(observed_return − hurdle) / slope`, and nothing at or below the hurdle.
+pub fn committed_capital(observed_return: f64, supply: &CapitalSupply) -> f64 {
+    if supply.marginal_return_slope <= 0.0 {
+        return 0.0;
+    }
+    ((observed_return - supply.hurdle_return) / supply.marginal_return_slope).max(0.0)
+}
+
 /// A demand-side **insured** in the market: an asset to cover, a risk-aversion
 /// loading (its WTP is risk-aversion × expected loss), and the broker it places
 /// through.
@@ -1840,6 +1936,9 @@ pub struct YearReport {
     /// Number of syndicates still solvent at year-end (the population that sets
     /// the AvT and headroom aggregates above).
     pub solvent_count: usize,
+    /// Syndicates formed at the start of this year — lagged capital coming online
+    /// along the supply curve (#8). Zero in a market with no capital supply wired.
+    pub entrants: usize,
     /// Mean post-distribution capacity headroom across solvent syndicates.
     pub mean_headroom: f64,
     /// Number of true catastrophe events across all territories this year.
@@ -1876,6 +1975,14 @@ pub struct Market {
     panel_size: usize,
     rng: Rng,
     year: usize,
+    /// The capital-supply regime, if this market has endogenous entry wired (#8).
+    capital_supply: Option<CapitalSupply>,
+    /// Capital that has committed but not yet finished forming: `(year it can
+    /// first trade, amount)`.
+    forming: Vec<(usize, f64)>,
+    /// Committed capital not yet large enough to found a syndicate — it waits in
+    /// the formation queue and joins the next tranche that can fund one.
+    unformed_capital: f64,
 }
 
 impl Market {
@@ -1891,7 +1998,41 @@ impl Market {
         rng: Rng,
     ) -> Self {
         let capitals = agents.iter().map(|a| Syndicate::with_capital(a.initial_capital)).collect();
-        Market { agents, capitals, brokers, territories, attritional, expense_ratio, panel_size, rng, year: 0 }
+        Market {
+            agents,
+            capitals,
+            brokers,
+            territories,
+            attritional,
+            expense_ratio,
+            panel_size,
+            rng,
+            year: 0,
+            capital_supply: None,
+            forming: Vec::new(),
+            unformed_capital: 0.0,
+        }
+    }
+
+    /// Wire **endogenous entry** (#8) onto the market: from here on, each year-end
+    /// reads the market's own realised return on capital, commits whatever the
+    /// rising supply curve offers at that return, and instantiates the resulting
+    /// syndicates once they clear the formation lag. Without a supply the pool
+    /// only ever shrinks (through insolvency), which is the pre-#8 behaviour.
+    pub fn with_capital_supply(mut self, supply: CapitalSupply) -> Self {
+        self.capital_supply = Some(supply);
+        self
+    }
+
+    /// The market's capital-supply regime, if endogenous entry is wired (#8).
+    pub fn capital_supply(&self) -> Option<CapitalSupply> {
+        self.capital_supply
+    }
+
+    /// How many syndicates are on the market's roster (solvent, in runoff, or
+    /// newly formed) — it grows as lagged entrants come online.
+    pub fn roster_size(&self) -> usize {
+        self.agents.len()
     }
 
     /// The next year to be simulated (0 before the first [`step_year`](Self::step_year)).
@@ -1902,6 +2043,13 @@ impl Market {
     /// A syndicate's current capital balance.
     pub fn capital(&self, id: SyndicateId) -> f64 {
         self.capitals[id.0].capital()
+    }
+
+    /// A broker's current relationship score with a syndicate. A syndicate the
+    /// broker has never traded with — every entrant, on the day it forms — scores
+    /// zero.
+    pub fn relationship(&self, broker: BrokerId, syndicate: SyndicateId) -> f64 {
+        self.brokers[broker.0].relationship(syndicate)
     }
 
     /// A syndicate's current AvT multiplier.
@@ -1932,9 +2080,41 @@ impl Market {
             panel_size,
             rng,
             year,
+            capital_supply,
+            forming,
+            unformed_capital,
         } = self;
         let expense_ratio = *expense_ratio;
         let panel_size = *panel_size;
+
+        // --- Entry: capital that has cleared the formation lag comes online ----
+        // Entrants are instantiated BEFORE renewal, so their first act is to
+        // compete for this year's business. They arrive with fresh capital, a
+        // genome drawn from the population distribution, an AvT on the technical
+        // floor, and NO broker relationships — every broker's roster scores an
+        // unknown syndicate zero, so an entrant is shortlisted rarely at first and
+        // has to build its book over years (the relational half of the lag, #6).
+        let mut entrants = 0usize;
+        if let Some(supply) = capital_supply.as_ref() {
+            let ready: f64 = forming
+                .iter()
+                .filter(|(ready_year, _)| *ready_year <= *year)
+                .map(|(_, amount)| *amount)
+                .sum();
+            forming.retain(|(ready_year, _)| *ready_year > *year);
+            if supply.entrant_capital > 0.0 {
+                let count = (ready / supply.entrant_capital).floor() as usize;
+                for _ in 0..count {
+                    let genome = supply.population.sample(rng);
+                    agents.push(SyndicateAgent::new(supply.entrant_capital, genome));
+                    capitals.push(Syndicate::with_capital(supply.entrant_capital));
+                    entrants += 1;
+                }
+            }
+        }
+
+        // Opening capital: the base the year's return on capital is measured over.
+        let opening_capital: f64 = capitals.iter().map(|c| c.capital()).sum();
 
         for agent in agents.iter_mut() {
             agent.reset_year();
@@ -2171,6 +2351,29 @@ impl Market {
             }
         }
 
+        // --- Entry: this year's return commits capital along the supply curve --
+        // The signal is the market's OWN realised total return on capital — for
+        // now the underwriting result alone (investment income joins it in #9).
+        // It is an observable market outcome, not a cycle phase: nothing here
+        // knows whether the market is hard or soft.
+        if let Some(supply) = capital_supply.as_ref() {
+            let market_return = if opening_capital > 0.0 {
+                (total_premium - total_losses) / opening_capital
+            } else {
+                0.0
+            };
+            *unformed_capital += committed_capital(market_return, supply);
+            // Capital forms **whole syndicates**: a commitment too small to found
+            // one waits in the queue for the next, so a run of good years can fund
+            // an entrant that no single year would have.
+            if supply.entrant_capital > 0.0 && *unformed_capital >= supply.entrant_capital {
+                let count = (*unformed_capital / supply.entrant_capital).floor();
+                let funded = count * supply.entrant_capital;
+                *unformed_capital -= funded;
+                forming.push((*year + 1 + supply.formation_lag, funded));
+            }
+        }
+
         let mean_avt = if avt_values.is_empty() { 0.0 } else { avt_values.iter().sum::<f64>() / avt_values.len() as f64 };
         let avt_spread = population_std(&avt_values, mean_avt);
         let report = YearReport {
@@ -2180,6 +2383,7 @@ impl Market {
             rate_index: if sum_tp > 0.0 { sum_ap / sum_tp } else { 1.0 },
             combined_ratio: if total_premium > 0.0 { total_losses / total_premium } else { 0.0 },
             solvent_count,
+            entrants,
             mean_headroom: if solvent_count > 0 { mean_headroom_acc / solvent_count as f64 } else { 0.0 },
             cat_events: cat_event_count,
             placements: bound_layers,
@@ -2200,14 +2404,14 @@ impl Market {
 impl YearReport {
     /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
     pub const CSV_HEADER: &'static str =
-        "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,mean_headroom,cat_events,placements,gross_premium,incurred_losses";
+        "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,mean_headroom,cat_events,placements,gross_premium,incurred_losses";
 
     /// The year's diagnostics as ordered `(column, value)` pairs — the single
     /// source of truth for column order and per-field formatting that both
     /// [`csv_row`](Self::csv_row) and [`reports_to_json`] render from, so the CSV
     /// and JSON emissions can never drift out of sync. Every value is a bare JSON
     /// number (no quoting needed); the keys match [`CSV_HEADER`](Self::CSV_HEADER).
-    fn columns(&self) -> [(&'static str, String); 11] {
+    fn columns(&self) -> [(&'static str, String); 12] {
         [
             ("year", self.year.to_string()),
             ("mean_avt", format!("{:.6}", self.mean_avt)),
@@ -2215,6 +2419,7 @@ impl YearReport {
             ("rate_index", format!("{:.6}", self.rate_index)),
             ("combined_ratio", format!("{:.6}", self.combined_ratio)),
             ("solvent_count", self.solvent_count.to_string()),
+            ("entrants", self.entrants.to_string()),
             ("mean_headroom", format!("{:.6}", self.mean_headroom)),
             ("cat_events", self.cat_events.to_string()),
             ("placements", self.placements.to_string()),
@@ -2281,21 +2486,21 @@ pub fn reports_to_json(reports: &[YearReport]) -> String {
 /// specific constants are calibration in the code — the *forms* are the design.
 pub fn demonstration_market(seed: u64) -> Market {
     let appetites = [0.35, 0.4, 0.45, 0.5, 0.5, 0.55, 0.6, 0.65, 0.45, 0.55];
+    let genome_of = |i: usize, a: f64| -> SyndicateGenome {
+        SyndicateGenome {
+            cat_model: CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 },
+            exposure: ExposurePolicy { return_period: 200.0, solvency_fraction: 0.45, line_fraction: 0.5, tail_trials: 120 },
+            pricing: PricingParams { hurdle_rate: 0.08 + 0.01 * (i % 4) as f64, credibility_k: 50.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 120 },
+            avt: AvtParams { headroom_responsiveness: 0.35 + 0.1 * (i % 3) as f64, feedback_responsiveness: 0.25, share_appetite: a },
+            distribution: DistributionParams { payout_fraction: 0.5, solvency_floor: 200.0 },
+            herding_susceptibility: 0.5,
+            target_line: 0.55,
+        }
+    };
     let syndicates: Vec<SyndicateAgent> = appetites
         .iter()
         .enumerate()
-        .map(|(i, &a)| {
-            let genome = SyndicateGenome {
-                cat_model: CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 },
-                exposure: ExposurePolicy { return_period: 200.0, solvency_fraction: 0.45, line_fraction: 0.5, tail_trials: 120 },
-                pricing: PricingParams { hurdle_rate: 0.08 + 0.01 * (i % 4) as f64, credibility_k: 50.0, target_loss_ratio: 0.6, return_period: 200.0, tail_trials: 120 },
-                avt: AvtParams { headroom_responsiveness: 0.35 + 0.1 * (i % 3) as f64, feedback_responsiveness: 0.25, share_appetite: a },
-                distribution: DistributionParams { payout_fraction: 0.5, solvency_floor: 200.0 },
-                herding_susceptibility: 0.5,
-                target_line: 0.55,
-            };
-            SyndicateAgent::new(280.0, genome)
-        })
+        .map(|(i, &a)| SyndicateAgent::new(FOUNDING_CAPITAL, genome_of(i, a)))
         .collect();
     let n = syndicates.len();
     let brokers = vec![
@@ -2324,7 +2529,23 @@ pub fn demonstration_market(seed: u64) -> Market {
         4,
         Rng::seeded(seed),
     )
+    .with_capital_supply(CapitalSupply {
+        // Fresh capital wants a clear premium over the founders' own hurdle before
+        // it commits, and each further unit demands more: a very good year pulls in
+        // a couple of syndicates, an ordinary one none.
+        hurdle_return: 0.04,
+        marginal_return_slope: 0.0002,
+        formation_lag: 3,
+        entrant_capital: FOUNDING_CAPITAL,
+        // Entrants are drawn from the same population the founders were: the
+        // mid-population genome, jittered across the founders' own spread.
+        population: GenomePopulation { centre: genome_of(1, 0.5), spread: 0.25 },
+    })
 }
+
+/// The capital a founding syndicate — and every later entrant — is endowed with in
+/// the demonstration market.
+const FOUNDING_CAPITAL: f64 = 280.0;
 
 /// Attribute a panel's settlements back to the agents' loss/premium tallies. The
 /// substrate guarantees the loss-settlement invariants on the settlements; this
@@ -4452,6 +4673,36 @@ mod tests {
         assert!(120.0 - released >= params.solvency_floor, "capital never falls below the floor");
     }
 
+
+    // --- Capital lifecycle: endogenous entry (#8) ----------------------------
+
+    #[test]
+    fn no_capital_commits_at_or_below_the_hurdle_and_supply_rises_with_the_return() {
+        // #8: entry responds to the market's own observable return along a RISING
+        // supply curve — the easiest capital deploys first and the marginal unit
+        // demands a progressively higher return. Below the hurdle nothing forms.
+        let supply = CapitalSupply {
+            hurdle_return: 0.08,
+            marginal_return_slope: 0.0002,
+            formation_lag: 2,
+            entrant_capital: 500.0,
+            population: GenomePopulation { centre: test_genome(0.5), spread: 0.2 },
+        };
+
+        assert_eq!(committed_capital(0.02, &supply), 0.0, "a return below the hurdle attracts no capital");
+        assert_eq!(committed_capital(0.08, &supply), 0.0, "at the hurdle the marginal unit is indifferent");
+
+        let modest = committed_capital(0.10, &supply);
+        let rich = committed_capital(0.16, &supply);
+        assert!(modest > 0.0, "a return above the hurdle attracts capital, got {modest}");
+        assert!(rich > modest, "more attractive returns pull in more capital: {rich} !> {modest}");
+
+        // Rising curve: the marginal unit of the larger commitment demands a
+        // strictly higher return than the marginal unit of the smaller one.
+        let marginal = |q: f64| supply.hurdle_return + supply.marginal_return_slope * q;
+        assert!(marginal(rich) > marginal(modest), "the supply curve rises");
+    }
+
     // --- The annual market engine -------------------------------------------
 
     fn test_genome(appetite: f64) -> SyndicateGenome {
@@ -4648,6 +4899,163 @@ mod tests {
         assert!(median < 0.5, "benign years dominate (low median CR): {median}");
         assert!(max_cr > 1.5, "cat years spike the CR well above unity: {max_cr}");
         assert!((4..=24).contains(&cat_years), "cat years are a real minority, got {cat_years} of 60");
+    }
+
+
+    #[test]
+    fn a_genome_drawn_from_the_population_varies_around_the_population_centre() {
+        // #8 scope guard: an entrant's genome is drawn from the SAME population
+        // distribution the market was formed from — no survivor-weighted
+        // inheritance, no mutation (that is #12/#14's job). Draws are
+        // heterogeneous and stay inside the population's support.
+        let population = GenomePopulation { centre: test_genome(0.5), spread: 0.3 };
+        let mut rng = Rng::seeded(17);
+
+        let a = population.sample(&mut rng);
+        let b = population.sample(&mut rng);
+        assert!(a != b, "successive draws are heterogeneous, not clones of the centre");
+
+        let centre = test_genome(0.5);
+        for _ in 0..200 {
+            let g = population.sample(&mut rng);
+            let within = |drawn: f64, base: f64| drawn >= base * 0.7 - 1e-9 && drawn <= base * 1.3 + 1e-9;
+            assert!(within(g.avt.share_appetite, centre.avt.share_appetite), "share-appetite inside the population support: {}", g.avt.share_appetite);
+            assert!(within(g.pricing.hurdle_rate, centre.pricing.hurdle_rate), "hurdle rate inside the population support: {}", g.pricing.hurdle_rate);
+            assert!(within(g.cat_model.annual_frequency, centre.cat_model.annual_frequency), "cat-model frequency inside the population support: {}", g.cat_model.annual_frequency);
+            assert!(within(g.cat_model.tail_alpha, centre.cat_model.tail_alpha), "cat-model tail alpha inside the population support: {}", g.cat_model.tail_alpha);
+            assert!(g.exposure.tail_trials == centre.exposure.tail_trials, "non-selectable calibration is carried, not jittered");
+        }
+    }
+
+
+    #[test]
+    fn committed_capital_only_trades_after_the_formation_lag() {
+        // #8: entry is lagged. Capital that commits at the end of a profitable year
+        // cannot underwrite until it has been through formation, so no entrant
+        // appears for `formation_lag` years however attractive the return is.
+        let lag = 3;
+        let supply = CapitalSupply {
+            hurdle_return: 0.002,
+            marginal_return_slope: 0.00001,
+            formation_lag: lag,
+            entrant_capital: 400.0,
+            population: GenomePopulation { centre: test_genome(0.5), spread: 0.25 },
+        };
+        let mut market = small_market(5).with_capital_supply(supply);
+        let reports = market.run(12);
+
+        for r in &reports[..lag] {
+            assert_eq!(r.entrants, 0, "year {} is inside the formation lag, no capacity can trade yet", r.year);
+        }
+        assert!(reports.iter().any(|r| r.entrants > 0), "lagged capital eventually comes online");
+        assert!(
+            reports.last().unwrap().solvent_count > reports[0].solvent_count,
+            "the pool grows as entrants come online: {} !> {}",
+            reports.last().unwrap().solvent_count,
+            reports[0].solvent_count
+        );
+    }
+
+
+    #[test]
+    fn an_entrant_starts_with_fresh_capital_and_no_broker_relationships() {
+        // #8: new capacity instantiates as a NEW syndicate — fresh capital (not a
+        // slice of an incumbent's), a genome drawn from the population, and no
+        // broker relationships at all, so it must earn its way onto shortlists
+        // over years rather than arriving with an incumbent's book.
+        let supply = CapitalSupply {
+            hurdle_return: 0.002,
+            marginal_return_slope: 0.00001,
+            formation_lag: 2,
+            entrant_capital: 400.0,
+            population: GenomePopulation { centre: test_genome(0.5), spread: 0.25 },
+        };
+        let mut market = small_market(5).with_capital_supply(supply);
+        let incumbents = market.roster_size();
+        let reports = market.run(6);
+
+        let entry_year = reports.iter().position(|r| r.entrants > 0).expect("capital comes online");
+        assert!(market.roster_size() > incumbents, "the roster grows with entrants");
+
+        let entrant = SyndicateId(incumbents);
+        assert!(market.capital(entrant) > 0.0, "an entrant is founded with fresh capital");
+        for i in 0..incumbents {
+            assert!(
+                market.capital(entrant) < market.capital(SyndicateId(i)),
+                "entrant capital is fresh and small, not an incumbent's balance"
+            );
+            for b in 0..2 {
+                assert!(
+                    market.relationship(BrokerId(b), entrant) < market.relationship(BrokerId(b), SyndicateId(i)),
+                    "broker {b} still trusts incumbent {i} over the entrant that arrived in year {entry_year} with no relationships"
+                );
+            }
+        }
+    }
+
+
+    #[test]
+    fn a_multi_decade_run_grows_capacity_only_through_lagged_entry_and_re_softens() {
+        // #6/#8 over decades in the reference market. Capacity is supplied by
+        // endogenous entry alone: the roster grows ONLY in years lagged capital
+        // comes online, never by fiat, and no syndicate ever withdraws (there is no
+        // exit mechanism — a departure could only be the zero floor). As entrants
+        // build capacity the market re-softens: headroom is abundant and the mean
+        // ask sits further below the technical floor late in the run than early.
+        let mut market = demonstration_market(2024);
+        let reports = market.run(60);
+
+        let entrants: usize = reports.iter().map(|r| r.entrants).sum();
+        assert!(entrants > 0, "capital commits and comes online over the run");
+        assert_eq!(
+            market.roster_size(),
+            10 + entrants,
+            "the roster is the founders plus every entrant — nothing ever leaves it"
+        );
+
+        // Capacity only ever arrives through formation: solvent_count rises in an
+        // entry year and never rises on its own.
+        for w in reports.windows(2) {
+            if w[1].solvent_count > w[0].solvent_count {
+                assert!(w[1].entrants > 0, "year {} gained capacity without an entrant", w[1].year);
+            }
+        }
+
+        // The formation lag: no capacity can trade before capital has committed
+        // (year-end of year 0 at the earliest) and been through formation.
+        let lag = market.capital_supply().expect("the reference market has a capital supply").formation_lag;
+        for r in &reports[..=lag] {
+            assert_eq!(r.entrants, 0, "year {} is inside the formation lag", r.year);
+        }
+
+        // Re-softening: the late market carries more free capacity and a softer
+        // ask than the early one — the entrants competed the hard phase away.
+        let mean = |slice: &[YearReport], f: fn(&YearReport) -> f64| slice.iter().map(f).sum::<f64>() / slice.len() as f64;
+        let early_headroom = mean(&reports[..20], |r| r.mean_headroom);
+        let late_headroom = mean(&reports[40..], |r| r.mean_headroom);
+        let early_avt = mean(&reports[..20], |r| r.mean_avt);
+        let late_avt = mean(&reports[40..], |r| r.mean_avt);
+        assert!(late_headroom > early_headroom, "capacity is restored: headroom {early_headroom} → {late_headroom}");
+        assert!(late_avt < early_avt, "the market re-softens as capacity arrives: AvT {early_avt} → {late_avt}");
+    }
+
+
+    #[test]
+    fn an_entrant_builds_broker_relationships_from_zero_over_the_years() {
+        // #6/#7's relational ramp: an entrant arrives unknown to every broker and
+        // is shortlisted only rarely, but each placement it does win lifts its
+        // score — so the survivors' post-cat grip on the panels erodes as entrants
+        // build relationships. Nothing grants the entrant a book; it earns one.
+        let mut market = demonstration_market(2024);
+        let founders = market.roster_size();
+        market.run(20);
+        let entrant = SyndicateId(founders);
+        assert!(market.roster_size() > founders, "an entrant comes online inside 20 years");
+
+        let ramp: f64 = (0..3).map(|b| market.relationship(BrokerId(b), entrant)).sum();
+        assert!(ramp > 0.0, "the entrant has built relationships from a standing start, got {ramp}");
+        let incumbent: f64 = (0..3).map(|b| market.relationship(BrokerId(b), SyndicateId(0))).sum();
+        assert!(ramp < incumbent, "but still trails a founder's relationships: {ramp} !< {incumbent}");
     }
 
     #[test]

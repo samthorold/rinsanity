@@ -17,8 +17,10 @@ use std::process::ExitCode;
 
 use rinsanity::{
     anchored_quote, attritional_aggregate_samples, catastrophe_aggregate_samples,
-    coefficient_of_variation, demonstration_market, follower_weight, reports_to_csv,
-    reports_to_json, AttritionalPeril, Broker, CatastrophePeril, RelationshipOutcome, Rng,
+    coefficient_of_variation, demonstration_genome, demonstration_market, follower_weight, homogeneity_rows_to_csv,
+    homogeneity_rows_to_json, reports_to_csv, reports_to_json, run_homogeneity_sweep,
+    AttritionalPeril, Broker, CatBeliefPopulation, CatastrophePeril, HomogeneitySweep,
+    RelationshipOutcome, Rng,
     SyndicateId, YieldProcess, BASELINE_YIELD,
 };
 
@@ -27,7 +29,11 @@ rinsanity — emergent underwriting-cycle simulation
 
 USAGE:
     rinsanity cycle [--seed <u64>] [--years <usize>] [--yield-mean <f64>]
+                    [--bias <f64>] [--spread <f64>] [--herding <f64>]
                     [--format csv|json] [--out <path>]
+    rinsanity homogeneity [--seed <u64>] [--seeds <usize>] [--years <usize>]
+                          [--bias <f64>] [--spread <f64>] [--herding <f64>]
+                          [--format csv|json] [--out <path>]
     rinsanity diagnostics            # human demonstrations + qualitative cycle read
     rinsanity [--explain]            # alias for diagnostics (default)
 
@@ -42,14 +48,51 @@ cycle:
                         environment is a scenario input: holding --seed fixed and
                         varying only this is the controlled high-yield vs low-yield
                         experiment (default 0.045, the calibrated baseline)
+    --bias   <f64>      shared bias of the market's cat models from the true cat
+                        process (#14). Negative is optimistic (default 0.0)
+    --spread <f64>      heterogeneity spread of those cat models (default 0.0 —
+                        every syndicate holds the same model)
+    --herding <f64>     pin every syndicate's herding susceptibility
     --format csv|json   csv (header + rows) or json (array of objects) (default csv)
     --out    <path>     write to a file instead of stdout
+
+homogeneity:
+    The cat-model homogeneity sweep (#14). Runs the reference market once per arm
+    per seed and emits ONE row per arm-seed — the 2x2 of belief homogeneity against
+    shared bias, everything else held equal. Schema: HomogeneityRow::CSV_HEADER.
+
+    --seed    <u64>     first seed; the sweep runs --seeds consecutive seeds (default 2024)
+    --seeds   <usize>   how many consecutive seeds to run each arm at (default 8)
+    --years   <usize>   number of years per run (default 40)
+    --bias    <f64>     the biased arms' shared bias from the true cat process.
+                        Negative is optimistic; the believed annual cat load scales
+                        as (1 + bias)^3. Failures first appear around -0.35 and
+                        are reliable by -0.55 (default -0.55)
+    --spread  <f64>     the scattered arms' heterogeneity spread. The homogeneous
+                        arms are pinned at 0.02 (default 0.45)
+    --herding <f64>     pin every syndicate's herding susceptibility. Pinning it at
+                        0 removes the price channel, so anything left is belief
+                        (default: leave the reference market's own values)
+    --capital-scale <f64>
+                        scale every arm's capital endowment (founders, entrants and
+                        the distribution floor) by this factor. Not part of the
+                        experiment — it sets how thickly capitalised the market the
+                        experiment runs in is (default 1.0, the reference market)
+    --format csv|json   csv (header + rows) or json (array of objects) (default csv)
+    --out     <path>    write to a file instead of stdout
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("cycle") => match run_cycle(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("error: {msg}\n\n{USAGE}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("homogeneity") => match run_homogeneity(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
                 eprintln!("error: {msg}\n\n{USAGE}");
@@ -80,6 +123,9 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
     let mut format = Format::Csv;
     let mut out: Option<String> = None;
     let mut yield_mean: Option<f64> = None;
+    let mut bias: f64 = 0.0;
+    let mut spread: f64 = 0.0;
+    let mut herding: Option<f64> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -101,6 +147,21 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
                 yield_mean = Some(raw.parse().map_err(|_| format!("invalid --yield-mean '{raw}'"))?);
                 i += 2;
             }
+            "--bias" => {
+                let raw = value(i)?;
+                bias = raw.parse().map_err(|_| format!("invalid --bias '{raw}'"))?;
+                i += 2;
+            }
+            "--spread" => {
+                let raw = value(i)?;
+                spread = raw.parse().map_err(|_| format!("invalid --spread '{raw}'"))?;
+                i += 2;
+            }
+            "--herding" => {
+                let raw = value(i)?;
+                herding = Some(raw.parse().map_err(|_| format!("invalid --herding '{raw}'"))?);
+                i += 2;
+            }
             "--format" => {
                 format = value(i)?.parse()?;
                 i += 2;
@@ -116,6 +177,18 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
     // The yield path keeps its own generator, so overriding the regime shifts the
     // macro environment and nothing else — the underwriting world is untouched.
     let mut market = demonstration_market(seed);
+    if bias != 0.0 || spread != 0.0 {
+        // The belief knobs (#14) reach the market only here, at construction: the
+        // scenario centres the population on the true process and offsets it.
+        market = market.with_cat_beliefs(CatBeliefPopulation {
+            centre: demonstration_genome().cat_model,
+            heterogeneity_spread: spread,
+            shared_bias: bias,
+        });
+    }
+    if let Some(h) = herding {
+        market = market.with_herding_susceptibility(h);
+    }
     if let Some(mean) = yield_mean {
         market = market.with_yield_process(YieldProcess { mean, initial: mean, ..BASELINE_YIELD });
     }
@@ -125,6 +198,97 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
         Format::Json => reports_to_json(&reports),
     };
 
+    match out {
+        Some(path) => std::fs::write(&path, format!("{body}\n")).map_err(|e| format!("writing {path}: {e}"))?,
+        None => println!("{body}"),
+    }
+    Ok(())
+}
+
+/// The homogeneity sweep's machine-readable surface (#14): parse the arm knobs,
+/// run every arm at every seed on the reference market, and emit one row apiece.
+///
+/// The knobs reach the market through the belief population only — same seed, same
+/// insureds, same true cat process, same macro yield in every arm — so a difference
+/// between two rows is a difference in belief and nothing else.
+fn run_homogeneity(args: &[String]) -> Result<(), String> {
+    let mut seed: u64 = 2024;
+    let mut seeds: usize = 8;
+    let mut years: usize = 40;
+    let mut bias: f64 = -0.55;
+    let mut spread: f64 = 0.45;
+    let mut herding: Option<f64> = None;
+    let mut capital_scale: f64 = 1.0;
+    let mut format = Format::Csv;
+    let mut out: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let value = |i: usize| -> Result<&String, String> {
+            args.get(i + 1).ok_or_else(|| format!("{flag} requires a value"))
+        };
+        let number = |i: usize| -> Result<f64, String> {
+            let raw = value(i)?;
+            raw.parse().map_err(|_| format!("invalid {flag} '{raw}'"))
+        };
+        match flag {
+            "--seed" => {
+                let raw = value(i)?;
+                seed = raw.parse().map_err(|_| format!("invalid --seed '{raw}'"))?;
+                i += 2;
+            }
+            "--seeds" => {
+                let raw = value(i)?;
+                seeds = raw.parse().map_err(|_| format!("invalid --seeds '{raw}'"))?;
+                i += 2;
+            }
+            "--years" => {
+                let raw = value(i)?;
+                years = raw.parse().map_err(|_| format!("invalid --years '{raw}'"))?;
+                i += 2;
+            }
+            "--bias" => {
+                bias = number(i)?;
+                i += 2;
+            }
+            "--spread" => {
+                spread = number(i)?;
+                i += 2;
+            }
+            "--herding" => {
+                herding = Some(number(i)?);
+                i += 2;
+            }
+            "--capital-scale" => {
+                capital_scale = number(i)?;
+                i += 2;
+            }
+            "--format" => {
+                format = value(i)?.parse()?;
+                i += 2;
+            }
+            "--out" => {
+                out = Some(value(i)?.clone());
+                i += 2;
+            }
+            other => return Err(format!("unknown homogeneity option '{other}'")),
+        }
+    }
+
+    let sweep = HomogeneitySweep::reference(
+        years,
+        (0..seeds as u64).map(|k| seed + k).collect(),
+        bias,
+        spread,
+        herding,
+        capital_scale,
+    );
+    let rows = run_homogeneity_sweep(&sweep);
+    let body = match format {
+        Format::Csv => homogeneity_rows_to_csv(&rows),
+        Format::Json => homogeneity_rows_to_json(&rows),
+    };
     match out {
         Some(path) => std::fs::write(&path, format!("{body}\n")).map_err(|e| format!("writing {path}: {e}"))?,
         None => println!("{body}"),

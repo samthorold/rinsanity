@@ -75,6 +75,20 @@ _Avoid_: calling it a "default loss"; the reinsurer is not in breach, it is exha
 **Ceded premium**:
 The reinsurance premium a primary pays out — an explicit deduction in the gross-to-net statement between gross written and net earned premium, never folded into a blended expense ratio.
 
+**Cat-belief population**:
+The market-level distribution a syndicate's *cat model* is drawn from, held separately from the general genome population so belief dispersion can be varied with every other trait pinned. It governs founders and entrants alike.
+_Avoid_: folding it into the genome spread — that contaminates the experiment.
+
+**Heterogeneity spread**:
+The fractional dispersion of cat models across the population: how much syndicates disagree about the cat process. Zero is perfect homogeneity. It scatters belief at an unchanged population average — it is not a knob on how wrong the market is, only on how much it agrees with itself.
+
+**Shared bias**:
+The population's common offset of belief *from the true cat process*, signed so negative is optimistic (catastrophes believed rarer, smaller and lighter-tailed than they are). It is applied when a belief is **constructed**, never read at runtime — no agent ever observes the truth. It is what makes homogeneity dangerous rather than merely uniform: homogeneous-and-correct is harmless, homogeneous-and-biased is the systemic-risk condition.
+_Avoid_: calling a single syndicate's model error a "shared bias"; the bias is a property of the population.
+
+**Believed annual cat load**:
+The expected catastrophe damage fraction per exposed asset per year *under a syndicate's own cat model* — frequency times the believed mean event damage. The one scalar the two knobs move: a shared bias `b` scales it by `(1 + b)³`, while the heterogeneity spread leaves its population average alone.
+
 **Float**:
 The premium a syndicate holds between writing business and paying claims on it, which earns the market yield while held.
 

@@ -791,6 +791,27 @@ impl CatModel {
         pareto_damage_fraction(self.min_damage_fraction, self.tail_alpha, rng)
     }
 
+    /// The **believed annual cat load**: the expected catastrophe damage fraction
+    /// per exposed asset per year under this model, `frequency · E[damage]` with
+    /// the Pareto mean `x_m · α / (α − 1)` (a tail index at or below 1 has no
+    /// finite mean, so the belief is capped at total loss). One scalar summarising
+    /// how expensive this model thinks catastrophe is — the figure a biased
+    /// population understates in unison.
+    pub fn believed_annual_load(&self) -> f64 {
+        self.annual_frequency * self.believed_mean_damage()
+    }
+
+    /// The believed **mean damage fraction** of one event: the Pareto mean
+    /// `x_m · α / (α − 1)`. A tail index at or below one has no finite mean, so the
+    /// belief is capped at a total loss.
+    pub fn believed_mean_damage(&self) -> f64 {
+        if self.tail_alpha > 1.0 {
+            (self.min_damage_fraction * self.tail_alpha / (self.tail_alpha - 1.0)).min(1.0)
+        } else {
+            1.0
+        }
+    }
+
     /// The believed number of catastrophe events in one year for a zone: a
     /// Poisson count with mean [`annual_frequency`](Self::annual_frequency).
     fn annual_event_count(&self, rng: &mut Rng) -> usize {
@@ -2086,6 +2107,96 @@ struct ReservingRoll {
     closed: Vec<f64>,
 }
 
+/// The **cat-belief population** (#14): the market-level distribution a syndicate's
+/// *cat model* — its belief about the true cat process — is drawn from, held
+/// separately from the general genome population so belief dispersion can be varied
+/// with every other trait pinned.
+///
+/// Two knobs, and the pair is the whole experiment:
+///
+///   * the **heterogeneity spread** — fractional dispersion of belief across the
+///     population, so a low spread means every syndicate holds nearly the same model;
+///   * the **shared bias** — a single common offset of that model *from the truth*,
+///     so the whole population is wrong in the same direction at once.
+///
+/// Homogeneous **and** correct is harmless; homogeneous **and** biased is the
+/// systemic-risk condition. The bias is applied when a belief is *constructed*,
+/// never read at runtime: no agent ever observes the cat process.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CatBeliefPopulation {
+    /// The population's central cat model *before* the shared bias — in a
+    /// well-calibrated market, numerically the true cat process.
+    pub centre: CatModel,
+    /// Fractional dispersion of belief around the biased centre: a parameter is
+    /// drawn uniformly on `centre · [1 ± heterogeneity_spread]`. Zero is perfect
+    /// homogeneity.
+    pub heterogeneity_spread: f64,
+    /// The population's common offset from the truth, signed so that **negative is
+    /// optimistic** (the market believes catastrophes are rarer, smaller and
+    /// lighter-tailed than they are) and positive pessimistic. Zero is a correctly
+    /// calibrated population.
+    pub shared_bias: f64,
+}
+
+impl CatBeliefPopulation {
+    /// A perfectly calibrated, perfectly homogeneous population: every draw is the
+    /// centre. The reference market's default, and the arm every biased arm is
+    /// read against.
+    pub fn calibrated(centre: CatModel) -> Self {
+        Self { centre, heterogeneity_spread: 0.0, shared_bias: 0.0 }
+    }
+
+    /// The population's **biased centre**: the shared offset applied to the centre,
+    /// before any heterogeneity.
+    pub fn biased_centre(&self) -> CatModel {
+        let b = 1.0 + self.shared_bias;
+        let c = self.centre;
+        cat_model_from_load(c.annual_frequency * b, c.min_damage_fraction * b, c.believed_mean_damage() * b * b)
+    }
+
+    /// Draw one syndicate's cat model: the biased centre, jittered uniformly across
+    /// the heterogeneity spread.
+    ///
+    /// Both knobs act on the three quantities a cat model *costs* risk with — the
+    /// event frequency, the minimum damage, and the mean damage — and the tail index
+    /// is then derived from the last two. That is deliberate: jittering `tail_alpha`
+    /// directly is not load-neutral (the Pareto mean `α/(α−1)` is sharply convex, so
+    /// symmetric dispersion in alpha is a systematic *increase* in believed cost),
+    /// and a heterogeneity knob that also moved the population's average belief
+    /// would confound the two knobs the experiment is trying to separate. Here the
+    /// spread scatters belief at an unchanged average and the bias moves the
+    /// average — the market's believed cat load scales as `(1 + shared_bias)³`.
+    ///
+    /// Always consumes exactly three uniforms, whatever the knobs are set to, so an
+    /// arm's random stream does not depend on its settings.
+    pub fn sample(&self, rng: &mut Rng) -> CatModel {
+        let centre = self.centre;
+        let b = 1.0 + self.shared_bias;
+        let mut jitter = |base: f64| base * (1.0 + self.heterogeneity_spread * (2.0 * rng.uniform() - 1.0));
+        let frequency = jitter(centre.annual_frequency * b);
+        let min_damage = jitter(centre.min_damage_fraction * b);
+        // The mean carries the bias twice: once with the scale, once against the
+        // tail. An optimistic population therefore believes catastrophes are rarer,
+        // smaller AND lighter-tailed, which is what a shared model error looks like.
+        let mean_damage = jitter(centre.believed_mean_damage() * b * b);
+        cat_model_from_load(frequency, min_damage, mean_damage)
+    }
+}
+
+/// Build a cat model from the three quantities it costs risk with — event
+/// frequency, minimum damage `x_m`, and mean damage — by inverting the Pareto mean
+/// `m = x_m · α / (α − 1)` for the tail index. A mean at or below the scale is not
+/// a Pareto at all, so it is floored just above it (an extremely light tail).
+fn cat_model_from_load(frequency: f64, min_damage: f64, mean_damage: f64) -> CatModel {
+    let min_damage = min_damage.clamp(1e-6, 1.0);
+    let mean_damage = mean_damage.max(min_damage * 1.000_001);
+    CatModel {
+        annual_frequency: frequency.max(0.0),
+        min_damage_fraction: min_damage,
+        tail_alpha: (mean_damage / (mean_damage - min_damage)).clamp(1.000_001, 1_000.0),
+    }
+}
+
 /// The **population distribution** a market's syndicate genomes are drawn from: a
 /// central genome plus a fractional `spread` of heterogeneity around its selectable
 /// traits. It is the distribution used at market formation, and it is the *only*
@@ -2097,10 +2208,27 @@ pub struct GenomePopulation {
     /// The population's central genome — every draw jitters around this.
     pub centre: SyndicateGenome,
     /// Fractional dispersion: a trait is drawn uniformly on `centre · [1 ± spread]`.
+    /// It governs the *general* genome traits only — the cat model has its own
+    /// population, so belief dispersion can be swept with everything else pinned.
     pub spread: f64,
+    /// The **cat-belief population** the syndicate's cat model is drawn from (#14):
+    /// its own heterogeneity spread and shared bias, deliberately independent of
+    /// `spread`.
+    pub cat_belief: CatBeliefPopulation,
 }
 
 impl GenomePopulation {
+    /// A population around `centre` whose general traits *and* whose beliefs both
+    /// disperse at `spread`, correctly calibrated (no shared bias) — the pre-#14
+    /// behaviour, and the base a sweep overrides the belief knobs on.
+    pub fn new(centre: SyndicateGenome, spread: f64) -> Self {
+        Self {
+            centre,
+            spread,
+            cat_belief: CatBeliefPopulation { centre: centre.cat_model, heterogeneity_spread: spread, shared_bias: 0.0 },
+        }
+    }
+
     /// Draw one genome from the population. Only the *selectable* traits vary —
     /// the cat model (a syndicate's belief about the cat process, so entrants
     /// inherit the population's spread of belief, not the truth), share-appetite,
@@ -2108,14 +2236,13 @@ impl GenomePopulation {
     /// payout rule. Monte-Carlo trial counts and other numerical calibration are
     /// carried across unchanged: they are not traits selection acts on.
     pub fn sample(&self, rng: &mut Rng) -> SyndicateGenome {
-        let mut jitter = |base: f64| base * (1.0 + self.spread * (2.0 * rng.uniform() - 1.0));
         let c = self.centre;
+        // Belief comes from its own population, never from the general spread. It
+        // draws first so the general traits keep the random stream they always had.
+        let cat_model = self.cat_belief.sample(rng);
+        let mut jitter = |base: f64| base * (1.0 + self.spread * (2.0 * rng.uniform() - 1.0));
         SyndicateGenome {
-            cat_model: CatModel {
-                annual_frequency: jitter(c.cat_model.annual_frequency),
-                min_damage_fraction: jitter(c.cat_model.min_damage_fraction),
-                tail_alpha: jitter(c.cat_model.tail_alpha),
-            },
+            cat_model,
             exposure: ExposurePolicy {
                 solvency_fraction: jitter(c.exposure.solvency_fraction),
                 line_fraction: jitter(c.exposure.line_fraction),
@@ -2406,6 +2533,11 @@ pub struct YearReport {
     /// Syndicates formed at the start of this year — lagged capital coming online
     /// along the supply curve (#8). Zero in a market with no capital supply wired.
     pub entrants: usize,
+    /// Syndicates that hit the **zero floor this year** — solvent at the year's
+    /// opening and in runoff at its close. The clustering of this count in time is
+    /// what makes a correlated failure visible as *systemic* rather than as a run
+    /// of unlucky individuals (#14).
+    pub insolvencies: usize,
     /// Mean post-distribution capacity headroom across solvent syndicates.
     pub mean_headroom: f64,
     /// Number of true catastrophe events across all territories this year.
@@ -2626,6 +2758,77 @@ impl Market {
             supply.population.centre.reserving_bias = bias;
         }
         self
+    }
+
+    /// Scale the market's **capital endowment** — the founders' balances, the
+    /// entrant capital, and the distribution floor that is denominated in it — by a
+    /// common factor, leaving the insured cohort, the perils and every genome trait
+    /// untouched.
+    ///
+    /// This is a scenario knob, not a phenomenon: it says how thickly the market is
+    /// capitalised against the exposure it is asked to carry. The reference market
+    /// is deliberately well capitalised, so it is the lever that says *how far from
+    /// the edge* a given belief error leaves it.
+    pub fn with_capital_scale(mut self, scale: f64) -> Self {
+        for (i, agent) in self.agents.iter_mut().enumerate() {
+            agent.initial_capital *= scale;
+            agent.genome.distribution.solvency_floor *= scale;
+            self.capitals[i] = Syndicate::with_capital(self.capitals[i].capital() * scale);
+        }
+        if let Some(supply) = self.capital_supply.as_mut() {
+            supply.entrant_capital *= scale;
+            supply.population.centre.distribution.solvency_floor *= scale;
+        }
+        self
+    }
+
+    /// Pin every syndicate's **herding susceptibility** — founders and the entrant
+    /// population alike — to one value. The control lever that keeps price herding
+    /// (#3) and cat-model homogeneity (#14) separable: pinning it at zero removes
+    /// the price channel entirely, so anything that survives is belief.
+    pub fn with_herding_susceptibility(mut self, susceptibility: f64) -> Self {
+        for agent in self.agents.iter_mut() {
+            agent.genome.herding_susceptibility = susceptibility;
+        }
+        if let Some(supply) = self.capital_supply.as_mut() {
+            supply.population.centre.herding_susceptibility = susceptibility;
+        }
+        self
+    }
+
+    /// Draw every syndicate's **cat model** from a [`CatBeliefPopulation`] (#14):
+    /// the founders on the roster now *and* the entrant population alike, so a
+    /// spread/bias sweep reaches the market's initial state and not merely the
+    /// syndicates that arrive later.
+    ///
+    /// The bias is applied here, at construction, from the scenario's own knob —
+    /// it is never a runtime channel from the substrate's truth to an agent. What
+    /// makes the belief *wrong* is that the scenario centres the population on the
+    /// true process and then offsets it; the agents themselves see nothing.
+    ///
+    /// Every draw consumes the same three uniforms whatever the knobs are set to,
+    /// so two arms of a sweep differ in belief and in nothing else.
+    pub fn with_cat_beliefs(mut self, beliefs: CatBeliefPopulation) -> Self {
+        for agent in self.agents.iter_mut() {
+            agent.genome.cat_model = beliefs.sample(&mut self.rng);
+        }
+        if let Some(supply) = self.capital_supply.as_mut() {
+            supply.population.cat_belief = beliefs;
+            supply.population.centre.cat_model = beliefs.biased_centre();
+        }
+        self
+    }
+
+    /// A syndicate's current **cat model** — its belief about the cat process, the
+    /// thing the spread/bias knobs move. Never the truth.
+    pub fn cat_model(&self, id: SyndicateId) -> CatModel {
+        self.agents[id.0].genome.cat_model
+    }
+
+    /// A syndicate's herding susceptibility — the price channel, kept readable so
+    /// a sweep can report the setting it actually ran at.
+    pub fn herding_susceptibility(&self, id: SyndicateId) -> f64 {
+        self.agents[id.0].genome.herding_susceptibility
     }
 
     /// The market's total booked IBNR across every syndicate's open underwriting
@@ -3012,6 +3215,7 @@ impl Market {
         // --- Year-end: tally → distributions → AvT → relationships → roll ------
         let mut mean_headroom_acc = 0.0;
         let mut solvent_count = 0usize;
+        let mut insolvencies = 0usize;
         let mut avt_values: Vec<f64> = Vec::new();
         let mut total_premium = 0.0;
         let mut total_losses = 0.0;
@@ -3083,6 +3287,10 @@ impl Market {
             };
             agent.avt = updated_avt(agent.avt, headroom, win_rate, &agent.genome.avt);
 
+            if !capitals[i].is_solvent() && opening_capitals[i] > 0.0 {
+                // Solvent at the year's opening, on the floor at its close.
+                insolvencies += 1;
+            }
             if capitals[i].is_solvent() {
                 solvent_count += 1;
                 mean_headroom_acc += headroom;
@@ -3158,6 +3366,7 @@ impl Market {
             combined_ratio: if total_premium > 0.0 { total_losses / total_premium } else { 0.0 },
             solvent_count,
             entrants,
+            insolvencies,
             mean_headroom: if solvent_count > 0 { mean_headroom_acc / solvent_count as f64 } else { 0.0 },
             cat_events: cat_event_count,
             placements: bound_layers,
@@ -3191,14 +3400,14 @@ impl Market {
 
 impl YearReport {
     /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
-    pub const CSV_HEADER: &'static str = "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,mean_headroom,cat_events,placements,gross_premium,incurred_losses,gross_incurred_losses,ceded_premium,reinsurance_recoveries,reinsurance_shortfall,cedents_short,solvent_reinsurers,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions";
+    pub const CSV_HEADER: &'static str = "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,insolvencies,mean_headroom,cat_events,placements,gross_premium,incurred_losses,gross_incurred_losses,ceded_premium,reinsurance_recoveries,reinsurance_shortfall,cedents_short,solvent_reinsurers,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions";
 
     /// The year's diagnostics as ordered `(column, value)` pairs — the single
     /// source of truth for column order and per-field formatting that both
     /// [`csv_row`](Self::csv_row) and [`reports_to_json`] render from, so the CSV
     /// and JSON emissions can never drift out of sync. Every value is a bare JSON
     /// number (no quoting needed); the keys match [`CSV_HEADER`](Self::CSV_HEADER).
-    fn columns(&self) -> [(&'static str, String); 23] {
+    fn columns(&self) -> [(&'static str, String); 24] {
         [
             ("year", self.year.to_string()),
             ("mean_avt", format!("{:.6}", self.mean_avt)),
@@ -3207,6 +3416,7 @@ impl YearReport {
             ("combined_ratio", format!("{:.6}", self.combined_ratio)),
             ("solvent_count", self.solvent_count.to_string()),
             ("entrants", self.entrants.to_string()),
+            ("insolvencies", self.insolvencies.to_string()),
             ("mean_headroom", format!("{:.6}", self.mean_headroom)),
             ("cat_events", self.cat_events.to_string()),
             ("placements", self.placements.to_string()),
@@ -3362,7 +3572,7 @@ pub fn demonstration_market(seed: u64) -> Market {
         entrant_capital: FOUNDING_CAPITAL,
         // Entrants are drawn from the same population the founders were: the
         // mid-population genome, jittered across the founders' own spread.
-        population: GenomePopulation { centre: genome_of(1, 0.5), spread: 0.25 },
+        population: GenomePopulation::new(genome_of(1, 0.5), 0.25),
     })
     .with_yield_process(BASELINE_YIELD)
 }
@@ -3379,6 +3589,257 @@ pub const BASELINE_YIELD: YieldProcess =
 /// The capital a founding syndicate — and every later entrant — is endowed with in
 /// the demonstration market.
 const FOUNDING_CAPITAL: f64 = 280.0;
+
+// ============================================================================
+// The cat-model homogeneity sweep (#14)
+// ============================================================================
+
+/// One **arm** of the homogeneity sweep: a setting of the two belief knobs, plus
+/// an optional herding override that pins the price channel so the belief channel
+/// can be read on its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HomogeneityArm {
+    /// The arm's label, carried through to the emitted row.
+    pub name: String,
+    /// The population's heterogeneity spread — low is a homogeneous market.
+    pub heterogeneity_spread: f64,
+    /// The population's shared bias from the truth — negative is optimistic.
+    pub shared_bias: f64,
+    /// If set, every syndicate's herding susceptibility is pinned here. `None`
+    /// leaves the reference market's own susceptibilities alone.
+    pub herding: Option<f64>,
+}
+
+/// A **controlled experiment in the spread/bias knobs**: the same reference market,
+/// the same seeds, the same everything, run once per arm. Only belief moves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HomogeneitySweep {
+    pub years: usize,
+    pub seeds: Vec<u64>,
+    pub arms: Vec<HomogeneityArm>,
+    /// A common scaling of the market's capital endowment, applied identically to
+    /// every arm. `1.0` is the reference market. It is not part of the experiment —
+    /// it sets how thickly capitalised the market the experiment runs in is.
+    pub capital_scale: f64,
+}
+
+impl HomogeneitySweep {
+    /// The **reference sweep**: the 2×2 of homogeneity against bias, so the
+    /// systemic-risk claim is read off a contrast and not a single cell.
+    /// Homogeneous-and-correct is the control that shows homogeneity alone is
+    /// harmless; scattered-and-biased is the control that shows the same average
+    /// error, diversified, is survivable.
+    pub fn reference(years: usize, seeds: Vec<u64>, bias: f64, spread: f64, herding: Option<f64>, capital_scale: f64) -> Self {
+        /// A homogeneous market is not *literally* identical — it is a market whose
+        /// syndicates all but agree. Two per cent of dispersion is that.
+        const TIGHT: f64 = 0.02;
+        let wide = spread;
+        let arm = |name: &str, spread: f64, shared_bias: f64| HomogeneityArm {
+            name: name.to_string(),
+            heterogeneity_spread: spread,
+            shared_bias,
+            herding,
+        };
+        Self {
+            years,
+            seeds,
+            capital_scale,
+            arms: vec![
+                arm("homogeneous_biased", TIGHT, bias),
+                arm("scattered_biased", wide, bias),
+                arm("homogeneous_calibrated", TIGHT, 0.0),
+                arm("scattered_calibrated", wide, 0.0),
+            ],
+        }
+    }
+}
+
+/// One emitted row: an arm run at one seed, and what the market did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HomogeneityRow {
+    pub arm: String,
+    pub seed: u64,
+    pub heterogeneity_spread: f64,
+    pub shared_bias: f64,
+    /// The mean herding susceptibility the arm actually ran at.
+    pub herding: f64,
+    /// The market's **mean believed cat load as a multiple of the true load** at
+    /// formation. Below one is a market that underprices catastrophe; the distance
+    /// from one is the mispricing the bias injects, before any loss arrives.
+    pub belief_load_ratio: f64,
+    /// The **dispersion** of that ratio across the founders — near zero is a market
+    /// that agrees with itself, whether or not it is right.
+    pub belief_dispersion: f64,
+    /// Syndicates that hit the zero floor over the run.
+    pub insolvencies: usize,
+    /// The most failures in any single year — the clustering the phenomenon is about.
+    pub peak_year_insolvencies: usize,
+    /// The first year a syndicate failed, or `-1` if none ever did.
+    pub first_insolvency_year: i64,
+    /// Years in which at least one syndicate failed.
+    pub insolvency_years: usize,
+    /// Mean effective rate index over the run — below one is writing under the
+    /// technical floor.
+    pub mean_rate_index: f64,
+    /// Mean combined ratio over the run.
+    pub mean_combined_ratio: f64,
+    /// The worst single year's combined ratio.
+    pub worst_combined_ratio: f64,
+    /// Capital standing at the end, summed over the roster.
+    pub final_capital: f64,
+    pub final_solvent: usize,
+}
+
+impl HomogeneityRow {
+    /// The emitted columns, in order — the single source of truth both the CSV and
+    /// the JSON render from, exactly as [`YearReport`] does.
+    fn columns(&self) -> [(&'static str, String); 16] {
+        [
+            ("arm", self.arm.clone()),
+            ("seed", self.seed.to_string()),
+            ("heterogeneity_spread", format!("{:.4}", self.heterogeneity_spread)),
+            ("shared_bias", format!("{:.4}", self.shared_bias)),
+            ("herding", format!("{:.4}", self.herding)),
+            ("belief_load_ratio", format!("{:.6}", self.belief_load_ratio)),
+            ("belief_dispersion", format!("{:.6}", self.belief_dispersion)),
+            ("insolvencies", self.insolvencies.to_string()),
+            ("peak_year_insolvencies", self.peak_year_insolvencies.to_string()),
+            ("first_insolvency_year", self.first_insolvency_year.to_string()),
+            ("insolvency_years", self.insolvency_years.to_string()),
+            ("mean_rate_index", format!("{:.6}", self.mean_rate_index)),
+            ("mean_combined_ratio", format!("{:.6}", self.mean_combined_ratio)),
+            ("worst_combined_ratio", format!("{:.6}", self.worst_combined_ratio)),
+            ("final_capital", format!("{:.2}", self.final_capital)),
+            ("final_solvent", self.final_solvent.to_string()),
+        ]
+    }
+
+    /// The sweep's CSV header, column for column with [`csv_row`](Self::csv_row).
+    pub const CSV_HEADER: &'static str = "arm,seed,heterogeneity_spread,shared_bias,herding,belief_load_ratio,belief_dispersion,insolvencies,peak_year_insolvencies,first_insolvency_year,insolvency_years,mean_rate_index,mean_combined_ratio,worst_combined_ratio,final_capital,final_solvent";
+
+    pub fn csv_row(&self) -> String {
+        self.columns().map(|(_, v)| v).join(",")
+    }
+}
+
+/// Run one arm of the sweep at one seed on the reference market.
+///
+/// The arm is applied to the market *before* it steps: the belief population
+/// governs the founders on the roster and the entrant population alike, and the
+/// optional herding pin is applied the same way. Nothing else differs between
+/// arms — same seed, same insureds, same true cat process, same macro yield.
+pub fn run_homogeneity_arm(arm: &HomogeneityArm, seed: u64, years: usize, capital_scale: f64) -> HomogeneityRow {
+    // The scenario centres belief on the true process and then offsets it by the
+    // arm's bias. Reading the truth here is the *scenario author* calibrating an
+    // experiment; no agent ever gets this number.
+    let truth = demonstration_genome().cat_model;
+    let beliefs = CatBeliefPopulation {
+        centre: truth,
+        heterogeneity_spread: arm.heterogeneity_spread,
+        shared_bias: arm.shared_bias,
+    };
+    let mut market = demonstration_market(seed).with_capital_scale(capital_scale).with_cat_beliefs(beliefs);
+    if let Some(h) = arm.herding {
+        market = market.with_herding_susceptibility(h);
+    }
+
+    let true_load = truth.believed_annual_load();
+    let founders = market.roster_size();
+    let ratios: Vec<f64> = (0..founders)
+        .map(|i| market.cat_model(SyndicateId(i)).believed_annual_load() / true_load)
+        .collect();
+    let belief_load_ratio = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    let belief_dispersion = population_std(&ratios, belief_load_ratio);
+    let herding = (0..founders).map(|i| market.herding_susceptibility(SyndicateId(i))).sum::<f64>() / founders as f64;
+
+    let reports = market.run(years);
+    let insolvencies: usize = reports.iter().map(|r| r.insolvencies).sum();
+    let peak_year_insolvencies = reports.iter().map(|r| r.insolvencies).max().unwrap_or(0);
+    let first_insolvency_year = reports
+        .iter()
+        .find(|r| r.insolvencies > 0)
+        .map(|r| r.year as i64)
+        .unwrap_or(-1);
+    let insolvency_years = reports.iter().filter(|r| r.insolvencies > 0).count();
+    let mean_rate_index = reports.iter().map(|r| r.rate_index).sum::<f64>() / reports.len() as f64;
+    let mean_combined_ratio = reports.iter().map(|r| r.combined_ratio).sum::<f64>() / reports.len() as f64;
+    let worst_combined_ratio = reports.iter().map(|r| r.combined_ratio).fold(0.0, f64::max);
+    let final_capital = (0..market.roster_size()).map(|i| market.capital(SyndicateId(i))).sum();
+
+    HomogeneityRow {
+        arm: arm.name.clone(),
+        seed,
+        heterogeneity_spread: arm.heterogeneity_spread,
+        shared_bias: arm.shared_bias,
+        herding,
+        belief_load_ratio,
+        belief_dispersion,
+        insolvencies,
+        peak_year_insolvencies,
+        first_insolvency_year,
+        insolvency_years,
+        mean_rate_index,
+        mean_combined_ratio,
+        worst_combined_ratio,
+        final_capital,
+        final_solvent: reports.last().map(|r| r.solvent_count).unwrap_or(0),
+    }
+}
+
+/// Run the whole sweep: every arm at every seed, in arm-major order. The multi-seed
+/// shape is the point — a single seed cannot distinguish a systemic mechanism from
+/// one unlucky draw.
+pub fn run_homogeneity_sweep(sweep: &HomogeneitySweep) -> Vec<HomogeneityRow> {
+    let mut rows = Vec::with_capacity(sweep.arms.len() * sweep.seeds.len());
+    for arm in &sweep.arms {
+        for &seed in &sweep.seeds {
+            rows.push(run_homogeneity_arm(arm, seed, sweep.years, sweep.capital_scale));
+        }
+    }
+    rows
+}
+
+/// Render the sweep as machine-readable CSV: the documented header then one row
+/// per arm-seed, nothing else.
+pub fn homogeneity_rows_to_csv(rows: &[HomogeneityRow]) -> String {
+    let mut out = String::from(HomogeneityRow::CSV_HEADER);
+    for row in rows {
+        out.push('\n');
+        out.push_str(&row.csv_row());
+    }
+    out
+}
+
+/// Render the sweep as a JSON array of objects, keyed by the same columns. The arm
+/// name is the one string field, and arm names are plain identifiers, so the
+/// hand-rolled quoting stays honest.
+pub fn homogeneity_rows_to_json(rows: &[HomogeneityRow]) -> String {
+    let mut out = String::from("[");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        for (j, (key, value)) in row.columns().iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(key);
+            out.push_str("\":");
+            if key == &"arm" {
+                out.push('"');
+                out.push_str(value);
+                out.push('"');
+            } else {
+                out.push_str(value);
+            }
+        }
+        out.push('}');
+    }
+    out.push(']');
+    out
+}
 
 /// Place every solvent primary's **outward reinsurance programme** for the year.
 ///
@@ -5627,7 +6088,7 @@ mod tests {
             marginal_return_slope: 0.0002,
             formation_lag: 2,
             entrant_capital: 500.0,
-            population: GenomePopulation { centre: test_genome(0.5), spread: 0.2 },
+            population: GenomePopulation::new(test_genome(0.5), 0.2),
         };
 
         assert_eq!(committed_capital(0.02, &supply), 0.0, "a return below the hurdle attracts no capital");
@@ -5850,7 +6311,7 @@ mod tests {
         // distribution the market was formed from — no survivor-weighted
         // inheritance, no mutation (that is #12/#14's job). Draws are
         // heterogeneous and stay inside the population's support.
-        let population = GenomePopulation { centre: test_genome(0.5), spread: 0.3 };
+        let population = GenomePopulation::new(test_genome(0.5), 0.3);
         let mut rng = Rng::seeded(17);
 
         let a = population.sample(&mut rng);
@@ -5864,7 +6325,10 @@ mod tests {
             assert!(within(g.avt.share_appetite, centre.avt.share_appetite), "share-appetite inside the population support: {}", g.avt.share_appetite);
             assert!(within(g.pricing.hurdle_rate, centre.pricing.hurdle_rate), "hurdle rate inside the population support: {}", g.pricing.hurdle_rate);
             assert!(within(g.cat_model.annual_frequency, centre.cat_model.annual_frequency), "cat-model frequency inside the population support: {}", g.cat_model.annual_frequency);
-            assert!(within(g.cat_model.tail_alpha, centre.cat_model.tail_alpha), "cat-model tail alpha inside the population support: {}", g.cat_model.tail_alpha);
+            // The tail index is *derived* from the believed minimum and mean damage
+            // (the load parameterisation, #14), so the support the spread bounds is
+            // the mean damage; alpha follows it and ranges wider.
+            assert!(within(g.cat_model.believed_mean_damage(), centre.cat_model.believed_mean_damage()), "cat-model mean damage inside the population support: {}", g.cat_model.believed_mean_damage());
             assert!(g.exposure.tail_trials == centre.exposure.tail_trials, "non-selectable calibration is carried, not jittered");
         }
     }
@@ -5881,7 +6345,7 @@ mod tests {
             marginal_return_slope: 0.00001,
             formation_lag: lag,
             entrant_capital: 400.0,
-            population: GenomePopulation { centre: test_genome(0.5), spread: 0.25 },
+            population: GenomePopulation::new(test_genome(0.5), 0.25),
         };
         let mut market = small_market(5).with_capital_supply(supply);
         let reports = market.run(12);
@@ -5910,7 +6374,7 @@ mod tests {
             marginal_return_slope: 0.00001,
             formation_lag: 2,
             entrant_capital: 400.0,
-            population: GenomePopulation { centre: test_genome(0.5), spread: 0.25 },
+            population: GenomePopulation::new(test_genome(0.5), 0.25),
         };
         let mut market = small_market(5).with_capital_supply(supply);
         let incumbents = market.roster_size();
@@ -6182,7 +6646,7 @@ mod tests {
             marginal_return_slope: 0.00001,
             formation_lag: 1,
             entrant_capital: 400.0,
-            population: GenomePopulation { centre: test_genome(0.5), spread: 0.25 },
+            population: GenomePopulation::new(test_genome(0.5), 0.25),
         };
         let high_yield = YieldProcess { mean: 0.08, persistence: 0.0, volatility: 0.0, initial: 0.08, seed: 3 };
 
@@ -6362,7 +6826,7 @@ mod tests {
     #[test]
     fn reserving_bias_is_a_selectable_genome_trait_drawn_across_the_population() {
         let centre = demonstration_genome();
-        let population = GenomePopulation { centre, spread: 0.2 };
+        let population = GenomePopulation::new(centre, 0.2);
         let mut rng = Rng::seeded(11);
         let biases: Vec<f64> = (0..40).map(|_| population.sample(&mut rng).reserving_bias).collect();
         let min = biases.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -7103,5 +7567,264 @@ mod tests {
             stripped_cedents > 1,
             "only {stripped_cedents} cedent(s) were left short"
         );
+    }
+
+    // --- Cat-model homogeneity as systemic risk (#14) ------------------------
+
+    #[test]
+    fn a_calibrated_belief_population_draws_the_centre_exactly() {
+        // The reference calibration: belief centred on the truth, no shared bias,
+        // no heterogeneity. Every syndicate then holds the same, correct model.
+        let truth = CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 };
+        let population = CatBeliefPopulation::calibrated(truth);
+        let mut rng = Rng::seeded(1);
+        for _ in 0..8 {
+            let belief = population.sample(&mut rng);
+            assert!(
+                (belief.annual_frequency - truth.annual_frequency).abs() < 1e-9
+                    && (belief.min_damage_fraction - truth.min_damage_fraction).abs() < 1e-9
+                    && (belief.tail_alpha - truth.tail_alpha).abs() < 1e-9,
+                "no spread and no bias leaves belief at the centre: {belief:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_optimistic_shared_bias_offsets_the_whole_population_from_the_truth() {
+        // The bias is a *shared* error: every syndicate's belief lands on the same
+        // side of the truth. Optimism is rarer, smaller, lighter-tailed cats.
+        let truth = CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 };
+        let population = CatBeliefPopulation { centre: truth, heterogeneity_spread: 0.05, shared_bias: -0.3 };
+        let mut rng = Rng::seeded(7);
+        for _ in 0..20 {
+            let belief = population.sample(&mut rng);
+            assert!(belief.annual_frequency < truth.annual_frequency, "believes cats arrive less often");
+            assert!(belief.min_damage_fraction < truth.min_damage_fraction, "believes cats are smaller");
+            assert!(belief.tail_alpha > truth.tail_alpha, "believes the tail is lighter");
+        }
+    }
+
+    #[test]
+    fn the_heterogeneity_spread_scatters_belief_and_zero_spread_makes_it_homogeneous() {
+        let truth = CatModel { annual_frequency: 0.4, min_damage_fraction: 0.07, tail_alpha: 1.35 };
+        let draw = |spread: f64| {
+            let population = CatBeliefPopulation { centre: truth, heterogeneity_spread: spread, shared_bias: 0.0 };
+            let mut rng = Rng::seeded(11);
+            (0..40).map(|_| population.sample(&mut rng).annual_frequency).collect::<Vec<f64>>()
+        };
+        let homogeneous = draw(0.0);
+        let scattered = draw(0.4);
+        let dispersion = |v: &[f64]| {
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            population_std(v, m)
+        };
+        assert!(dispersion(&homogeneous) < 1e-12, "zero spread is perfect homogeneity");
+        assert!(dispersion(&scattered) > 0.05, "a wide spread scatters belief: {}", dispersion(&scattered));
+    }
+
+    #[test]
+    fn the_cat_belief_spread_is_independent_of_the_general_genome_spread() {
+        // The experiment demands belief dispersion move with every other trait held
+        // fixed, so the two spreads are separate knobs on the population.
+        let centre = test_genome(0.5);
+        let sample_n = |genome_spread: f64, belief_spread: f64| {
+            let population = GenomePopulation {
+                spread: genome_spread,
+                cat_belief: CatBeliefPopulation { centre: centre.cat_model, heterogeneity_spread: belief_spread, shared_bias: 0.0 },
+                ..GenomePopulation::new(centre, genome_spread)
+            };
+            let mut rng = Rng::seeded(3);
+            (0..12).map(|_| population.sample(&mut rng)).collect::<Vec<SyndicateGenome>>()
+        };
+
+        // Belief scatters while the rest of the genome is pinned.
+        let beliefs_only = sample_n(0.0, 0.4);
+        assert!(
+            beliefs_only.iter().any(|g| g.cat_model != beliefs_only[0].cat_model),
+            "a wide belief spread scatters cat models"
+        );
+        assert!(
+            beliefs_only.iter().all(|g| g.pricing.hurdle_rate == beliefs_only[0].pricing.hurdle_rate
+                && g.avt.share_appetite == beliefs_only[0].avt.share_appetite
+                && g.target_line == beliefs_only[0].target_line),
+            "a zero genome spread leaves every other trait identical"
+        );
+
+        // And the converse: the general genome spread does not disturb belief.
+        let traits_only = sample_n(0.3, 0.0);
+        assert!(
+            traits_only.iter().all(|g| g.cat_model == centre.cat_model),
+            "a zero belief spread leaves every syndicate holding the same model"
+        );
+        assert!(
+            traits_only.iter().any(|g| g.avt.share_appetite != traits_only[0].avt.share_appetite),
+            "the general genome spread still scatters the other traits"
+        );
+    }
+
+    #[test]
+    fn the_belief_population_governs_founders_as_well_as_entrants() {
+        let truth = demonstration_genome().cat_model;
+
+        // Homogeneous and biased: every founder holds the same, optimistic model.
+        let homogeneous = CatBeliefPopulation { centre: truth, heterogeneity_spread: 0.0, shared_bias: -0.4 };
+        let market = demonstration_market(1).with_cat_beliefs(homogeneous);
+        let founders: Vec<CatModel> = (0..market.roster_size()).map(|i| market.cat_model(SyndicateId(i))).collect();
+        assert!(founders.iter().all(|b| *b == homogeneous.biased_centre()), "a homogeneous population gives every founder one model");
+        assert!(founders[0].annual_frequency < truth.annual_frequency, "and it sits on the optimistic side of the truth");
+        assert_eq!(
+            market.capital_supply().unwrap().population.cat_belief,
+            homogeneous,
+            "entrants are drawn from the same belief population as the founders"
+        );
+
+        // Scattered and unbiased: founders' beliefs straddle the truth.
+        let scattered = CatBeliefPopulation { centre: truth, heterogeneity_spread: 0.45, shared_bias: 0.0 };
+        let market = demonstration_market(1).with_cat_beliefs(scattered);
+        let founders: Vec<CatModel> = (0..market.roster_size()).map(|i| market.cat_model(SyndicateId(i))).collect();
+        assert!(founders.iter().any(|b| b.annual_frequency > truth.annual_frequency), "some founders are pessimistic");
+        assert!(founders.iter().any(|b| b.annual_frequency < truth.annual_frequency), "others optimistic");
+    }
+
+    #[test]
+    fn the_year_report_counts_insolvencies_and_they_reconcile_with_the_solvent_roster() {
+        let mut market = demonstration_market(2024);
+        let reports = market.run(30);
+        let failed: usize = reports.iter().map(|r| r.insolvencies).sum();
+        assert_eq!(
+            reports.last().unwrap().solvent_count,
+            market.roster_size() - failed,
+            "the roster less every syndicate that hit the zero floor is the solvent count"
+        );
+        // The calibration fact this issue starts from: with belief centred exactly
+        // on the truth, the reference market never puts a syndicate on the floor.
+        assert_eq!(failed, 0, "the correctly calibrated reference market produces no insolvency");
+    }
+
+    #[test]
+    fn the_homogeneity_sweep_reports_one_row_per_arm_per_seed() {
+        let sweep = HomogeneitySweep {
+            years: 12,
+            seeds: vec![1, 2],
+            capital_scale: 1.0,
+            arms: vec![
+                HomogeneityArm { name: "homogeneous_calibrated".into(), heterogeneity_spread: 0.02, shared_bias: 0.0, herding: None },
+                HomogeneityArm { name: "scattered_calibrated".into(), heterogeneity_spread: 0.40, shared_bias: 0.0, herding: None },
+            ],
+        };
+        let rows = run_homogeneity_sweep(&sweep);
+        assert_eq!(rows.len(), 4, "one row per arm per seed");
+        assert_eq!(rows[0].arm, "homogeneous_calibrated");
+        assert_eq!(rows[0].seed, 1);
+        // A calibrated population is not biased against the truth, whatever its
+        // spread: the market's mean belief carries the true cat load.
+        for row in &rows {
+            assert!((row.belief_load_ratio - 1.0).abs() < 0.15, "{} believes {:.2}x the true cat load", row.arm, row.belief_load_ratio);
+            assert_eq!(row.insolvencies, 0, "a calibrated market puts nobody on the floor");
+        }
+    }
+
+    /// The arms the systemic-risk tests below share: everything equal but belief.
+    fn belief_arm(name: &str, spread: f64, bias: f64, herding: Option<f64>) -> HomogeneityArm {
+        HomogeneityArm { name: name.to_string(), heterogeneity_spread: spread, shared_bias: bias, herding }
+    }
+
+    /// Seeds a belief arm produced at least one insolvency at, over `SWEEP_YEARS`.
+    const SWEEP_SEEDS: [u64; 2] = [1, 2];
+    const SWEEP_YEARS: usize = 25;
+    fn seeds_with_failure(arm: &HomogeneityArm) -> usize {
+        SWEEP_SEEDS
+            .iter()
+            .filter(|&&seed| run_homogeneity_arm(arm, seed, SWEEP_YEARS, 1.0).insolvencies > 0)
+            .count()
+    }
+
+    #[test]
+    fn a_shared_bias_underprices_the_tail_in_unison_and_a_calibrated_population_does_not() {
+        // Correlated MISPRICING, before any loss arrives: the whole population
+        // believes catastrophe costs a fraction of what it does, and — being
+        // homogeneous — they all believe the same fraction. The knob is exactly
+        // cubic in the believed load, so the mispricing is legible from the row.
+        let biased = run_homogeneity_arm(&belief_arm("homogeneous_biased", 0.02, -0.6, None), 1, 4, 1.0);
+        assert!(biased.belief_load_ratio < 0.1, "the biased market believes {:.3}x the true cat load", biased.belief_load_ratio);
+        assert!(biased.belief_dispersion < 0.02, "and it agrees with itself: dispersion {:.3}", biased.belief_dispersion);
+
+        let calibrated = run_homogeneity_arm(&belief_arm("scattered_calibrated", 0.45, 0.0, None), 1, 4, 1.0);
+        assert!((calibrated.belief_load_ratio - 1.0).abs() < 0.2, "an unbiased population carries the true load on average: {:.3}", calibrated.belief_load_ratio);
+        assert!(calibrated.belief_dispersion > 0.1, "while scattering widely around it: {:.3}", calibrated.belief_dispersion);
+    }
+
+    #[test]
+    fn a_homogeneous_and_biased_market_fails_where_a_correctly_calibrated_one_never_does() {
+        // The systemic-risk condition. Same seeds, same true cat process, same
+        // insureds, same capital: only belief differs.
+        let biased = seeds_with_failure(&belief_arm("homogeneous_biased", 0.02, -0.6, None));
+        assert_eq!(biased, SWEEP_SEEDS.len(), "the homogeneous, biased market reaches the zero floor on every seed");
+
+        // Homogeneity ALONE is harmless — this is the control that makes the claim
+        // about shared *error*, not about agreement.
+        let homogeneous_and_right = seeds_with_failure(&belief_arm("homogeneous_calibrated", 0.02, 0.0, None));
+        assert_eq!(homogeneous_and_right, 0, "a homogeneous but correctly calibrated market never reaches the floor");
+
+        // And a population scattered AROUND the truth diversifies its error away.
+        let scattered_and_right = seeds_with_failure(&belief_arm("scattered_calibrated", 0.45, 0.0, None));
+        assert_eq!(scattered_and_right, 0, "a widely scattered, unbiased market never reaches the floor");
+    }
+
+    #[test]
+    fn the_belief_effect_survives_with_the_price_herding_channel_switched_off() {
+        // #3 is convergence on a shared PRICE; #14 is convergence on a shared MODEL.
+        // With herding susceptibility pinned at zero every follower quotes its own
+        // blind price and anchors toward nobody — and the belief effect is untouched.
+        let biased = seeds_with_failure(&belief_arm("homogeneous_biased", 0.02, -0.6, Some(0.0)));
+        assert_eq!(biased, SWEEP_SEEDS.len(), "the biased market still fails on every seed with no price herding at all");
+        let calibrated = seeds_with_failure(&belief_arm("homogeneous_calibrated", 0.02, 0.0, Some(0.0)));
+        assert_eq!(calibrated, 0, "and the calibrated market still never fails");
+    }
+
+    #[test]
+    fn varying_price_herding_at_fixed_belief_does_not_reproduce_the_effect() {
+        // The other direction: hold the belief knobs still and sweep herding from
+        // nothing to almost total. Nobody starts failing, and nobody stops.
+        for (spread, bias) in [(0.02, -0.6), (0.02, 0.0)] {
+            let quiet = run_homogeneity_arm(&belief_arm("fixed_belief", spread, bias, Some(0.0)), 1, SWEEP_YEARS, 1.0);
+            let herded = run_homogeneity_arm(&belief_arm("fixed_belief", spread, bias, Some(0.95)), 1, SWEEP_YEARS, 1.0);
+            assert_eq!(quiet.herding, 0.0);
+            assert_eq!(herded.herding, 0.95);
+            assert_eq!(
+                quiet.insolvencies, herded.insolvencies,
+                "herding moved insolvency at spread {spread}, bias {bias} — the two channels are not separable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sweep_emission_is_machine_readable_and_csv_and_json_agree() {
+        let rows = vec![
+            run_homogeneity_arm(&belief_arm("homogeneous_biased", 0.02, -0.6, Some(0.0)), 1, 3, 1.0),
+            run_homogeneity_arm(&belief_arm("scattered_calibrated", 0.45, 0.0, Some(0.0)), 1, 3, 1.0),
+        ];
+
+        let csv = homogeneity_rows_to_csv(&rows);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3, "one header line then one row per arm-seed");
+        assert_eq!(lines[0], HomogeneityRow::CSV_HEADER, "the first line is the documented header");
+        let width = HomogeneityRow::CSV_HEADER.split(',').count();
+        for line in &lines[1..] {
+            assert_eq!(line.split(',').count(), width, "every row has the header's width: {line}");
+        }
+        assert!(lines[1].starts_with("homogeneous_biased,1,"), "the arm and its seed lead the row: {}", lines[1]);
+
+        // JSON renders the same cells through the same columns, so the two emissions
+        // cannot drift: every CSV cell appears verbatim in the JSON object.
+        let json = homogeneity_rows_to_json(&rows);
+        assert!(json.starts_with('[') && json.ends_with(']'));
+        assert!(json.contains("\"arm\":\"homogeneous_biased\""), "the one string field is quoted: {json}");
+        for (i, line) in lines[1..].iter().enumerate() {
+            for (cell, (key, _)) in line.split(',').zip(rows[i].columns().iter()) {
+                let rendered = if *key == "arm" { format!("\"{key}\":\"{cell}\"") } else { format!("\"{key}\":{cell}") };
+                assert!(json.contains(&rendered), "JSON carries the CSV cell {rendered}");
+            }
+        }
     }
 }

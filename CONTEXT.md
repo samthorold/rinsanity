@@ -20,6 +20,10 @@ _Avoid_: conflating with a syndicate's cat model.
 A syndicate's *belief* about the cat process, used to compute its catastrophe ELF and its portfolio tail measure. An estimate of the cat process that may be systematically wrong.
 _Avoid_: treating as ground truth.
 
+**Tail sample**:
+One draw of a syndicate's believed catastrophe years from its own **cat model** — the occurrences striking each zone in each believed year — held and reread rather than redrawn. Every model-anchored Monte-Carlo read consumes the same draws, and the draws are exposure-free, so one sample serves the syndicate's whole year: every band, every candidate line, and the book as it grows. It is what makes the **portfolio tail measure**'s trial count clear its own return period affordably, and it is what puts the syndicates competing for a band on the same simulated futures.
+_Avoid_: reading it as a cache of *results* — the measure still responds to the book, the candidate and the treaty; what is reused is the believed world they are read against.
+
 **Headroom**:
 A syndicate's free exposure budget relative to its capital — how much more risk it can write before hitting its exposure limits. The local state that drives its AvT multiplier.
 

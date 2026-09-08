@@ -156,6 +156,16 @@ A quote is **declined** when adding the risk would breach either limit, or when 
 
 Because both limits and the cost-of-capital loading read *current* capital and the *same* tail measure, a post-cat drawdown **tightens capacity and raises price at once** — the capacity crunch and the hardening are two faces of one depletion. This is a core driver of the cycle (#1, #2, #6, #7), emerging from local capital accounting with no market-phase variable.
 
+### Estimating it: the tail sample
+
+The measure is a Monte-Carlo **order statistic**, and that has one hard consequence: at `n` believed years a 1-in-`R` read is the `ceil(n·(1 − 1/R))`-th of them, which is the **sample maximum** for every `n` below `R`. A tail measure read on fewer trials than its own return period is therefore not a 1-in-`R` at all — it is the worst of `n` believed years, and biased low against the quantile it claims to be. **The trial count must clear the return period.** (#45; the reference market ran below it, at 48 and before that 120, and its cycle statistics were measurably distorted by it.)
+
+Paying for that is a **cost-structure** question, not a trial-count one. Every model-anchored Monte-Carlo read in the model — the portfolio tail measure, the marginal capital a layer consumes, the catastrophe ELF, the expected reinstatement credit — consumes exactly the same draws: a count of believed occurrences per zone per year, each with a damage fraction. Those draws are **exposure-free**, so one **tail sample** of them serves a syndicate's whole year: every band, every candidate line, and the book as it grows. Each syndicate draws its sample once at renewal and reads every quote off it.
+
+Two things follow. The cost of a read stops scaling with the number of quotes, so resolving the return period is affordable — cheaper, in fact, than the unresolved per-quote sampling it replaces. And the syndicates competing for a band are compared on the **same simulated futures** rather than on independently-drawn ones — common random numbers — so the noise that actually matters, the noise in the *comparison*, cancels instead of merely averaging down. Independent sampling per quote is the worst possible arrangement for a comparison, and it is also less faithful: the syndicates are facing the same world.
+
+The samples are drawn over the market's whole territory list in roster order before any quoting, and address zones by territory, so nothing depends on who quotes what or on the order a book lists its zones in.
+
 The exposure measure is defined at a single binding return period (1-in-200 coverability). The design admits further return-period constraints, but the regulatory tail-shape rule (1-in-500 ≤ 135% × 1-in-200) is not imposed: it is a distribution-shape floor that does not bear on any target phenomenon. The return period, solvency fraction, and `line_fraction` are calibration in the code.
 
 ## Placement — how AP forms

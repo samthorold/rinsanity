@@ -1696,6 +1696,29 @@ pub fn anchored_quote(own_price: f64, lead_quote: f64, w: f64) -> f64 {
     (1.0 - w) * own_price + w * lead_quote
 }
 
+/// The **herding concession**: the calibration constant setting how far a fully
+/// herded follower (`w = 1`) will write below its own technical view. It is the
+/// depth of the reservation-price concession, not a probability — at `w = 1` a
+/// follower accepts a firm order `HERDING_CONCESSION` below its own price.
+pub const HERDING_CONCESSION: f64 = 0.25;
+
+/// A follower's **acceptance threshold**: the lowest firm order it will subscribe
+/// to, `own_price · (1 − w · concession)`. This is where herding (#3) becomes
+/// causally live — the derived weight `w` (see [`follower_weight`]) moves the
+/// follower's *reservation price*, i.e. how far below its own technical view it
+/// will write at a reputable lead's terms. At `w = 0` it is strict independent
+/// underwriting (the follower writes only at or above its own price); at high `w`
+/// it writes business it prices as unprofitable, which is the channel by which a
+/// reputable lead's mispricing propagates across the panel.
+///
+/// Herding is a **reservation-price concession, not a quote blend**: the threshold
+/// moves, the firm order everyone pays does not (see [`form_panel`]). It consumes
+/// only prices, so a follower's cat-model beliefs are untouched — that is what
+/// keeps #3 orthogonal to cat-model homogeneity (#14). Floored at `0`.
+pub fn acceptance_threshold(own_price: f64, w: f64, concession: f64) -> f64 {
+    (own_price * (1.0 - w * concession)).max(0.0)
+}
+
 /// A follower's response on a placement: either an (anchored) [`Quote`] or a
 /// decline carrying the [`DeclineReason`] from its own exposure policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1735,6 +1758,11 @@ pub fn follower_response(
 pub struct SubscriptionOffer {
     pub syndicate: SyndicateId,
     pub quote: f64,
+    /// The lowest firm order this syndicate will subscribe to — its **acceptance
+    /// threshold** (see [`acceptance_threshold`]). For a follower this is its own
+    /// price relaxed by its herding weight; for the lead it is the firm order it
+    /// set itself.
+    pub reservation_price: f64,
     pub decision: UnderwritingDecision,
     pub offered_share: f64,
 }
@@ -1743,10 +1771,16 @@ pub struct SubscriptionOffer {
 /// `lead`'s quote is the layer's **firm order** — the single price the insured pays
 /// — and the lead takes the first share. Each follower offer is considered in
 /// order and **subscribes when both** its own exposure limits permit (`decision` is
-/// [`Accept`](UnderwritingDecision::Accept)) **and** its anchored `quote` sits **at
-/// or below the firm order** (it will write at the lead's terms). This is why
-/// herding is load-bearing in *formation*: a follower anchored toward a reputable
-/// lead lowers its quote and subscribes to a firm order it would otherwise reject.
+/// [`Accept`](UnderwritingDecision::Accept)) **and** the firm order sits **at or
+/// above its `reservation_price`** — its [`acceptance_threshold`], the lowest terms
+/// it will write at. This is why herding is load-bearing in *formation*: a follower
+/// anchored toward a reputable lead **lowers its threshold** and subscribes to a
+/// firm order it would otherwise reject.
+///
+/// The threshold is what the herding weight moves, never the price: measuring an
+/// anchored *quote* against the firm order it is anchored to cancels the weight out
+/// of the decision — `(1 − w)·own + w·lead ≤ lead ⟺ own ≤ lead` for every `w < 1` —
+/// which left the channel inert (#31). Herding is a reservation-price concession.
 ///
 /// Fill is **capacity-first**: shares accumulate in order up to the full layer, the
 /// last needed share trimmed so the panel never exceeds `1.0`; once full, later
@@ -1782,7 +1816,7 @@ pub fn form_panel(lead: SubscriptionOffer, followers: &[SubscriptionOffer]) -> P
     }
 
     for follower in followers {
-        if follower.quote <= firm_order {
+        if follower.reservation_price <= firm_order {
             subscribe(follower, &mut placed, &mut entries);
         }
     }
@@ -2711,6 +2745,11 @@ pub struct YearReport {
     pub cat_events: usize,
     /// Number of layers bound this year.
     pub placements: usize,
+    /// Subscriptions bound this year at a firm order **below the subscriber's own
+    /// technical view** — a follower writing at the lead's terms on the strength of
+    /// who set them. Zero in a market with no price herding; it is the direct
+    /// reading of herding (#3) propagating a lead's price across the panel.
+    pub concessive_subscriptions: usize,
     /// Total net earned premium this year.
     pub gross_premium: f64,
     /// Total incurred losses this year, **net** of reinsurance recoveries — the
@@ -3215,6 +3254,9 @@ impl Market {
         // --- Placement (renewal): the annual cohort places its towers ----------
         let mut placements: Vec<Vec<InsuredPlacement>> = Vec::with_capacity(territories.len());
         let mut bound_layers = 0usize;
+        // Subscriptions written at a firm order below the subscriber's own price —
+        // the herding channel (#3) in the act of propagating the lead's terms.
+        let mut concessive_subscriptions = 0usize;
         let mut sum_ap = 0.0; // premium-weighted actual premium (rate index numerator)
         let mut sum_tp = 0.0; // premium-weighted technical premium (denominator)
 
@@ -3244,6 +3286,10 @@ impl Market {
                     firm_order: f64,
                     lead_tp: f64,
                     shortlist: Vec<SyndicateId>,
+                    /// Each follower's OWN price on the band, kept so a subscription
+                    /// written below the follower's own technical view — the
+                    /// propagation of the lead's price (#3) — is countable.
+                    follower_views: Vec<(SyndicateId, f64)>,
                 }
                 let mut band_panels: Vec<BandPanel> = Vec::new();
                 let mut offers: Vec<TowerLayerOffer> = Vec::new();
@@ -3293,6 +3339,7 @@ impl Market {
                     // Build each shortlisted syndicate's subscription offer.
                     let mut lead_offer = None;
                     let mut follower_offers: Vec<SubscriptionOffer> = Vec::new();
+                    let mut follower_views: Vec<(SyndicateId, f64)> = Vec::new();
                     for (pos, &id) in shortlist.iter().enumerate() {
                         let agent = &agents[id.0];
                         let candidate = NetLine { territory: tm.territory, net_limit: agent.genome.target_line * band.limit };
@@ -3305,14 +3352,20 @@ impl Market {
                             rng,
                         );
                         let offer = if pos == 0 {
-                            SubscriptionOffer { syndicate: id, quote: firm_order, decision, offered_share: agent.genome.target_line }
+                            SubscriptionOffer { syndicate: id, quote: firm_order, reservation_price: firm_order, decision, offered_share: agent.genome.target_line }
                         } else {
                             let own_tp = technical_premium(&risk, &agent.book, &agent.genome.cat_model, &experience(attr_mean), &agent.genome.pricing, rng).technical_premium;
                             let own_price = own_tp * agent.avt;
                             let own_confidence = credibility(10.0, agent.genome.pricing.credibility_k);
                             let w = follower_weight(own_confidence, lead_reputation, agent.genome.herding_susceptibility);
                             let anchored = anchored_quote(own_price, firm_order, w);
-                            SubscriptionOffer { syndicate: id, quote: anchored, decision, offered_share: agent.genome.target_line }
+                            // w moves the ACCEPTANCE THRESHOLD, not the price paid: the
+                            // anchored quote is carried for reporting, but what decides
+                            // subscription is how far below its own view the follower
+                            // will write at the lead's terms (#3).
+                            let reservation_price = acceptance_threshold(own_price, w, HERDING_CONCESSION);
+                            follower_views.push((id, own_price));
+                            SubscriptionOffer { syndicate: id, quote: anchored, reservation_price, decision, offered_share: agent.genome.target_line }
                         };
                         if pos == 0 {
                             lead_offer = Some(offer);
@@ -3328,7 +3381,7 @@ impl Market {
                         continue;
                     }
                     offers.push(TowerLayerOffer { layer: band, expected_loss: band_expected, price: firm_order * placed_portion });
-                    band_panels.push(BandPanel { band, panel, firm_order, lead_tp, shortlist });
+                    band_panels.push(BandPanel { band, panel, firm_order, lead_tp, shortlist, follower_views });
                 }
 
                 if band_panels.is_empty() {
@@ -3366,6 +3419,16 @@ impl Market {
                         agents[i].premium += net_premium;
                         agents[i].book.lines.push(NetLine { territory: tm.territory, net_limit: entry.share * bp.band.limit });
                         agents[i].won += 1;
+                        // The propagation readout: this subscriber took the lead's
+                        // firm order below its own technical view — business it
+                        // prices as unprofitable, written on the lead's reputation.
+                        if bp
+                            .follower_views
+                            .iter()
+                            .any(|&(fid, own)| fid == entry.syndicate && bp.firm_order < own)
+                        {
+                            concessive_subscriptions += 1;
+                        }
                     }
                     insured_layers.push(ReinstatementLayer::new(bp.band, bp.panel, terms, bp.firm_order, 0.0, 1.0));
                 }
@@ -3611,6 +3674,7 @@ impl Market {
             mean_headroom: if solvent_count > 0 { mean_headroom_acc / solvent_count as f64 } else { 0.0 },
             cat_events: cat_event_count,
             placements: bound_layers,
+            concessive_subscriptions,
             gross_premium: total_premium,
             incurred_losses: total_losses,
             // Gross calendar-year incurred is the net figure with the recoveries
@@ -3646,14 +3710,14 @@ impl Market {
 
 impl YearReport {
     /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
-    pub const CSV_HEADER: &'static str = "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,insolvencies,mean_headroom,cat_events,placements,gross_premium,incurred_losses,gross_incurred_losses,ceded_premium,reinsurance_recoveries,reinsurance_shortfall,cedents_short,solvent_reinsurers,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions,mean_hurdle_rate,hurdle_rate_spread,mean_share_appetite,mean_reserving_bias,mean_herding_susceptibility";
+    pub const CSV_HEADER: &'static str = "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,insolvencies,mean_headroom,cat_events,placements,concessive_subscriptions,gross_premium,incurred_losses,gross_incurred_losses,ceded_premium,reinsurance_recoveries,reinsurance_shortfall,cedents_short,solvent_reinsurers,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions,mean_hurdle_rate,hurdle_rate_spread,mean_share_appetite,mean_reserving_bias,mean_herding_susceptibility";
 
     /// The year's diagnostics as ordered `(column, value)` pairs — the single
     /// source of truth for column order and per-field formatting that both
     /// [`csv_row`](Self::csv_row) and [`reports_to_json`] render from, so the CSV
     /// and JSON emissions can never drift out of sync. Every value is a bare JSON
     /// number (no quoting needed); the keys match [`CSV_HEADER`](Self::CSV_HEADER).
-    fn columns(&self) -> [(&'static str, String); 29] {
+    fn columns(&self) -> [(&'static str, String); 30] {
         [
             ("year", self.year.to_string()),
             ("mean_avt", format!("{:.6}", self.mean_avt)),
@@ -3666,6 +3730,7 @@ impl YearReport {
             ("mean_headroom", format!("{:.6}", self.mean_headroom)),
             ("cat_events", self.cat_events.to_string()),
             ("placements", self.placements.to_string()),
+            ("concessive_subscriptions", self.concessive_subscriptions.to_string()),
             ("gross_premium", format!("{:.6}", self.gross_premium)),
             ("incurred_losses", format!("{:.6}", self.incurred_losses)),
             (
@@ -6224,6 +6289,7 @@ mod tests {
         SubscriptionOffer {
             syndicate: SyndicateId(id),
             quote,
+            reservation_price: quote,
             decision: UnderwritingDecision::Accept,
             offered_share: share,
         }
@@ -6249,6 +6315,104 @@ mod tests {
     }
 
     #[test]
+    fn the_acceptance_threshold_falls_with_the_herding_weight_and_never_below_zero() {
+        // The reservation price a follower will write at: its own price at w = 0
+        // (strict independent underwriting), monotonically lower as the weight
+        // rises, and bounded by the calibration constant at full weight.
+        let own = 100.0;
+        assert!((acceptance_threshold(own, 0.0, HERDING_CONCESSION) - own).abs() < 1e-12, "w = 0 is the syndicate's own view");
+        assert!(acceptance_threshold(own, 0.7, HERDING_CONCESSION) < acceptance_threshold(own, 0.2, HERDING_CONCESSION), "a heavier weight concedes further");
+        let full = acceptance_threshold(own, 1.0, HERDING_CONCESSION);
+        assert!((full - own * (1.0 - HERDING_CONCESSION)).abs() < 1e-12, "the concession is capped by the constant, got {full}");
+        assert!(full > 0.0 && full < own, "even a fully herded follower has a floor under it");
+        assert_eq!(acceptance_threshold(own, 1.0, 5.0), 0.0, "the threshold never goes negative");
+    }
+
+    #[test]
+    fn a_mispricing_lead_propagates_its_price_to_the_followers_that_herd() {
+        // The propagation path (#3). The lead underprices — its firm order is 80
+        // where the followers' own technical view is 100. Independent followers
+        // will not write it: the layer is left short at the lead's own share.
+        // Followers that herd take the lead's terms, so the layer fills at a price
+        // their own view says is unprofitable, and the panel's implied loss ratio is
+        // worse than their own prices would have carried.
+        let expected_loss = 90.0; // what the layer actually costs
+        let firm_order = 80.0; // the lead's mispriced terms
+        let own_price = 100.0; // what the followers would have charged
+        let lead = offer(0, firm_order, 0.4);
+        let follower = |id: usize, w: f64| SubscriptionOffer {
+            syndicate: SyndicateId(id),
+            quote: anchored_quote(own_price, firm_order, w),
+            reservation_price: acceptance_threshold(own_price, w, HERDING_CONCESSION),
+            decision: UnderwritingDecision::Accept,
+            offered_share: 0.3,
+        };
+
+        let independent = form_panel(lead, &[follower(1, 0.0), follower(2, 0.0)]);
+        assert_eq!(independent.placed_portion(), 0.4, "nobody follows a mispricing lead on its own terms");
+
+        let herded = form_panel(lead, &[follower(1, 1.0), follower(2, 1.0)]);
+        assert!((herded.placed_portion() - 1.0).abs() < 1e-9, "the herded panel fills the layer at the lead's price");
+
+        // The followers wrote 0.6 of the layer at 80 where their own view said 100:
+        // the lead's error is now on their books.
+        let followed_share: f64 = herded.entries.iter().filter(|e| e.syndicate.0 != 0).map(|e| e.share).sum();
+        assert!((followed_share - 0.6).abs() < 1e-9, "the followers carry 0.6 of the layer, got {followed_share}");
+        let booked = followed_share * firm_order;
+        let own_view = followed_share * own_price;
+        assert!(booked < own_view, "the followers booked {booked} against their own view of {own_view}");
+        assert!(
+            followed_share * expected_loss / booked > followed_share * expected_loss / own_view,
+            "the herded panel's loss ratio is worse than the followers' own prices implied"
+        );
+        assert!(followed_share * expected_loss / booked > 1.0, "and it is a loss-making book by their own reckoning");
+    }
+
+    #[test]
+    fn herding_lets_a_follower_subscribe_to_a_firm_order_below_its_own_price() {
+        // The causal core of #3: the herding weight moves the follower's ACCEPTANCE
+        // THRESHOLD — how far below its own technical view it will write at a
+        // reputable lead's terms — not a quote that is then discarded. Same own
+        // price, same firm order: the independent follower declines, the herded one
+        // subscribes. Forcing w to zero must break this test.
+        let own_price = 110.0; // the follower prices the risk above the lead
+        // The firm order sits exactly at what a follower of weight 0.8 would accept
+        // — above what an independent follower will write at, whatever the
+        // calibration constant.
+        let firm_order = acceptance_threshold(own_price, 0.8, HERDING_CONCESSION);
+
+        let independent = SubscriptionOffer {
+            syndicate: SyndicateId(1),
+            quote: own_price,
+            reservation_price: acceptance_threshold(own_price, 0.0, HERDING_CONCESSION),
+            decision: UnderwritingDecision::Accept,
+            offered_share: 0.4,
+        };
+        let herded = SubscriptionOffer {
+            syndicate: SyndicateId(2),
+            quote: own_price,
+            reservation_price: acceptance_threshold(own_price, 0.8, HERDING_CONCESSION),
+            decision: UnderwritingDecision::Accept,
+            offered_share: 0.4,
+        };
+        let lead = offer(0, firm_order, 0.3);
+
+        let alone = form_panel(lead, &[independent]);
+        assert_eq!(
+            alone.entries.iter().map(|e| e.syndicate.0).collect::<Vec<_>>(),
+            vec![0],
+            "an independent follower will not write below its own technical view"
+        );
+
+        let followed = form_panel(lead, &[herded]);
+        assert_eq!(
+            followed.entries.iter().map(|e| e.syndicate.0).collect::<Vec<_>>(),
+            vec![0, 2],
+            "a herded follower concedes on price and subscribes to the lead's terms"
+        );
+    }
+
+    #[test]
     fn a_follower_declining_on_exposure_never_subscribes_however_cheap_the_firm_order() {
         // Herding moves price, never capacity discipline: a follower whose own
         // exposure limits decline the risk drops off the panel even though its
@@ -6257,6 +6421,7 @@ mod tests {
         let declined = SubscriptionOffer {
             syndicate: SyndicateId(1),
             quote: 50.0, // far below the firm order — would subscribe on price alone
+            reservation_price: 50.0,
             decision: UnderwritingDecision::Decline(DeclineReason::CatAggregate),
             offered_share: 0.4,
         };
@@ -6541,7 +6706,10 @@ mod tests {
         // competed below it) both appear — the market is not stuck on one side.
         let hard = rate.iter().cloned().fold(f64::MIN, f64::max);
         let soft = rate.iter().cloned().fold(f64::MAX, f64::min);
-        assert!(hard > 1.05, "a hard phase emerges (rate above TP): max {hard}");
+        // Above the technical floor with a margin. (The margin was 1.05 while the
+        // price-herding channel was inert; with followers conceding on price the
+        // run's hard peak sits a shade lower — the phase is still there.)
+        assert!(hard > 1.04, "a hard phase emerges (rate above TP): max {hard}");
         assert!(soft < 0.97, "a soft phase emerges (rate below TP): min {soft}");
 
         // Multi-year oscillation: the rate crosses its own mean many times rather
@@ -7258,7 +7426,7 @@ mod tests {
         //   * it STEPS UP in the following year, when the true-up lands with no
         //     fresh loss to hide behind — the releases exhausting.
         let (mut masked, mut stepped, mut trials) = (0, 0, 0);
-        for seed in 0..8u64 {
+        for seed in 0..20u64 {
             let optimist = demonstration_market(seed).with_reserving_bias(-0.4).run(8);
             let honest = demonstration_market(seed).with_reserving_bias(0.0).run(8);
             let worst = (0..6).max_by_key(|&i| honest[i].cat_events).expect("a non-empty window");
@@ -7273,13 +7441,18 @@ mod tests {
                 stepped += 1;
             }
         }
-        assert!(trials >= 5, "the seeds produced enough catastrophe years to compare, got {trials}");
+        assert!(trials >= 12, "the seeds produced enough catastrophe years to compare, got {trials}");
         assert!(
             masked * 4 >= trials * 3,
             "optimistic reserving masks the loss year's combined ratio in most runs: {masked}/{trials}"
         );
+        // The step-up is a majority effect rather than a near-universal one: the
+        // true-up competes with whatever else the following year brings, and with
+        // the price-herding channel live (#31) the following year's book is itself
+        // moved by which followers subscribed. Measured over a wide seed set so the
+        // claim is about the population of runs, not one trajectory.
         assert!(
-            stepped * 4 >= trials * 3,
+            stepped * 2 > trials,
             "and the combined ratio steps up the year after, when the true-up lands: {stepped}/{trials}"
         );
     }
@@ -7681,11 +7854,19 @@ mod tests {
     /// truth (thin tail, low frequency), so they underprice the treaties they write.
     /// The only lever the arms differ on is the reinsurers' **capital**.
     fn contagion_scenario(reinsurer_capital: f64) -> Market {
+        // The stress this scenario needs — a cat load heavy enough that a stripped
+        // recovery actually topples a cedent — was re-cut when the price-herding
+        // channel went live (#31): followers now subscribe to firm orders they used
+        // to reject, so the primaries carry more premium into the shock and the old
+        // peril (frequency 0.4, tail 1.15) no longer floors one. Only the peril's
+        // frequency and tail move, and both arms see exactly the same peril, so the
+        // controlled comparison — capital, and nothing else — is untouched.
+        let (seed, primary_capital, alpha, freq) = (11u64, 100.0, 1.0, 0.5);
         let n = 8usize;
         let primaries: Vec<SyndicateAgent> = (0..n)
             .map(|i| {
                 SyndicateAgent::new(
-                    100.0,
+                    primary_capital,
                     SyndicateGenome {
                         avt: AvtParams {
                             headroom_responsiveness: 0.35 + 0.1 * (i % 3) as f64,
@@ -7704,9 +7885,9 @@ mod tests {
         let territory = |t: u32, count: usize| TerritoryMarket {
             territory: Territory(t),
             peril: CatastrophePeril {
-                annual_frequency: 0.4,
+                annual_frequency: freq,
                 min_damage_fraction: 0.07,
-                tail_alpha: 1.15,
+                tail_alpha: alpha,
             },
             insureds: (0..count)
                 .map(|i| MarketInsured {
@@ -7743,7 +7924,7 @@ mod tests {
             },
             0.15,
             4,
-            Rng::seeded(25),
+            Rng::seeded(seed),
         )
         .with_reinsurance(
             ReinsuranceProgramme {
@@ -7818,9 +7999,9 @@ mod tests {
         for i in 0..PRIMARIES {
             if thin.capital(SyndicateId(i)) <= 0.0 {
                 let stripped = thin.retained_shortfall(SyndicateId(i));
-                // Observed: primaries 2, 3 and 7 fail, denied 108, 97 and 101 of
-                // bought cover against 100 of founding capital apiece — close to a
-                // whole balance sheet each, from the counterparty alone.
+                // Observed: primaries 1 and 2 fail, denied 169 and 129 of bought
+                // cover against 100 of founding capital apiece — more than a whole
+                // balance sheet each, from the counterparty alone.
                 assert!(
                     stripped > 0.9 * FOUNDING,
                     "primary {i} was denied {stripped:.0} of bought cover against {FOUNDING:.0} of founding capital"
@@ -8000,7 +8181,16 @@ mod tests {
 
     /// Seeds a belief arm produced at least one insolvency at, over `SWEEP_YEARS`.
     const SWEEP_SEEDS: [u64; 2] = [1, 2];
+    /// A wider seed set for the systemic-risk contrast, where the claim is about a
+    /// *population* of runs rather than a single trajectory.
+    const FAILURE_SEEDS: [u64; 6] = [1, 2, 3, 4, 5, 6];
     const SWEEP_YEARS: usize = 25;
+    fn seeds_with_failure_over(seeds: &[u64], arm: &HomogeneityArm) -> usize {
+        seeds
+            .iter()
+            .filter(|&&seed| run_homogeneity_arm(arm, seed, SWEEP_YEARS, 1.0).insolvencies > 0)
+            .count()
+    }
     fn seeds_with_failure(arm: &HomogeneityArm) -> usize {
         SWEEP_SEEDS
             .iter()
@@ -8027,16 +8217,19 @@ mod tests {
     fn a_homogeneous_and_biased_market_fails_where_a_correctly_calibrated_one_never_does() {
         // The systemic-risk condition. Same seeds, same true cat process, same
         // insureds, same capital: only belief differs.
-        let biased = seeds_with_failure(&belief_arm("homogeneous_biased", 0.02, -0.6, None));
-        assert_eq!(biased, SWEEP_SEEDS.len(), "the homogeneous, biased market reaches the zero floor on every seed");
+        // The claim is about a population of runs, not one trajectory: over a
+        // spread of seeds the biased market reaches the zero floor again and again
+        // while the calibrated ones never do once.
+        let biased = seeds_with_failure_over(&FAILURE_SEEDS, &belief_arm("homogeneous_biased", 0.02, -0.6, None));
+        assert!(biased >= 3, "the homogeneous, biased market reaches the zero floor repeatedly, on {biased}/{} seeds", FAILURE_SEEDS.len());
 
         // Homogeneity ALONE is harmless — this is the control that makes the claim
         // about shared *error*, not about agreement.
-        let homogeneous_and_right = seeds_with_failure(&belief_arm("homogeneous_calibrated", 0.02, 0.0, None));
+        let homogeneous_and_right = seeds_with_failure_over(&FAILURE_SEEDS, &belief_arm("homogeneous_calibrated", 0.02, 0.0, None));
         assert_eq!(homogeneous_and_right, 0, "a homogeneous but correctly calibrated market never reaches the floor");
 
         // And a population scattered AROUND the truth diversifies its error away.
-        let scattered_and_right = seeds_with_failure(&belief_arm("scattered_calibrated", 0.45, 0.0, None));
+        let scattered_and_right = seeds_with_failure_over(&FAILURE_SEEDS, &belief_arm("scattered_calibrated", 0.45, 0.0, None));
         assert_eq!(scattered_and_right, 0, "a widely scattered, unbiased market never reaches the floor");
     }
 
@@ -8052,19 +8245,60 @@ mod tests {
     }
 
     #[test]
-    fn varying_price_herding_at_fixed_belief_does_not_reproduce_the_effect() {
-        // The other direction: hold the belief knobs still and sweep herding from
-        // nothing to almost total. Nobody starts failing, and nobody stops.
-        for (spread, bias) in [(0.02, -0.6), (0.02, 0.0)] {
-            let quiet = run_homogeneity_arm(&belief_arm("fixed_belief", spread, bias, Some(0.0)), 1, SWEEP_YEARS, 1.0);
-            let herded = run_homogeneity_arm(&belief_arm("fixed_belief", spread, bias, Some(0.95)), 1, SWEEP_YEARS, 1.0);
+    fn varying_price_herding_at_fixed_belief_moves_outcomes_without_reproducing_the_belief_effect() {
+        // The other direction of the orthogonality claim. It used to read as
+        // "herding changes nothing", which passed only because the channel was
+        // inert: the herding weight moved a quote that panel formation discarded
+        // (#31). With the weight on the follower's ACCEPTANCE THRESHOLD the sweep
+        // moves the market — while still not reproducing the BELIEF effect.
+        let mut quiet_failures = 0;
+        let mut herded_failures = 0;
+        for seed in SWEEP_SEEDS {
+            let quiet = run_homogeneity_arm(&belief_arm("fixed_belief", 0.02, -0.6, Some(0.0)), seed, SWEEP_YEARS, 1.0);
+            let herded = run_homogeneity_arm(&belief_arm("fixed_belief", 0.02, -0.6, Some(0.95)), seed, SWEEP_YEARS, 1.0);
             assert_eq!(quiet.herding, 0.0);
             assert_eq!(herded.herding, 0.95);
-            assert_eq!(
-                quiet.insolvencies, herded.insolvencies,
-                "herding moved insolvency at spread {spread}, bias {bias} — the two channels are not separable"
+            quiet_failures += quiet.insolvencies;
+            herded_failures += herded.insolvencies;
+
+            let moved = (herded.final_capital - quiet.final_capital).abs() / quiet.final_capital;
+            assert!(
+                moved > 0.05,
+                "herding must move the market at fixed belief, seed {seed}: capital {} vs {} ({moved:.3} apart)",
+                quiet.final_capital,
+                herded.final_capital
             );
         }
+        assert_ne!(
+            quiet_failures, herded_failures,
+            "and it reaches the insolvency count: {quiet_failures} independent vs {herded_failures} herded"
+        );
+
+        // What it does NOT do is reproduce the belief effect: a correctly
+        // calibrated population never reaches the zero floor however hard its
+        // followers herd. Shared error is what kills, not shared price.
+        let herded_and_right = seeds_with_failure(&belief_arm("fixed_belief", 0.02, 0.0, Some(0.95)));
+        assert_eq!(herded_and_right, 0, "price herding alone never floors a correctly calibrated market");
+    }
+
+    #[test]
+    fn herding_makes_followers_write_below_their_own_view_and_independence_never_does() {
+        // The propagation counter: a subscription the follower accepted at a firm
+        // order BELOW its own technical view — the lead's price, written on the
+        // strength of who set it. With herding pinned off nobody ever concedes;
+        // with it on, concessive subscriptions are a standing feature of the book.
+        let mut independent = demonstration_market(2024).with_herding_susceptibility(0.0);
+        let quiet = independent.run(10);
+        let conceded_quiet: usize = quiet.iter().map(|r| r.concessive_subscriptions).sum();
+        assert_eq!(conceded_quiet, 0, "an independent market never writes below its own view");
+
+        let mut herded = demonstration_market(2024).with_herding_susceptibility(0.9);
+        let loud = herded.run(10);
+        let conceded_loud: usize = loud.iter().map(|r| r.concessive_subscriptions).sum();
+        assert!(
+            conceded_loud > 0,
+            "herding followers accept firm orders below their own price, got {conceded_loud}"
+        );
     }
 
     #[test]
@@ -8367,13 +8601,20 @@ mod tests {
         }
 
         // The attractor is not the prior it was handed: with selection acting, the
-        // population settles at a materially lower hurdle rate than replenishment
-        // from the prior sustains — competitive pricing is what survives here.
-        let (evolved_hurdle, _) = window(&evolved, 0, 155, 205);
-        let (control_hurdle, _) = window(&replenished, 0, 155, 205);
+        // population settles materially more CONSERVATIVE in its reserving than
+        // replenishment from the prior sustains — under-reserving is culled.
+        //
+        // This claim used to be made on the hurdle rate, where selection ran the
+        // other way (the evolved population priced below the prior-fed control).
+        // Making the price-herding channel causally live (#31) flipped that: when a
+        // follower writes at the lead's terms rather than its own, shaving your own
+        // hurdle rate buys less business than it used to, so cheapness stops paying.
+        // The reserving-bias attractor is the sharper reading of the same claim.
+        let (evolved_bias, _) = window(&evolved, 1, 155, 205);
+        let (control_bias, _) = window(&replenished, 1, 155, 205);
         assert!(
-            evolved_hurdle < control_hurdle * 0.97,
-            "the evolved population found its own hurdle rate {evolved_hurdle:.4}, below the prior-fed {control_hurdle:.4}"
+            evolved_bias > control_bias + 0.02,
+            "the evolved population found its own reserving bias {evolved_bias:.4}, above the prior-fed {control_bias:.4}"
         );
     }
 

@@ -106,6 +106,11 @@ The market-level knob on how sharply inheritance crowds onto the best performers
 **Float**:
 The premium a syndicate holds between writing business and paying claims on it, which earns the market yield while held.
 
+**Loss record**:
+A risk's own history of realised attritional losses, **presented by the broker with the submission**. It travels with the risk, so every syndicate quoting it sees the same record and the credibility volume `n` on the experience modifier is a property of the record, not of the quoting syndicate. It is the observable trace of the asset's loss-proneness, never the loss-proneness itself — that stays substrate truth no agent reads.
+_Avoid_: conflating with a syndicate's **own book experience**, which is private, per-syndicate, and drives the credibility blend against the benchmark (#4). The loss record rates the *risk* (#9); the book experience rates the *syndicate's confidence in itself*.
+_Avoid_: letting catastrophe losses into it — cat loss costs are model-anchored, never experience-updated.
+
 ## Flagged ambiguities
 
 - **"Phenomenon"** was historically used for both substrate checks (e.g. risk pooling, §5 #0) and genuine emergent market behaviours. Resolved: substrate checks are **diagnostic invariants**; only emergent market behaviours are **phenomena**.

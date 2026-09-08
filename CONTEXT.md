@@ -122,6 +122,11 @@ A risk's own history of realised attritional losses, **presented by the broker w
 _Avoid_: conflating with a syndicate's **own book experience**, which is private, per-syndicate, and drives the credibility blend against the benchmark (#4). The loss record rates the *risk* (#9); the book experience rates the *syndicate's confidence in itself*.
 _Avoid_: letting catastrophe losses into it — cat loss costs are model-anchored, never experience-updated.
 
+**Own book experience**:
+A syndicate's private record of what it has written in the attritional class and what that book has actually burnt: accumulated exposure-years, the benchmark expectation on them, and the realised loss. It is the `own` half of the credibility blend and the volume `n` that weighs it, so it is what turns accumulated exposure into confidence — specialism is **earned** here (#4). No two syndicates hold the same one.
+_Avoid_: conflating with the **loss record**, which is the risk's, is presented by the broker, and is identical in every syndicate's hands. This one is the syndicate's own and is never shown to anyone.
+_Avoid_: letting catastrophe losses into it, for the same reason as the loss record.
+
 **Acceptance threshold**:
 A follower's **reservation price** on a placement: the lowest firm order it will subscribe to, its own technical view relaxed by its herding weight. This — not a quote — is what price herding moves: a follower anchored toward a reputable lead lowers its threshold and writes business it prices as unprofitable. At zero weight it is exactly the syndicate's own price (strict independent underwriting).
 _Avoid_: calling herding a "quote blend" in the context of the subscription decision; measuring an anchored quote against the firm order it is anchored to cancels the weight out entirely. The anchored quote survives as a reporting figure only.

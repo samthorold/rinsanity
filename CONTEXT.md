@@ -111,6 +111,17 @@ A risk's own history of realised attritional losses, **presented by the broker w
 _Avoid_: conflating with a syndicate's **own book experience**, which is private, per-syndicate, and drives the credibility blend against the benchmark (#4). The loss record rates the *risk* (#9); the book experience rates the *syndicate's confidence in itself*.
 _Avoid_: letting catastrophe losses into it — cat loss costs are model-anchored, never experience-updated.
 
+**Acceptance threshold**:
+A follower's **reservation price** on a placement: the lowest firm order it will subscribe to, its own technical view relaxed by its herding weight. This — not a quote — is what price herding moves: a follower anchored toward a reputable lead lowers its threshold and writes business it prices as unprofitable. At zero weight it is exactly the syndicate's own price (strict independent underwriting).
+_Avoid_: calling herding a "quote blend" in the context of the subscription decision; measuring an anchored quote against the firm order it is anchored to cancels the weight out entirely. The anchored quote survives as a reporting figure only.
+
+**Herding concession**:
+The calibration constant setting how far below its own technical view a *fully* herded follower will write. It is the depth of the reservation-price concession, never a probability of following.
+
+**Concessive subscription**:
+A subscription bound at a firm order **below the subscriber's own price** — a follower writing at the lead's terms on the strength of who set them. The countable trace of a lead's mispricing propagating across a panel, emitted per year.
+_Avoid_: reading it as a discount given to the insured; the insured pays the firm order either way, and it is the follower's margin, not the price, that moves.
+
 ## Flagged ambiguities
 
 - **"Phenomenon"** was historically used for both substrate checks (e.g. risk pooling, §5 #0) and genuine emergent market behaviours. Resolved: substrate checks are **diagnostic invariants**; only emergent market behaviours are **phenomena**.

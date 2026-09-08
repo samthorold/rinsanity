@@ -10449,6 +10449,19 @@ mod tests {
         // than diffusing. The control is the SAME market replenishing entrants from
         // the fixed prior — a distribution refilled from a source no market outcome
         // can move, which is why culling alone only prunes.
+        //
+        // PROVENANCE (#44). The three claims below — stationarity, bounded
+        // dispersion, and tighter-than-the-prior-fed-control — have not been
+        // touched since they were written. They stood unchanged through #31
+        // (herding made causally live in the follower's price), #32 (Lloyd's-scale
+        // lines, so layers place across many followers), #35 (the seed-panel
+        // discipline) and #36 (experience rating giving a syndicate's own burning
+        // cost a say in its price): four consecutive PRs that each demonstrably
+        // moved market trajectories. Surviving all four untouched is the strongest
+        // evidence this test carries, and it is recorded here because it is
+        // otherwise invisible — a passing assertion looks the same whether it has
+        // held for four years or four rewrites. If one of them breaks, something
+        // real has changed; that is a finding, not a test to relax.
         let years = 205;
         let evolutionary = demonstration_market(7).capital_supply().expect("the reference market has entry wired").inheritance;
         assert!(evolutionary.is_some(), "the reference market evolves its genome by default (#12)");
@@ -10534,34 +10547,82 @@ mod tests {
             "and the genome as a whole is materially tighter than the control: mean ratio {pooled:.3}"
         );
 
-        // The attractor is not the prior it was handed: with selection acting, the
-        // population settles materially more CONSERVATIVE in its reserving than
-        // replenishment from the prior sustains — under-reserving is culled.
+        // What this test does NOT claim is a DIRECTION — which trait selection
+        // favours, and which way. That claim moved three times (#12 to #31 to #36)
+        // and ended up asserted on a 0.005 margin on one seed; it now lives on its
+        // own, over a fixed seed panel, in
+        // `selection_moves_the_reserving_bias_in_a_consistent_direction_across_the_seed_panel`
+        // (#44). Splitting it out costs the three claims above nothing: they are
+        // about where the distribution sits and how wide it is, not about which way
+        // it was pushed.
+    }
+
+    /// The seed panel the directional-selection claim (#44) is read over, fixed
+    /// in writing before the run and every seat in it counted. Eight contiguous
+    /// seeds: seed 7 — the one seed the claim used to be asserted on — sits
+    /// *inside* the panel rather than being it.
+    const DIRECTIONAL_SELECTION_SEEDS: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    /// The horizon each arm of the panel is run over. Shorter than the attractor
+    /// test's 205 years, on eight times as many trajectories: the question here
+    /// is whether selection has a consistent *direction*, not where one
+    /// population happens to end up.
+    const DIRECTIONAL_SELECTION_YEARS: usize = 100;
+    /// How many of the eight seeds must show the evolved population reserving
+    /// more conservatively than the prior-fed control for the direction to count
+    /// as consistent. Seven of eight is a ~3.5% outcome under a coin-flip null;
+    /// six of eight is ~14%, which is a lean, not a direction. Declared before
+    /// the numbers were seen, and not renegotiable after them.
+    const DIRECTIONAL_SELECTION_AGREEING_SEEDS: usize = 7;
+
+    #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
+    fn selection_moves_the_reserving_bias_in_a_consistent_direction_across_the_seed_panel() {
+        // #44. The DIRECTION of selection, split out of the attractor test above
+        // and read the only way a direction can honestly be read: over a panel of
+        // seeds fixed in advance, counting how many agree on the sign.
         //
-        // This claim used to be made on the hurdle rate, where selection ran the
-        // other way (the evolved population priced below the prior-fed control).
-        // Making the price-herding channel causally live (#31) flipped that: when a
-        // follower writes at the lead's terms rather than its own, shaving your own
-        // hurdle rate buys less business than it used to, so cheapness stops paying.
-        // The reserving-bias attractor is the sharper reading of the same claim.
-        //
-        // WEAKENED (#36). The gap this is read on has narrowed: wiring experience
-        // rating gives a syndicate's own realised burning cost a say in what it
-        // charges, which is a second channel on the same result the reserving bias
-        // moves, and the selection pressure on the bias itself is correspondingly
-        // diluted. The margin required here drops from 0.02 to 0.005 — the third
-        // time this claim has had to move, and it is stated plainly rather than
-        // quietly relaxed. What is added back as evidence, at no cost, is that the
-        // gap now has to hold over BOTH half-centuries rather than only the last:
-        // it is a standing property of the attractor, not one window's accident.
-        for (from, to) in [(105, 155), (155, 205)] {
-            let (evolved_bias, _) = window(&evolved, 1, from, to);
-            let (control_bias, _) = window(&replenished, 1, from, to);
-            assert!(
-                evolved_bias > control_bias + 0.005,
-                "over years {from}..{to} the evolved population found its own reserving bias {evolved_bias:.4}, above the prior-fed {control_bias:.4}"
-            );
-        }
+        // This claim has moved three times. It began on the hurdle rate (#12);
+        // making the price-herding channel causally live (#31) flipped it, because
+        // a follower writing at the lead's terms buys less business by shaving its
+        // own hurdle rate, so cheapness stopped paying, and the claim moved onto
+        // the reserving bias. Panel granularity (#32) and experience rating (#36)
+        // each diluted it further, the latter pushing the required margin down to
+        // 0.005 on a single seed — a number that happens to be positive, not a
+        // claim about selection. Sign consistency across a panel is the instrument
+        // that can actually answer the question, and a null is a valid answer.
+        let evolutionary = demonstration_market(DIRECTIONAL_SELECTION_SEEDS[0])
+            .capital_supply()
+            .expect("the reference market has entry wired")
+            .inheritance;
+        assert!(evolutionary.is_some(), "the reference market evolves its genome by default (#12)");
+
+        // The population's mean reserving bias, averaged over the run's second
+        // half so the reading is of the settled population, not the founders.
+        let settled_mean_bias = |seed: u64, inheritance| {
+            let mut market = demonstration_market(seed).with_inheritance(inheritance);
+            let half = DIRECTIONAL_SELECTION_YEARS / 2;
+            let mut total = 0.0;
+            for year in 0..DIRECTIONAL_SELECTION_YEARS {
+                market.step_year();
+                if year >= half {
+                    total += genome_distribution(&market, |g| g.reserving_bias).0;
+                }
+            }
+            total / (DIRECTIONAL_SELECTION_YEARS - half) as f64
+        };
+
+        // Positive means the evolved population reserves MORE conservatively than
+        // the same market replenishing its entrants from the fixed prior.
+        let gaps: Vec<(u64, f64)> = DIRECTIONAL_SELECTION_SEEDS
+            .iter()
+            .map(|&seed| (seed, settled_mean_bias(seed, evolutionary) - settled_mean_bias(seed, None)))
+            .collect();
+        let agreeing = gaps.iter().filter(|(_, gap)| *gap > 0.0).count();
+        assert!(
+            agreeing >= DIRECTIONAL_SELECTION_AGREEING_SEEDS,
+            "selection moves the reserving bias conservative on {agreeing} of {} seeds, needing {DIRECTIONAL_SELECTION_AGREEING_SEEDS}: {gaps:?}",
+            DIRECTIONAL_SELECTION_SEEDS.len()
+        );
     }
 
     #[test]

@@ -3078,10 +3078,36 @@ pub struct YearReport {
     /// reading of herding (#3) propagating a lead's price across the panel.
     pub concessive_subscriptions: usize,
     /// Insureds that bought **no cover at all** this year — priced out of every
-    /// band they were offered, or offered nothing that placed. It is the exit the
-    /// pool self-selects through (#9): a chronic loss-generator surcharged past
-    /// its willingness-to-pay restructures its tower away and finally declines.
+    /// band they were offered, or offered nothing that placed. Read it with its
+    /// **narrow meaning**: it counts outright exits only. Because
+    /// [`restructure_tower`] sheds the worst value-for-money band first, a risk
+    /// surcharged past its budget usually *shrinks its tower* rather than leaving,
+    /// and that response never reaches this counter. `limit_bound` against
+    /// `limit_offered` is the observable that sees it.
     pub insured_declines: usize,
+    /// The **limit the market put in front of the insureds** this year: for every
+    /// band that formed a panel, the band limit times the portion the panel
+    /// subscribed. The denominator of the band-shedding reading.
+    pub limit_offered: f64,
+    /// What the market **asked for the whole offered tower** as a fraction of the
+    /// **willingness-to-pay** it was asked against, summed over the risks that were
+    /// offered anything. Below `1.0` the pool can buy everything it was shown and
+    /// still has slack — the room a surcharge must climb through before it prices
+    /// a risk out; above `1.0` the tower cannot be bought whole and bands shed.
+    /// Zero in a year that offered nothing.
+    pub offered_price_to_wtp: f64,
+    /// The **attritional share of the loss cost** the market offered cover on this
+    /// year: the attritional expectation over the total (attritional + catastrophe)
+    /// expectation, across the bands that formed a panel. The experience modifier
+    /// scopes to the attritional component only — a cat loss cost is model-anchored
+    /// and never experience-updated — so this is the ceiling on how far a
+    /// surcharge can move a quoted price. Zero in a year that offered nothing.
+    pub attritional_share: f64,
+    /// The **limit the insureds actually kept**: the same figure restricted to the
+    /// bands that survived [`restructure_tower`]. Below `limit_offered` is a pool
+    /// that has shed cover under price without necessarily declining anything
+    /// (#9, and the quantity elasticity that damps the cycle, #1).
+    pub limit_bound: f64,
     /// The **burning cost of the pool the market actually took on** this year:
     /// the mean realised-over-expected on the broker-presented loss records of the
     /// risks bound, weighted by the **attritional exposure** each placement carried
@@ -3410,6 +3436,34 @@ impl Market {
         self
     }
 
+    /// Scale the **catastrophe regime**: every territory's true cat frequency and
+    /// every syndicate's *believed* frequency, moved by the same factor.
+    ///
+    /// Truth and belief move together deliberately. The knob is not a mispricing
+    /// knob — that is [`with_cat_beliefs`](Self::with_cat_beliefs) — it is a
+    /// **regime** knob, and the only thing it changes about the market is the
+    /// **composition of the loss cost**: how much of what an insured is buying
+    /// cover against is the attritional component experience rating (#9) is
+    /// allowed to rate, and how much is the model-anchored catastrophe component it
+    /// is not. It consumes nothing from the market's generator, so `1.0` is the
+    /// market it was applied to, year for year.
+    pub fn with_cat_frequency_scale(mut self, scale: f64) -> Self {
+        for tm in self.territories.iter_mut() {
+            tm.peril.annual_frequency *= scale;
+        }
+        for agent in self.agents.iter_mut() {
+            agent.genome.cat_model.annual_frequency *= scale;
+        }
+        for reinsurer in self.reinsurers.iter_mut() {
+            reinsurer.genome.cat_model.annual_frequency *= scale;
+        }
+        if let Some(supply) = self.capital_supply.as_mut() {
+            supply.population.centre.cat_model.annual_frequency *= scale;
+            supply.population.cat_belief.centre.annual_frequency *= scale;
+        }
+        self
+    }
+
     /// Redraw every territory's cohort of insureds from an [`InsuredPopulation`]:
     /// the risks in the market become genuinely different risks, dispersed in
     /// size, in willingness-to-pay, and in the loss-proneness of the asset itself.
@@ -3688,6 +3742,23 @@ impl Market {
         // at binding, off the records as the brokers presented them.
         let mut pool_exposure = 0.0f64;
         let mut pool_burden = 0.0f64;
+        // The band-shedding readout (#9): the limit the market actually put in
+        // front of the insureds, and how much of it they kept. A risk that sheds
+        // its worst-value band still buys, so this — not `insured_declines` —
+        // is what sees a pool contract under price.
+        let mut limit_offered = 0.0f64;
+        let mut limit_bound = 0.0f64;
+        // The headroom readout (#9): what the market asked for the whole tower it
+        // offered, against the willingness-to-pay it was offered against. It is
+        // the distance a surcharge has to climb before it prices anyone out.
+        let mut offered_price = 0.0f64;
+        let mut offered_wtp = 0.0f64;
+        // The rateable-share readout (#9): how much of the loss cost the market
+        // offered cover on is ATTRITIONAL — the only component an experience
+        // modifier may touch, cat being model-anchored. It bounds how far a
+        // surcharge can move a price at all.
+        let mut offered_attritional_cost = 0.0f64;
+        let mut offered_loss_cost = 0.0f64;
         let mut sum_ap = 0.0; // premium-weighted actual premium (rate index numerator)
         let mut sum_tp = 0.0; // premium-weighted technical premium (denominator)
 
@@ -3837,6 +3908,9 @@ impl Market {
                     if placed_portion <= 0.0 {
                         continue;
                     }
+                    limit_offered += band.limit * placed_portion;
+                    offered_attritional_cost += attr_mean;
+                    offered_loss_cost += band_expected;
                     offers.push(TowerLayerOffer { layer: band, expected_loss: band_expected, price: firm_order * placed_portion });
                     band_panels.push(BandPanel { band, panel, firm_order, lead_tp, shortlist, follower_views, attritional_benchmark: attr_mean });
                 }
@@ -3849,6 +3923,8 @@ impl Market {
                 // worst value-for-money bands when the market hardens (the cycle
                 // damper, #1).
                 let wtp = insured.risk_aversion * expected_total;
+                offered_price += offers.iter().map(|o| o.price).sum::<f64>();
+                offered_wtp += wtp;
                 let kept: Vec<Layer> = match restructure_tower(&offers, wtp) {
                     TowerPurchase::Bound { layers, .. } => layers,
                     TowerPurchase::Declined => continue,
@@ -3861,6 +3937,7 @@ impl Market {
                     bound_layers += 1;
                     panel_members += bp.panel.entries.len();
                     placed_portions += bp.panel.placed_portion();
+                    limit_bound += bp.band.limit * bp.panel.placed_portion();
                     let attritional_exposure = bp.attritional_benchmark * bp.panel.placed_portion();
                     pool_exposure += attritional_exposure;
                     pool_burden += attritional_exposure * insured.loss_record.relativity();
@@ -4198,6 +4275,10 @@ impl Market {
             mean_placed_portion: if bound_layers > 0 { placed_portions / bound_layers as f64 } else { 0.0 },
             concessive_subscriptions,
             insured_declines,
+            limit_offered,
+            limit_bound,
+            offered_price_to_wtp: if offered_wtp > 0.0 { offered_price / offered_wtp } else { 0.0 },
+            attritional_share: if offered_loss_cost > 0.0 { offered_attritional_cost / offered_loss_cost } else { 0.0 },
             pool_burning_cost,
             gross_premium: total_premium,
             incurred_losses: total_losses,
@@ -4233,15 +4314,26 @@ impl Market {
 }
 
 impl YearReport {
+    /// The share of the limit offered that the insureds actually kept: `1.0` is a
+    /// pool that bought everything it was shown, below that is **band-shedding**.
+    /// `1.0` in a year that offered nothing, so an empty market reads as no
+    /// shedding rather than as total shedding.
+    pub fn limit_bound_share(&self) -> f64 {
+        if self.limit_offered <= 0.0 {
+            return 1.0;
+        }
+        self.limit_bound / self.limit_offered
+    }
+
     /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
-    pub const CSV_HEADER: &'static str = "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,insolvencies,mean_headroom,cat_events,placements,mean_panel_size,mean_placed_portion,concessive_subscriptions,insured_declines,pool_burning_cost,gross_premium,incurred_losses,gross_incurred_losses,ceded_premium,reinsurance_recoveries,reinsurance_shortfall,cedents_short,solvent_reinsurers,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions,mean_hurdle_rate,hurdle_rate_spread,mean_share_appetite,mean_reserving_bias,mean_herding_susceptibility";
+    pub const CSV_HEADER: &'static str = "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,insolvencies,mean_headroom,cat_events,placements,mean_panel_size,mean_placed_portion,concessive_subscriptions,insured_declines,limit_offered,limit_bound,offered_price_to_wtp,attritional_share,pool_burning_cost,gross_premium,incurred_losses,gross_incurred_losses,ceded_premium,reinsurance_recoveries,reinsurance_shortfall,cedents_short,solvent_reinsurers,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions,mean_hurdle_rate,hurdle_rate_spread,mean_share_appetite,mean_reserving_bias,mean_herding_susceptibility";
 
     /// The year's diagnostics as ordered `(column, value)` pairs — the single
     /// source of truth for column order and per-field formatting that both
     /// [`csv_row`](Self::csv_row) and [`reports_to_json`] render from, so the CSV
     /// and JSON emissions can never drift out of sync. Every value is a bare JSON
     /// number (no quoting needed); the keys match [`CSV_HEADER`](Self::CSV_HEADER).
-    fn columns(&self) -> [(&'static str, String); 34] {
+    fn columns(&self) -> [(&'static str, String); 38] {
         [
             ("year", self.year.to_string()),
             ("mean_avt", format!("{:.6}", self.mean_avt)),
@@ -4258,6 +4350,10 @@ impl YearReport {
             ("mean_placed_portion", format!("{:.6}", self.mean_placed_portion)),
             ("concessive_subscriptions", self.concessive_subscriptions.to_string()),
             ("insured_declines", self.insured_declines.to_string()),
+            ("limit_offered", format!("{:.6}", self.limit_offered)),
+            ("limit_bound", format!("{:.6}", self.limit_bound)),
+            ("offered_price_to_wtp", format!("{:.6}", self.offered_price_to_wtp)),
+            ("attritional_share", format!("{:.6}", self.attritional_share)),
             ("pool_burning_cost", format!("{:.6}", self.pool_burning_cost)),
             ("gross_premium", format!("{:.6}", self.gross_premium)),
             ("incurred_losses", format!("{:.6}", self.incurred_losses)),
@@ -4480,6 +4576,137 @@ pub const BASELINE_YIELD: YieldProcess =
 /// The capital a founding syndicate — and every later entrant — is endowed with in
 /// the demonstration market.
 const FOUNDING_CAPITAL: f64 = 280.0;
+
+// ============================================================================
+// The self-selection experiment (#9)
+// ----------------------------------------------------------------------------
+// The instrument the experience-rating diagnosis is read on. Each arm is the
+// reference market with the two STRUCTURAL knobs the diagnosis implicates moved —
+// how much of the loss cost is rateable at all, and how close price sits to what
+// the pool will pay — and each arm is run twice on the same seed: once rating the
+// broker-presented loss records, once with credibility pinned so high that nothing
+// is rated. Both runs see the same population, so the gap between the pools they
+// take on is the rating and nothing else. Heterogeneity is excluded by
+// construction, not by argument.
+// ============================================================================
+
+/// One **arm** of the self-selection experiment (#9): a regime the reference
+/// market is moved into so the mechanism can be read where it should be loudest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelfSelectionArm {
+    /// The arm's label, carried through to the emitted row.
+    pub name: String,
+    /// Scaling on the **catastrophe regime** — the loss-cost composition. `1.0` is
+    /// the reference market; `0.0` is an attritional-only class in which the whole
+    /// loss cost is the component experience rating is allowed to rate.
+    pub cat_frequency_scale: f64,
+    /// The insured population's **mean risk aversion** — where price sits relative
+    /// to willingness-to-pay. The reference population's mean leaves the market
+    /// soft against WTP; nearer `1.0` there is no slack to climb through.
+    pub mean_risk_aversion: f64,
+}
+
+impl SelfSelectionArm {
+    /// The reference market, unmoved: the arm every other arm is read against.
+    pub fn reference(name: &str) -> Self {
+        Self { name: name.to_string(), cat_frequency_scale: 1.0, mean_risk_aversion: MEAN_RISK_AVERSION }
+    }
+
+    /// The reference market with the catastrophe regime switched off: an
+    /// attritional-dominated class, cause (2) removed and nothing else moved.
+    pub fn attritional_only(name: &str) -> Self {
+        Self { cat_frequency_scale: 0.0, ..Self::reference(name) }
+    }
+
+    /// The reference market with the pool's willingness-to-pay pulled down onto the
+    /// price: cause (1) removed and nothing else moved.
+    pub fn tight_budget(name: &str, mean_risk_aversion: f64) -> Self {
+        Self { mean_risk_aversion, ..Self::reference(name) }
+    }
+
+    /// The market this arm runs in, before the rating control is applied.
+    fn market(&self, seed: u64) -> Market {
+        let population = InsuredPopulation::homogeneous(MEAN_SUM_INSURED, self.mean_risk_aversion)
+            .dispersed(INSURED_SPREAD, seed ^ 0x1D_5E_A5_ED);
+        demonstration_market(seed)
+            .with_cat_frequency_scale(self.cat_frequency_scale)
+            .with_insured_population(population)
+    }
+}
+
+/// One emitted row: an arm run at one seed, rated against its own unrated control.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelfSelectionRow {
+    pub arm: String,
+    pub seed: u64,
+    /// The mean burning cost of the pool the **rated** market took on: `1.0` is a
+    /// market carrying exactly the population's average hazard, below it a market
+    /// that has selected the better risks.
+    pub rated_pool_burning_cost: f64,
+    /// The same for the **unrated** control, which rates nothing and therefore
+    /// carries whatever the population is.
+    pub unrated_pool_burning_cost: f64,
+    /// The **self-selection gap**: unrated less rated. Positive is rating leaving
+    /// the worse risks behind; it is the effect size #9 is claimed on.
+    pub selection_gap: f64,
+    /// The share of the offered limit the rated market's pool kept — the
+    /// **band-shedding** reading (`1.0` is a pool that bought everything).
+    pub rated_limit_bound_share: f64,
+    /// The same for the unrated control. Rated below unrated is rating shrinking
+    /// towers, the response that never reaches `insured_declines`.
+    pub unrated_limit_bound_share: f64,
+    /// Mean insureds per year that bought **nothing at all** in the rated arm.
+    pub rated_declines: f64,
+    /// The same for the unrated control.
+    pub unrated_declines: f64,
+    /// The rated arm's mean **offered price over willingness-to-pay** — how much
+    /// slack a surcharge has to climb through (cause 1).
+    pub offered_price_to_wtp: f64,
+    /// The rated arm's mean **attritional share of the loss cost** — the ceiling on
+    /// how far a surcharge can move a price at all (cause 2).
+    pub attritional_share: f64,
+    /// The rated arm's mean **rate index** (AP/TP): how soft the market ran.
+    pub rate_index: f64,
+}
+
+/// Run one arm of the self-selection experiment at one seed: the same market,
+/// rated and unrated, for `years` years each.
+pub fn run_self_selection_arm(arm: &SelfSelectionArm, seed: u64, years: usize) -> SelfSelectionRow {
+    /// Credibility so high that no record earns any weight: the control arm rates
+    /// nothing, on the same market with the same seed.
+    const UNRATED_K: f64 = 1e12;
+    let run = |market: Market| -> Vec<YearReport> {
+        let mut market = market;
+        (0..years).map(|_| market.step_year()).collect()
+    };
+    let rated = run(arm.market(seed));
+    let unrated = run(arm.market(seed).with_credibility_k(UNRATED_K));
+    // The pool reading is meaningless in a year that took on no attritional
+    // exposure at all, so those years are not averaged in.
+    let pool = |reports: &[YearReport]| {
+        let live: Vec<f64> = reports.iter().map(|r| r.pool_burning_cost).filter(|&b| b > 0.0).collect();
+        if live.is_empty() { 0.0 } else { live.iter().sum::<f64>() / live.len() as f64 }
+    };
+    let mean = |reports: &[YearReport], of: fn(&YearReport) -> f64| {
+        if reports.is_empty() { 0.0 } else { reports.iter().map(of).sum::<f64>() / reports.len() as f64 }
+    };
+    let rated_pool_burning_cost = pool(&rated);
+    let unrated_pool_burning_cost = pool(&unrated);
+    SelfSelectionRow {
+        arm: arm.name.clone(),
+        seed,
+        rated_pool_burning_cost,
+        unrated_pool_burning_cost,
+        selection_gap: unrated_pool_burning_cost - rated_pool_burning_cost,
+        rated_limit_bound_share: mean(&rated, |r| r.limit_bound_share()),
+        unrated_limit_bound_share: mean(&unrated, |r| r.limit_bound_share()),
+        rated_declines: mean(&rated, |r| r.insured_declines as f64),
+        unrated_declines: mean(&unrated, |r| r.insured_declines as f64),
+        offered_price_to_wtp: mean(&rated, |r| r.offered_price_to_wtp),
+        attritional_share: mean(&rated, |r| r.attritional_share),
+        rate_index: mean(&rated, |r| r.rate_index),
+    }
+}
 
 // ============================================================================
 // The cat-model homogeneity sweep (#14)
@@ -7704,6 +7931,269 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_cycle_emission_sees_a_tower_shed_a_band_without_the_risk_declining() {
+        // Band-shedding is the observable #9 actually moves. A risk surcharged or
+        // hard-priced past its budget sheds its worst value-for-money band and
+        // keeps buying the rest, so `insured_declines` — risks that bought
+        // NOTHING — can read flat while the pool has genuinely contracted.
+        // `limit_bound` against `limit_offered` is what sees that.
+        let population = |risk_aversion: f64| {
+            InsuredPopulation::homogeneous(MEAN_SUM_INSURED, risk_aversion).dispersed(INSURED_SPREAD, 11)
+        };
+        let mut generous = demonstration_market(11).with_insured_population(population(4.0));
+        let mut squeezed = demonstration_market(11).with_insured_population(population(1.05));
+        let generous = generous.step_year();
+        let squeezed = squeezed.step_year();
+
+        assert!(generous.limit_offered > 0.0, "the market offered no limit at all");
+        assert!(
+            generous.limit_bound <= generous.limit_offered + 1e-9,
+            "bound {} exceeds the {} offered",
+            generous.limit_bound,
+            generous.limit_offered
+        );
+        assert!(
+            squeezed.limit_bound_share() < generous.limit_bound_share() - 1e-9,
+            "a squeezed budget bound {:.3} of the limit offered against {:.3} on a generous one",
+            squeezed.limit_bound_share(),
+            generous.limit_bound_share()
+        );
+        assert!(squeezed.limit_bound > 0.0, "the squeezed market bought nothing at all — that is decline, not shedding");
+    }
+
+    #[test]
+    fn the_cycle_emission_reads_how_close_the_offered_tower_sits_to_what_the_pool_will_pay() {
+        // Cause (1) of #9's weakness — the market running soft — is a distance,
+        // and this is the instrument for it: the price of the WHOLE tower the
+        // market offered, over the WTP it was offered against. Below 1.0 there is
+        // slack, and a surcharge has to climb through all of it before it prices
+        // anyone out; above 1.0 the tower cannot be bought whole and bands shed.
+        let population = |risk_aversion: f64| {
+            InsuredPopulation::homogeneous(MEAN_SUM_INSURED, risk_aversion).dispersed(INSURED_SPREAD, 11)
+        };
+        let mut generous = demonstration_market(11).with_insured_population(population(4.0));
+        let mut squeezed = demonstration_market(11).with_insured_population(population(1.05));
+        let generous = generous.step_year();
+        let squeezed = squeezed.step_year();
+
+        assert!(generous.offered_price_to_wtp > 0.0, "no tower was offered to price against a budget");
+        assert!(
+            squeezed.offered_price_to_wtp > generous.offered_price_to_wtp,
+            "the same offered tower read {:.3} of a tight budget and {:.3} of a generous one",
+            squeezed.offered_price_to_wtp,
+            generous.offered_price_to_wtp
+        );
+        // And the two readings are the same phenomenon seen twice: the arm with no
+        // slack left is the arm that shed limit.
+        assert!(generous.limit_bound_share() > squeezed.limit_bound_share());
+    }
+
+    #[test]
+    fn the_cycle_emission_reads_the_attritional_share_of_the_loss_cost_it_offered() {
+        // Cause (2) of #9's weakness: the experience modifier scopes to the
+        // ATTRITIONAL loss cost only — cat is model-anchored and must never be
+        // experience-updated — so how much a surcharge can move the price is
+        // bounded by how much of the loss cost is attritional at all. This is the
+        // instrument for that bound.
+        let mut cat_free = {
+            let genome = SyndicateGenome {
+                cat_model: CatModel { annual_frequency: 0.0, min_damage_fraction: 0.05, tail_alpha: 1.5 },
+                ..test_genome(0.5)
+            };
+            Market::new(
+                (0..4).map(|_| SyndicateAgent::new(5_000.0, genome)).collect(),
+                vec![Broker::new(vec![1.0; 4], 0.85)],
+                vec![TerritoryMarket {
+                    territory: Territory(0),
+                    peril: CatastrophePeril { annual_frequency: 0.0, min_damage_fraction: 0.05, tail_alpha: 1.5 },
+                    insureds: (0..8)
+                        .map(|_| MarketInsured {
+                            asset: Asset::new(100.0, Territory(0)),
+                            risk_aversion: 2.0,
+                            broker: BrokerId(0),
+                            loss_record: LossRecord::UNRATED,
+                        })
+                        .collect(),
+                }],
+                AttritionalPeril { occurrence_probability: 0.25, mean_damage_fraction: 0.06 },
+                0.15,
+                4,
+                Rng::seeded(5),
+            )
+        };
+        let cat_free = cat_free.step_year();
+        assert!(
+            cat_free.attritional_share > 0.99,
+            "a cat-free market's loss cost is entirely attritional, not {:.3}",
+            cat_free.attritional_share
+        );
+
+        // The reference market is the opposite regime: a cat-dominated loss cost in
+        // which the rateable component is a small minority.
+        let reference = demonstration_market(11).step_year();
+        assert!(
+            reference.attritional_share < 0.25,
+            "the reference market's loss cost is {:.3} attritional — the diagnosis assumed a cat-dominated one",
+            reference.attritional_share
+        );
+    }
+
+    #[test]
+    fn scaling_the_catastrophe_regime_moves_the_loss_cost_composition_and_nothing_else() {
+        // The lever a #9 diagnostic arm is built on: it scales the true cat process
+        // and every syndicate's belief about it TOGETHER, so the market stays as
+        // well calibrated as it was and only the composition of the loss cost —
+        // how much of it is the rateable attritional component — moves. At 1.0 it
+        // is the reference market itself, year for year.
+        let reference = demonstration_market(11).step_year();
+        let unchanged = demonstration_market(11).with_cat_frequency_scale(1.0).step_year();
+        assert_eq!(reference, unchanged, "the identity scaling moved the market");
+
+        let mut cat_free = demonstration_market(11).with_cat_frequency_scale(0.0);
+        let cat_free = cat_free.step_year();
+        assert_eq!(cat_free.cat_events, 0, "a zero-frequency cat process still produced events");
+        assert!(
+            cat_free.attritional_share > 0.99,
+            "with the cat process switched off the loss cost should be all attritional, not {:.3}",
+            cat_free.attritional_share
+        );
+    }
+
+    #[test]
+    fn a_self_selection_arm_runs_the_same_market_rated_and_unrated() {
+        // The instrument the #9 diagnosis is read on: one market, run twice on the
+        // SAME seed — once rating the broker-presented loss records, once with
+        // credibility pinned so high that nothing is rated at all. Both arms see
+        // the same population of risks, so none of the gap between them can be
+        // heterogeneity; it is the rating and only the rating.
+        let arm = SelfSelectionArm::attritional_only("attritional_only");
+        let row = run_self_selection_arm(&arm, 11, 3);
+
+        assert_eq!(row.arm, "attritional_only");
+        assert!(row.rated_pool_burning_cost > 0.0 && row.unrated_pool_burning_cost > 0.0, "an arm took on no pool at all: {row:?}");
+        assert!(
+            (row.selection_gap - (row.unrated_pool_burning_cost - row.rated_pool_burning_cost)).abs() < 1e-12,
+            "the gap is the unrated pool less the rated one"
+        );
+        assert!(
+            row.attritional_share > 0.99,
+            "the attritional-only arm still prices {:.3} of its loss cost off the cat model",
+            row.attritional_share
+        );
+
+        // The reference arm is the reference market: the knobs are at their
+        // reference settings and the control is the only thing that differs.
+        let reference = run_self_selection_arm(&SelfSelectionArm::reference("reference"), 11, 3);
+        assert!(reference.attritional_share < 0.25, "the reference arm is cat-dominated by construction");
+    }
+
+    /// The seed panel the self-selection experiment (#9) is read over, fixed in
+    /// advance: every seed in it is counted, and a claim that survives on only some
+    /// of them is reported as such rather than filtered.
+    const SELECTION_SEEDS: [u64; 8] = [1, 7, 11, 19, 23, 31, 47, 101];
+
+    fn selection_panel(arm: &SelfSelectionArm, years: usize) -> Vec<SelfSelectionRow> {
+        SELECTION_SEEDS.iter().map(|&seed| run_self_selection_arm(arm, seed, years)).collect()
+    }
+
+    fn mean_gap(rows: &[SelfSelectionRow]) -> f64 {
+        rows.iter().map(|r| r.selection_gap).sum::<f64>() / rows.len() as f64
+    }
+
+    #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
+    fn the_reference_market_does_not_self_select_and_the_two_structural_reasons_are_readable() {
+        // The honest null, pinned. Experience rating is live and correctly signed
+        // in the reference market, but the pool it takes on is not measurably
+        // better than the population it was offered — and the emission says why:
+        // the loss cost is cat-dominated, so the modifier scopes to a small
+        // minority of it; and the offered tower still sits below the pool's
+        // willingness-to-pay, so a surcharge has slack to climb before it prices
+        // anything out.
+        let rows = selection_panel(&SelfSelectionArm::reference("reference"), 60);
+        let gap = mean_gap(&rows);
+        assert!(
+            gap.abs() < 0.05,
+            "the reference market self-selected by {gap:+.4} — the recorded null has moved and the decision in \
+             docs/system-design needs revisiting"
+        );
+
+        let mean = |of: fn(&SelfSelectionRow) -> f64| rows.iter().map(of).sum::<f64>() / rows.len() as f64;
+        assert!(
+            mean(|r| r.attritional_share) < 0.25,
+            "cause (2): the rateable share of the loss cost reads {:.3}",
+            mean(|r| r.attritional_share)
+        );
+        assert!(
+            mean(|r| r.offered_price_to_wtp) < 1.0,
+            "cause (1): the offered tower reads {:.3} of the budget, so there is no slack left to explain the null",
+            mean(|r| r.offered_price_to_wtp)
+        );
+    }
+
+    #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
+    fn releasing_either_structural_cause_alone_still_produces_no_self_selection() {
+        // The ranking. Each cause is released on its own, on the same seed panel
+        // against the same unrated control, and neither moves the pool: the effect
+        // is not a sum of the two causes, it is their interaction. Releasing the
+        // cat regime alone even makes the other cause worse — with the cat loss
+        // cost gone the price falls further below the budget than it started.
+        let attritional = selection_panel(&SelfSelectionArm::attritional_only("attritional_only"), 40);
+        let budget = selection_panel(&SelfSelectionArm::tight_budget("tight_budget", 1.1), 40);
+
+        assert!(
+            attritional.iter().all(|r| r.attritional_share > 0.99),
+            "the attritional-only arm did not actually release the cat component"
+        );
+        assert!(
+            budget.iter().all(|r| r.offered_price_to_wtp > 1.0),
+            "the tight-budget arm did not actually bring price up to the budget"
+        );
+        assert!(
+            mean_gap(&attritional).abs() < 0.06,
+            "an attritional-only loss cost alone self-selected by {:+.4}",
+            mean_gap(&attritional)
+        );
+        assert!(
+            mean_gap(&budget).abs() < 0.06,
+            "a budget-tight market alone self-selected by {:+.4}",
+            mean_gap(&budget)
+        );
+    }
+
+    #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
+    fn where_the_loss_cost_is_rateable_and_price_meets_the_budget_the_pool_self_selects_and_declines_never_see_it() {
+        // The diagnostic arm: both structural causes released together. The
+        // mechanism is confirmed — the rated market carries a pool burning
+        // materially less than the population it was offered, on every seed in the
+        // panel — and it does it entirely through BAND-SHEDDING. Nobody declines,
+        // in either arm, in any year: `insured_declines` reads zero throughout
+        // while the pool moves by a sixth. That is the instrument failure the
+        // diagnosis was looking for.
+        let arm = SelfSelectionArm { name: "diagnostic".to_string(), cat_frequency_scale: 0.0, mean_risk_aversion: 1.1 };
+        let rows = selection_panel(&arm, 60);
+        let gap = mean_gap(&rows);
+
+        assert!(gap > 0.10, "the diagnostic arm self-selected by only {gap:+.4} — the mechanism is suspect");
+        assert!(
+            rows.iter().all(|r| r.selection_gap > 0.0),
+            "the sign held on only {} of {} seeds",
+            rows.iter().filter(|r| r.selection_gap > 0.0).count(),
+            rows.len()
+        );
+        assert!(
+            rows.iter().all(|r| r.rated_pool_burning_cost < 0.95),
+            "the rated pool is not below the population it was offered"
+        );
+        assert!(
+            rows.iter().all(|r| r.rated_declines < 0.5 && r.unrated_declines < 0.5),
+            "the arm expressed through outright declines, so `insured_declines` was not blind after all"
+        );
+    }
+
     fn small_market(seed: u64) -> Market {
         // A handful of syndicates with heterogeneous share-appetites, two brokers,
         // and two territories each carrying a cohort of insureds. Small enough to
@@ -10101,3 +10591,4 @@ mod tests {
     }
 
 }
+

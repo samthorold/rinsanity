@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use rinsanity::{
     anchored_quote, attritional_aggregate_samples, catastrophe_aggregate_samples,
     coefficient_of_variation, demonstration_genome, demonstration_market, follower_weight, homogeneity_rows_to_csv,
-    homogeneity_rows_to_json, reports_to_csv, reports_to_json, run_homogeneity_sweep,
+    homogeneity_rows_to_json, reference_insured_population, reports_to_csv, reports_to_json, run_homogeneity_sweep,
     AttritionalPeril, Broker, CatBeliefPopulation, CatastrophePeril, HomogeneitySweep, Inheritance,
     RelationshipOutcome, Rng,
     SyndicateId, YieldProcess, BASELINE_YIELD,
@@ -31,6 +31,7 @@ USAGE:
     rinsanity cycle [--seed <u64>] [--years <usize>] [--yield-mean <f64>]
                     [--bias <f64>] [--spread <f64>] [--herding <f64>]
                     [--mutation <f64>] [--selection <f64>] [--no-inheritance]
+                    [--insured-spread <f64>]
                     [--format csv|json] [--out <path>]
     rinsanity homogeneity [--seed <u64>] [--seeds <usize>] [--years <usize>]
                           [--bias <f64>] [--spread <f64>] [--herding <f64>]
@@ -56,6 +57,11 @@ cycle:
     --herding <f64>     pin every syndicate's herding susceptibility
     --mutation <f64>    mutation rate applied to an inherited genome at entry (#12):
                         the fractional dispersion a child differs from its parent by
+    --insured-spread <f64>
+                        population spread of the insureds (#35): how widely the
+                        risks differ in size, in willingness-to-pay and in the
+                        asset's own (unobservable) loss-proneness. 0 is a market of
+                        carbon copies (default 0.3)
     --selection <f64>   inheritance weighting — how sharply new capacity crowds onto
                         the most profitable incumbents (0 imitates them uniformly)
     --no-inheritance    draw every entrant from the fixed population prior instead,
@@ -136,6 +142,7 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
     let mut mutation: Option<f64> = None;
     let mut selection: Option<f64> = None;
     let mut no_inheritance = false;
+    let mut insured_spread: Option<f64> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -180,6 +187,11 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
             "--selection" => {
                 let raw = value(i)?;
                 selection = Some(raw.parse().map_err(|_| format!("invalid --selection '{raw}'"))?);
+                i += 2;
+            }
+            "--insured-spread" => {
+                let raw = value(i)?;
+                insured_spread = Some(raw.parse().map_err(|_| format!("invalid --insured-spread '{raw}'"))?);
                 i += 2;
             }
             "--no-inheritance" => {
@@ -227,6 +239,11 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
             mutation_rate: mutation.unwrap_or(base.mutation_rate),
             selection_strength: selection.unwrap_or(base.selection_strength),
         }));
+    }
+    // The insured population (#35): how widely the risks in the market differ.
+    // Zero puts the market back on a cohort of carbon copies — the control arm.
+    if let Some(spread) = insured_spread {
+        market = market.with_insured_population(reference_insured_population(seed).dispersed(spread, seed ^ 0x1D_5E_A5_ED));
     }
     if let Some(mean) = yield_mean {
         market = market.with_yield_process(YieldProcess { mean, initial: mean, ..BASELINE_YIELD });

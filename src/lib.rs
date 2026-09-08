@@ -106,11 +106,29 @@ fn poisson_count(mean: f64, rng: &mut Rng) -> usize {
 pub struct Territory(pub u32);
 
 /// A unit of economic value owned by an insured: a `sum_insured` (replacement
-/// value, the ceiling on any single-occurrence loss) sitting in a `territory`.
+/// value, the ceiling on any single-occurrence loss) sitting in a `territory`,
+/// carrying its own **loss-proneness** — a multiplier on the market attritional
+/// peril's occurrence probability, so `1.0` is exactly the population average.
+///
+/// Loss-proneness is **substrate truth**, the same truth/belief line the cat
+/// process and a syndicate's cat model already sit either side of: it is drawn
+/// at market construction, fixed for the asset's life, and read by nothing but
+/// the peril that strikes it. No agent — underwriter, broker or insured — sees
+/// it; it can only be inferred from realised losses.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Asset {
     pub sum_insured: f64,
     pub territory: Territory,
+    pub loss_proneness: f64,
+}
+
+impl Asset {
+    /// An asset of exactly average loss-proneness: the market attritional peril
+    /// applies to it unmodified. The homogeneous case, and what every fixture in
+    /// the risk-pooling diagnostic is built from.
+    pub fn new(sum_insured: f64, territory: Territory) -> Self {
+        Asset { sum_insured, territory, loss_proneness: 1.0 }
+    }
 }
 
 /// The attritional peril: many small, statistically independent occurrences.
@@ -132,7 +150,12 @@ impl AttritionalPeril {
     /// draws (occurrence, then severity) so successive assets get independent
     /// occurrences.
     pub fn strike(&self, asset: &Asset, rng: &mut Rng) -> f64 {
-        let occurs = rng.uniform() < self.occurrence_probability;
+        // The asset's own loss-proneness scales how often an occurrence strikes
+        // it: expected burning cost is linear in proneness, and a proneness of 1
+        // leaves the market peril untouched. Both draws are taken whatever the
+        // proneness, so the stream stays aligned across assets.
+        let occurrence_probability = (self.occurrence_probability * asset.loss_proneness).clamp(0.0, 1.0);
+        let occurs = rng.uniform() < occurrence_probability;
         let severity = rng.uniform(); // drawn regardless, to keep the stream aligned
         if occurs {
             let damage_fraction = severity * 2.0 * self.mean_damage_fraction;
@@ -251,7 +274,7 @@ pub fn catastrophe_aggregate_samples(
     let zones: Vec<Vec<Asset>> = (0..territories)
         .map(|z| {
             (0..pool_size_per_territory)
-                .map(|_| Asset { sum_insured, territory: Territory(z as u32) })
+                .map(|_| Asset::new(sum_insured, Territory(z as u32)))
                 .collect()
         })
         .collect();
@@ -334,7 +357,7 @@ pub fn attritional_aggregate_samples(
     rng: &mut Rng,
 ) -> Vec<f64> {
     let assets: Vec<Asset> = (0..pool_size)
-        .map(|_| Asset { sum_insured, territory: Territory(0) })
+        .map(|_| Asset::new(sum_insured, Territory(0)))
         .collect();
     (0..trials)
         .map(|_| aggregate_attritional_loss(&assets, peril, rng))
@@ -2718,6 +2741,98 @@ pub struct MarketInsured {
     pub broker: BrokerId,
 }
 
+/// The **insured population**: the market-level distribution a cohort of insureds
+/// is drawn from — the demand-side counterpart of the [`CatBeliefPopulation`],
+/// held as its own parameter so the dispersion of the risks can be varied with
+/// everything else pinned.
+///
+/// Its **population spread** is one fractional half-width applied to each
+/// dimension an insured differs on — how big its asset is, how loss-prone that
+/// asset is, and how much it will pay to be rid of the risk. Every draw is
+/// mean-preserving, so the spread scatters the population without moving its
+/// average: at any spread the mean sum insured and mean risk aversion are the
+/// values configured here and the mean loss-proneness is exactly 1, i.e. the
+/// market [`AttritionalPeril`] remains the population's average hazard. Zero
+/// spread reproduces a cohort of carbon copies.
+///
+/// The **hazard spread** is held as its own field because loss-proneness is the
+/// one dimension no agent can see: pinning it while the observable dispersion
+/// runs (or the reverse) is the controlled experiment that shows the pricing and
+/// placement path never reads the truth.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InsuredPopulation {
+    /// Population mean sum insured.
+    pub mean_sum_insured: f64,
+    /// Population mean risk aversion (the WTP loading on expected loss).
+    pub mean_risk_aversion: f64,
+    /// The **population spread**: the fractional half-width of the mean-preserving
+    /// uniform dispersion of the *observable* dimensions — sum insured and risk
+    /// aversion. `0.0` is a homogeneous population; `0.4` scatters each insured
+    /// over `±40%` of the population average.
+    pub spread: f64,
+    /// The **hazard spread**: the same half-width on the asset's own
+    /// loss-proneness, the dimension that is substrate truth.
+    pub hazard_spread: f64,
+    /// The seed of the population's own generator, so drawing the cohort is
+    /// independent of every underwriting draw: changing a spread changes the
+    /// risks and nothing else about the world they are offered into.
+    pub seed: u64,
+}
+
+impl InsuredPopulation {
+    /// A population of carbon copies: today's market, and the zero of both knobs.
+    pub fn homogeneous(mean_sum_insured: f64, mean_risk_aversion: f64) -> Self {
+        InsuredPopulation { mean_sum_insured, mean_risk_aversion, spread: 0.0, hazard_spread: 0.0, seed: 0 }
+    }
+
+    /// The same population dispersed on every dimension at one spread — the
+    /// single knob a scenario turns.
+    pub fn dispersed(self, spread: f64, seed: u64) -> Self {
+        InsuredPopulation { spread, hazard_spread: spread, seed, ..self }
+    }
+
+    /// Draw a cohort of `count` insureds in `territory`, brokers rotating across
+    /// `n_brokers` as they always have.
+    ///
+    /// Each dimension is drawn as an evenly spaced ladder over the spread and then
+    /// shuffled independently of the others, so the cohort's mean is **exactly**
+    /// the population average however few insureds there are — a thirty-risk
+    /// market cannot accidentally be a market of expensive risks — while size,
+    /// loss-proneness and risk aversion stay uncorrelated. Each dimension consumes
+    /// its own shuffle whatever its spread is set to, so moving one spread leaves
+    /// the other dimensions exactly where they were.
+    pub fn cohort(&self, count: usize, territory: Territory, n_brokers: usize, rng: &mut Rng) -> Vec<MarketInsured> {
+        let ladder = |mean: f64, spread: f64, rng: &mut Rng| -> Vec<f64> {
+            let mut rungs: Vec<f64> = (0..count)
+                .map(|i| {
+                    let quantile = (i as f64 + 0.5) / count.max(1) as f64;
+                    mean * (1.0 + spread * (2.0 * quantile - 1.0))
+                })
+                .collect();
+            // Fisher-Yates, so the ladder carries no order across dimensions.
+            for i in (1..rungs.len()).rev() {
+                let j = (rng.uniform() * (i + 1) as f64) as usize;
+                rungs.swap(i, j.min(i));
+            }
+            rungs
+        };
+        let sums_insured = ladder(self.mean_sum_insured, self.spread, rng);
+        let pronenesses = ladder(1.0, self.hazard_spread, rng);
+        let aversions = ladder(self.mean_risk_aversion, self.spread, rng);
+        (0..count)
+            .map(|i| MarketInsured {
+                asset: Asset {
+                    sum_insured: sums_insured[i],
+                    territory,
+                    loss_proneness: pronenesses[i],
+                },
+                risk_aversion: aversions[i],
+                broker: BrokerId(i % n_brokers.max(1)),
+            })
+            .collect()
+    }
+}
+
 /// One **territory market**: the true catastrophe process (owned by the substrate,
 /// seen by no agent) and the cohort of insureds seeking cover in the zone.
 #[derive(Debug, Clone)]
@@ -3066,6 +3181,37 @@ impl Market {
             supply.population.centre.cat_model = beliefs.biased_centre();
         }
         self
+    }
+
+    /// Redraw every territory's cohort of insureds from an [`InsuredPopulation`]:
+    /// the risks in the market become genuinely different risks, dispersed in
+    /// size, in willingness-to-pay, and in the loss-proneness of the asset itself.
+    ///
+    /// Each territory keeps its cohort size and its territory; only the insureds
+    /// change. The draw runs on the population's **own** generator, seeded off the
+    /// population, so it consumes nothing from the market stream: at zero spread
+    /// the market is the one it was before, run for run.
+    pub fn with_insured_population(mut self, population: InsuredPopulation) -> Self {
+        let mut rng = Rng::seeded(population.seed);
+        let n_brokers = self.brokers.len();
+        for tm in self.territories.iter_mut() {
+            tm.insureds = population.cohort(tm.insureds.len(), tm.territory, n_brokers, &mut rng);
+        }
+        self
+    }
+
+    /// Every insured in the market, across all territories — the demand side as
+    /// the substrate holds it. A read-only window: the asset's loss-proneness is
+    /// visible here because this is the substrate's own view, not an agent's.
+    pub fn insureds(&self) -> impl Iterator<Item = &MarketInsured> {
+        self.territories.iter().flat_map(|tm| tm.insureds.iter())
+    }
+
+    /// The market-wide **attritional peril**: the population average hazard every
+    /// asset's own loss-proneness disperses around. The substrate's truth, exposed
+    /// here for the substrate's own diagnostics — no agent reads it either.
+    pub fn attritional_peril(&self) -> AttritionalPeril {
+        self.attritional
     }
 
     /// Set (or clear) the market's **evolutionary parameters** (#12): how new
@@ -3919,10 +4065,12 @@ pub fn demonstration_market(seed: u64) -> Market {
     let territory = |t: u32, freq: f64, count: usize| TerritoryMarket {
         territory: Territory(t),
         peril: CatastrophePeril { annual_frequency: freq, min_damage_fraction: 0.07, tail_alpha: 1.35 },
+        // The cohort is redrawn from the market's `InsuredPopulation` below; the
+        // placeholder fixes only the cohort SIZE and the territory.
         insureds: (0..count)
             .map(|i| MarketInsured {
-                asset: Asset { sum_insured: 100.0, territory: Territory(t) },
-                risk_aversion: 2.0,
+                asset: Asset::new(MEAN_SUM_INSURED, Territory(t)),
+                risk_aversion: MEAN_RISK_AVERSION,
                 broker: BrokerId(i % n_brokers),
             })
             .collect(),
@@ -3959,7 +4107,38 @@ pub fn demonstration_market(seed: u64) -> Market {
         inheritance: Some(Inheritance { mutation_rate: 0.08, selection_strength: 8.0 }),
     })
     .with_yield_process(BASELINE_YIELD)
+    // The insured population (#35): the cohort above fixes only how many risks sit
+    // in each territory — what they ARE is drawn here, dispersed in size, in
+    // willingness-to-pay, and in the loss-proneness of the asset itself. The draw
+    // runs on its own generator, so a spread sweep moves the risks and nothing
+    // else, and at zero spread the market is the homogeneous one it was.
+    .with_insured_population(reference_insured_population(seed))
 }
+
+/// The reference market's **insured population**: the population averages the
+/// market has always been calibrated on, dispersed at [`INSURED_SPREAD`]. Its
+/// generator is seeded off the market seed, so a fresh seed draws a fresh
+/// population of risks as well as a fresh sequence of years.
+pub fn reference_insured_population(seed: u64) -> InsuredPopulation {
+    InsuredPopulation::homogeneous(MEAN_SUM_INSURED, MEAN_RISK_AVERSION)
+        .dispersed(INSURED_SPREAD, seed ^ 0x1D_5E_A5_ED)
+}
+
+/// The reference population's mean sum insured — the value every insured used to
+/// carry, now the average of a dispersed population.
+const MEAN_SUM_INSURED: f64 = 100.0;
+
+/// The reference population's mean risk aversion: the WTP loading on expected loss.
+const MEAN_RISK_AVERSION: f64 = 2.0;
+
+/// The reference market's **population spread** (#35): how widely the insureds
+/// differ. Wide enough that a chronic loss-generator burns a multiple of what a
+/// benign risk does — the signal experience rating has to find — and narrow enough
+/// that the population still averages to the market attritional peril and every
+/// insured is still a buyer of cover (risk aversion stays above 1). Calibration;
+/// the *form* — a mean-preserving dispersion around a market-level average — is
+/// the design.
+pub const INSURED_SPREAD: f64 = 0.3;
 
 /// The reference market's **baseline macro environment** (#9): a moderate,
 /// persistent interest-rate regime. Persistence near 0.85 gives rate regimes that
@@ -4902,6 +5081,28 @@ mod tests {
     }
 
     #[test]
+    fn an_assets_loss_proneness_scales_its_attritional_burning_cost() {
+        // Loss-proneness is the asset's OWN hazard, dispersion around the market
+        // attritional peril: a proneness of 1.0 is exactly the market peril, and a
+        // more loss-prone asset burns proportionately more over many years.
+        let peril = AttritionalPeril { occurrence_probability: 0.2, mean_damage_fraction: 0.1 };
+        let burning_cost = |proneness: f64| {
+            let asset = Asset { sum_insured: 1_000.0, territory: Territory(0), loss_proneness: proneness };
+            let mut rng = Rng::seeded(7);
+            let years = 20_000;
+            (0..years).map(|_| peril.strike(&asset, &mut rng)).sum::<f64>() / years as f64
+        };
+        // The market mean: p x mean damage fraction x SI = 0.2 x 0.1 x 1000 = 20.
+        let average = burning_cost(1.0);
+        assert!((average - 20.0).abs() < 1.0, "average asset burning cost {average} off the market peril");
+        // A doubly loss-prone asset burns about twice as much; a half-prone one, half.
+        let prone = burning_cost(2.0);
+        let benign = burning_cost(0.5);
+        assert!((prone / average - 2.0).abs() < 0.1, "prone/average {}", prone / average);
+        assert!((benign / average - 0.5).abs() < 0.1, "benign/average {}", benign / average);
+    }
+
+    #[test]
     fn full_value_layer_settles_the_entire_ground_up_loss() {
         let layer = Layer::full_value(1_000.0);
         assert_eq!(layer.insured_loss(250.0), 250.0);
@@ -4994,8 +5195,53 @@ mod tests {
         assert!((6.5..9.5).contains(&overall), "overall CV compression {overall} not near 8");
     }
 
+    #[test]
+    fn aggregate_attritional_cv_falls_as_one_over_sqrt_n_on_a_heterogeneous_pool() {
+        // The same risk-pooling invariant, read on the harder instrument: a pool
+        // of assets that differ in size AND in their own loss-proneness. Pooling
+        // is a property of independence, not of uniformity, so dispersion must not
+        // stop the aggregate CV falling as ~1/√N — it only slows the fall a little,
+        // because a pool of unequal exposures pools slightly less efficiently than
+        // a pool of equal ones.
+        let peril = AttritionalPeril { occurrence_probability: 0.25, mean_damage_fraction: 0.1 };
+        let population = InsuredPopulation::homogeneous(1_000.0, 2.0).dispersed(0.5, 77);
+        let trials = 2_000;
+        let mut rng = Rng::seeded(2024);
+
+        let pool_sizes = [50usize, 200, 800];
+        let cvs: Vec<f64> = pool_sizes
+            .iter()
+            .map(|&n| {
+                let mut pool_rng = Rng::seeded(population.seed + n as u64);
+                let assets: Vec<Asset> = population
+                    .cohort(n, Territory(0), 1, &mut pool_rng)
+                    .iter()
+                    .map(|insured| insured.asset)
+                    .collect();
+                // The pool really is heterogeneous on both dimensions.
+                assert!(assets.iter().any(|a| a.sum_insured > 1_200.0) && assets.iter().any(|a| a.sum_insured < 800.0));
+                assert!(assets.iter().any(|a| a.loss_proneness > 1.2) && assets.iter().any(|a| a.loss_proneness < 0.8));
+                let samples: Vec<f64> =
+                    (0..trials).map(|_| aggregate_attritional_loss(&assets, &peril, &mut rng)).collect();
+                coefficient_of_variation(&samples)
+            })
+            .collect();
+
+        for window in cvs.windows(2) {
+            assert!(window[1] < window[0], "CV did not fall as the heterogeneous pool grew: {cvs:?}");
+            let ratio = window[1] / window[0];
+            assert!(
+                (0.40..0.60).contains(&ratio),
+                "heterogeneous CV ratio {ratio} per 4x pool growth not near 0.5 (1/√4); cvs = {cvs:?}"
+            );
+        }
+        // 16x the pool (50 → 800) cuts the CV ~4-fold (√16).
+        let overall = cvs[0] / cvs[2];
+        assert!((3.2..4.8).contains(&overall), "overall CV compression {overall} not near 4");
+    }
+
     fn uniform_pool(n: usize, sum_insured: f64) -> Vec<Asset> {
-        (0..n).map(|_| Asset { sum_insured, territory: Territory(0) }).collect()
+        (0..n).map(|_| Asset::new(sum_insured, Territory(0))).collect()
     }
 
     #[test]
@@ -5031,7 +5277,7 @@ mod tests {
         let peril = AttritionalPeril { occurrence_probability: 0.3, mean_damage_fraction: 0.1 };
         let territory = Territory(0);
         let assets: Vec<Asset> =
-            (0..1_000).map(|_| Asset { sum_insured: 1_000.0, territory }).collect();
+            (0..1_000).map(|_| Asset::new(1_000.0, territory)).collect();
 
         let mut rng = Rng::seeded(123);
         let losses: Vec<f64> = assets.iter().map(|a| peril.strike(a, &mut rng)).collect();
@@ -5054,8 +5300,8 @@ mod tests {
         // fraction of their own value — perfectly correlated, not independent.
         let event = CatastropheEvent { time: 0.5, damage_fraction: 0.3 };
         let assets = [
-            Asset { sum_insured: 1_000.0, territory: Territory(0) },
-            Asset { sum_insured: 4_000.0, territory: Territory(0) },
+            Asset::new(1_000.0, Territory(0)),
+            Asset::new(4_000.0, Territory(0)),
         ];
         // Each asset loses 0.3 of its own sum insured: 300 + 1200 = 1500.
         let loss = territory_catastrophe_loss(&assets, &[event]);
@@ -5069,8 +5315,8 @@ mod tests {
         // replacement value (GUL ≤ sum insured, per asset).
         let event = CatastropheEvent { time: 0.1, damage_fraction: 1.5 };
         let assets = [
-            Asset { sum_insured: 1_000.0, territory: Territory(0) },
-            Asset { sum_insured: 2_000.0, territory: Territory(0) },
+            Asset::new(1_000.0, Territory(0)),
+            Asset::new(2_000.0, Territory(0)),
         ];
         let loss = territory_catastrophe_loss(&assets, &[event]);
         assert_eq!(loss, 3_000.0);
@@ -5223,7 +5469,7 @@ mod tests {
             tail_alpha: 1.4,
         };
         let assets: Vec<Asset> =
-            (0..500).map(|_| Asset { sum_insured: 1_000.0, territory: Territory(0) }).collect();
+            (0..500).map(|_| Asset::new(1_000.0, Territory(0))).collect();
 
         let mut rng = Rng::seeded(2024);
         let events = peril.annual_events(&mut rng);
@@ -6624,6 +6870,180 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_zero_spread_insured_population_draws_a_cohort_of_identical_insureds() {
+        // The homogeneous case is the zero of the knob: every insured carries the
+        // population means and a loss-proneness of exactly 1 (the market peril).
+        let population = InsuredPopulation::homogeneous(100.0, 2.0);
+        let mut rng = Rng::seeded(1);
+        let cohort = population.cohort(6, Territory(1), 3, &mut rng);
+
+        assert_eq!(cohort.len(), 6);
+        for insured in &cohort {
+            assert_eq!(insured.asset.sum_insured, 100.0);
+            assert_eq!(insured.asset.loss_proneness, 1.0);
+            assert_eq!(insured.risk_aversion, 2.0);
+            assert_eq!(insured.asset.territory, Territory(1));
+        }
+        // Brokers still rotate across the cohort, as they always did.
+        assert_eq!(cohort[0].broker, BrokerId(0));
+        assert_eq!(cohort[1].broker, BrokerId(1));
+        assert_eq!(cohort[3].broker, BrokerId(0));
+    }
+
+    #[test]
+    fn a_spread_insured_population_disperses_size_proneness_and_risk_aversion_about_the_mean() {
+        // The spread scatters the population around an unchanged average: the
+        // market attritional peril stays the population mean loss-proneness, and
+        // the mean sum insured and risk aversion are what they were.
+        let population = InsuredPopulation::homogeneous(100.0, 2.0).dispersed(0.4, 5);
+        let mut rng = Rng::seeded(population.seed);
+        let cohort = population.cohort(4_000, Territory(0), 3, &mut rng);
+
+        let mean = |f: &dyn Fn(&MarketInsured) -> f64| cohort.iter().map(f).sum::<f64>() / cohort.len() as f64;
+        let mean_si = mean(&|i| i.asset.sum_insured);
+        let mean_proneness = mean(&|i| i.asset.loss_proneness);
+        let mean_aversion = mean(&|i| i.risk_aversion);
+        assert!((mean_si - 100.0).abs() < 1e-9, "mean sum insured {mean_si}");
+        assert!((mean_proneness - 1.0).abs() < 1e-9, "mean loss-proneness {mean_proneness}");
+        assert!((mean_aversion - 2.0).abs() < 1e-9, "mean risk aversion {mean_aversion}");
+
+        // And they genuinely differ: the dispersion spans the spread's half-width
+        // on each dimension, and no two insureds are carbon copies.
+        let min_p = cohort.iter().map(|i| i.asset.loss_proneness).fold(f64::MAX, f64::min);
+        let max_p = cohort.iter().map(|i| i.asset.loss_proneness).fold(0.0, f64::max);
+        assert!(min_p > 0.6 - 1e-9 && min_p < 0.65, "min proneness {min_p}");
+        assert!(max_p < 1.4 + 1e-9 && max_p > 1.35, "max proneness {max_p}");
+        let min_si = cohort.iter().map(|i| i.asset.sum_insured).fold(f64::MAX, f64::min);
+        let max_si = cohort.iter().map(|i| i.asset.sum_insured).fold(0.0, f64::max);
+        assert!(min_si >= 60.0 && max_si <= 140.0, "sum insured range {min_si}..{max_si}");
+        assert!(max_si - min_si > 60.0, "sum insured barely dispersed: {min_si}..{max_si}");
+        // Risk aversion stays above 1: an insured whose WTP fell below its own
+        // expected loss would never buy cover at any price.
+        assert!(cohort.iter().all(|i| i.risk_aversion > 1.0), "an insured priced itself out of the market");
+    }
+
+    #[test]
+    fn nothing_in_the_pricing_or_placement_path_reads_an_assets_true_loss_proneness() {
+        // Loss-proneness is substrate truth. Two markets whose insureds are
+        // identical in every OBSERVABLE respect — same sizes, same risk aversions,
+        // same brokers, same syndicates, same seed — but whose hazards are pinned
+        // in one and scattered wide in the other must quote and place the first
+        // year identically. Any leak of the truth into pricing, the demand side,
+        // or the exposure assessment would move the rate index.
+        let base = InsuredPopulation::homogeneous(100.0, 2.0).dispersed(0.4, 11);
+        let pinned = InsuredPopulation { hazard_spread: 0.0, ..base };
+        let scattered = InsuredPopulation { hazard_spread: 0.9, ..base };
+
+        let year_of = |population| demonstration_market(4).with_insured_population(population).step_year();
+        let a = year_of(pinned);
+        let b = year_of(scattered);
+
+        // The whole placement readout is bit-identical: same layers bound, same
+        // panels, same placed portions, same price relative to technical.
+        assert_eq!(a.placements, b.placements);
+        assert_eq!(a.mean_panel_size, b.mean_panel_size);
+        assert_eq!(a.mean_placed_portion, b.mean_placed_portion);
+        assert_eq!(a.rate_index, b.rate_index);
+        assert_eq!(a.gross_premium, b.gross_premium);
+
+        // But the hazard is genuinely live in the substrate: the SAME year's
+        // losses differ, because the risks differ.
+        assert_ne!(a.gross_incurred_losses, b.gross_incurred_losses);
+    }
+
+    #[test]
+    fn the_reference_market_offers_a_dispersed_population_of_risks() {
+        // The reference market is no longer thirty carbon copies: its insureds
+        // differ in the size of the asset, in the asset's own loss-proneness, and
+        // in what they will pay — around the same population averages as before.
+        let market = demonstration_market(3);
+        let insureds: Vec<MarketInsured> = market.insureds().copied().collect();
+        assert_eq!(insureds.len(), 30);
+
+        let spread_of = |f: &dyn Fn(&MarketInsured) -> f64| {
+            let values: Vec<f64> = insureds.iter().map(f).collect();
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let min = values.iter().cloned().fold(f64::MAX, f64::min);
+            let max = values.iter().cloned().fold(f64::MIN, f64::max);
+            (mean, min, max)
+        };
+        let (mean_si, min_si, max_si) = spread_of(&|i| i.asset.sum_insured);
+        assert!((mean_si - 100.0).abs() < 1e-9, "mean sum insured {mean_si} drifted off the population average");
+        assert!(max_si / min_si > 1.5, "sum insured barely dispersed: {min_si}..{max_si}");
+        let (mean_p, min_p, max_p) = spread_of(&|i| i.asset.loss_proneness);
+        assert!((mean_p - 1.0).abs() < 1e-9, "mean loss-proneness {mean_p} drifted off the market peril");
+        assert!(max_p / min_p > 1.5, "loss-proneness barely dispersed: {min_p}..{max_p}");
+        let (mean_ra, min_ra, max_ra) = spread_of(&|i| i.risk_aversion);
+        assert!((mean_ra - 2.0).abs() < 1e-9, "mean risk aversion {mean_ra}");
+        assert!(max_ra > min_ra && min_ra > 1.0, "risk aversion range {min_ra}..{max_ra}");
+
+        // And the zero of the knob is exactly the market as it was: a cohort of
+        // carbon copies on the population averages, every asset of average hazard.
+        let homogeneous = demonstration_market(3)
+            .with_insured_population(InsuredPopulation::homogeneous(MEAN_SUM_INSURED, MEAN_RISK_AVERSION));
+        for insured in homogeneous.insureds() {
+            assert_eq!(insured.asset.sum_insured, 100.0);
+            assert_eq!(insured.asset.loss_proneness, 1.0);
+            assert_eq!(insured.risk_aversion, 2.0);
+        }
+    }
+
+    #[test]
+    fn dispersed_sums_insured_still_build_towers_that_place_and_bind() {
+        // The tower's bands are derived from the asset's own sum insured, so
+        // varying sizes flow straight into attachments, limits and line sizes.
+        // Over a long run the market must go on placing: layers bound every year,
+        // placed portions a real fraction of a limit, premium flowing, and the
+        // syndicates still trading.
+        let reports = demonstration_market(9).run(60);
+        for report in &reports {
+            assert!(report.placements > 0, "year {} placed nothing at all", report.year);
+            assert!(
+                report.mean_placed_portion > 0.0 && report.mean_placed_portion <= 1.0 + 1e-9,
+                "year {} placed portion {} out of bounds",
+                report.year,
+                report.mean_placed_portion
+            );
+            assert!(report.mean_panel_size >= 1.0, "year {} bound a layer with no panel", report.year);
+            assert!(report.gross_premium.is_finite() && report.gross_premium > 0.0);
+            assert!(report.mean_headroom >= 0.0 && report.mean_headroom.is_finite());
+            assert!(report.solvent_count > 0, "the market died in year {}", report.year);
+        }
+    }
+
+    #[test]
+    fn the_insured_population_spreads_realised_burning_costs_wide_enough_to_rate_on() {
+        // What the dispersion is FOR: over a long run the risks in the market must
+        // separate into chronic loss-generators and benign ones, or experience
+        // rating (#9) has only sampling noise to find. Read on the burning cost
+        // each insured actually realises, per unit of sum insured, so the reading
+        // is the hazard and not the size of the asset.
+        let market = demonstration_market(31);
+        let peril = market.attritional_peril();
+        let mut rng = Rng::seeded(4);
+        let years = 400;
+        let mut costs: Vec<f64> = market
+            .insureds()
+            .map(|insured| {
+                let realised: f64 = (0..years).map(|_| peril.strike(&insured.asset, &mut rng)).sum();
+                realised / (years as f64 * insured.asset.sum_insured)
+            })
+            .collect();
+        costs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // The population still averages the market peril: 0.25 x 0.06 = 0.015 of
+        // sum insured a year.
+        let mean = costs.iter().sum::<f64>() / costs.len() as f64;
+        assert!((mean - 0.015).abs() < 0.002, "population burning cost {mean} off the market peril");
+        // And the worst risks are chronically worse than the best: the top of the
+        // population burns a clear multiple of the bottom, a difference no volume
+        // of quoting noise would produce.
+        let worst = costs[costs.len() - 3];
+        let best = costs[2];
+        assert!(worst / best > 1.5, "burning costs barely separate: {best} .. {worst}");
+    }
+
     fn small_market(seed: u64) -> Market {
         // A handful of syndicates with heterogeneous share-appetites, two brokers,
         // and two territories each carrying a cohort of insureds. Small enough to
@@ -6643,7 +7063,7 @@ mod tests {
             peril: CatastrophePeril { annual_frequency: freq, min_damage_fraction: 0.05, tail_alpha: 1.5 },
             insureds: (0..8)
                 .map(|i| MarketInsured {
-                    asset: Asset { sum_insured: 100.0, territory: Territory(t) },
+                    asset: Asset::new(100.0, Territory(t)),
                     risk_aversion: 1.6,
                     broker: BrokerId(i % n_brokers),
                 })
@@ -7913,7 +8333,11 @@ mod tests {
             reinsurer_line: 0.5,
         };
         let mut market = demonstration_market(5).with_reinsurance(programme, reinsurers);
-        let reports = market.run(8);
+        // Long enough for the true cat process to throw a shock that pierces the
+        // retention on this seed: a treaty that never responds proves nothing, and
+        // how long the market waits for one is a property of the cat process, not
+        // of the recovery mechanism under test.
+        let reports = market.run(24);
 
         assert_eq!(market.reinsurer_count(), 3);
         assert!(
@@ -8106,10 +8530,7 @@ mod tests {
             },
             insureds: (0..count)
                 .map(|i| MarketInsured {
-                    asset: Asset {
-                        sum_insured: 100.0,
-                        territory: Territory(t),
-                    },
+                    asset: Asset::new(100.0, Territory(t)),
                     risk_aversion: 2.0,
                     broker: BrokerId(i % 2),
                 })

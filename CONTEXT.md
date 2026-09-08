@@ -89,6 +89,17 @@ _Avoid_: calling a single syndicate's model error a "shared bias"; the bias is a
 **Believed annual cat load**:
 The expected catastrophe damage fraction per exposed asset per year *under a syndicate's own cat model* — frequency times the believed mean event damage. The one scalar the two knobs move: a shared bias `b` scales it by `(1 + b)³`, while the heterogeneity spread leaves its population average alone.
 
+**Insured population**:
+The market-level distribution the cohort of insureds is drawn from: the mean sum insured, the mean risk aversion, and the **population spread** that disperses them. The demand-side counterpart of the cat-belief population — held as its own market parameter so how much the *risks* differ can be varied with everything else pinned. Its draw runs on its own generator, so changing it changes the risks and nothing else about the world they are offered into.
+_Avoid_: treating the insureds as a fixture of the market builder; the cohort's size is a fixture, what the risks *are* is a population draw.
+
+**Population spread**:
+The fractional half-width of the mean-preserving dispersion of the insured population, on each dimension an insured differs on: how big its asset is, how loss-prone that asset is, and how much it will pay. Zero is a market of carbon copies. Mean-preserving is the point — the spread scatters the population without moving its average, so the market attritional peril stays the population's mean hazard and the spread is a knob distinct from the calibration it disperses around.
+
+**Loss-proneness**:
+An asset's **own** propensity to attritional loss, as a multiple of the market attritional peril: `1.0` is exactly the population average, higher is a chronic loss-generator. Substrate truth on the same footing as the cat process — drawn at market construction, fixed for the asset's life, and read by nothing but the peril that strikes the asset. No agent sees it; the **loss record** is its observable trace, and inferring one from the other is what experience rating (#9) is.
+_Avoid_: reading it as a "quality" score pricing may consult; the moment an agent can read it, experience rating has nothing left to discover.
+
 **Track record**:
 A syndicate's accumulated success: the exponentially-weighted mean of its own total-return signal per unit of opening capital. It is the measure market selection reads — never a single year's result, and never a market-wide figure. A syndicate that has not yet traded a year has no track record at all.
 _Avoid_: conflating with a broker relationship score, which is reputation with a counterparty, not profitability.

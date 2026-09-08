@@ -118,6 +118,16 @@ _Avoid_: calling herding a "quote blend" in the context of the subscription deci
 **Herding concession**:
 The calibration constant setting how far below its own technical view a *fully* herded follower will write. It is the depth of the reservation-price concession, never a probability of following.
 
+**Lead line**:
+The share of a layer a syndicate writes **as lead** — its own `target_line` scaled by the market's lead-line multiple, capped at the whole layer. A lead takes the biggest share on the slip: the domain norm, and the share that carries the reputational signal behind the firm order it set. *How much* a syndicate writes is selectable; *that a lead writes more than it would as a follower* is the placement convention.
+_Avoid_: reading it as a separate genome trait — it is derived from `target_line`.
+
+**Panel granularity**:
+How finely a layer's limit is divided across its subscribers: many small follower lines against a larger lead line, rather than two large ones. It is the precondition for post-cat concentration (#7), which is *defined* on share redistributing across a panel, for price herding (#3), which needs a population of followers to cluster, and for counter-cyclical capacity supply (#6), which routes through how many syndicates can participate in a placement at all. Its cost is that granular books are diversified books: the market absorbs shocks a lumpy panel could not.
+
+**Placed portion**:
+How much of a layer's limit its panel actually subscribed. Below one is **partial placement** — the insured restructures or retains the gap. At Lloyd's-scale lines a layer fills only when enough followers subscribe, so a placed portion below one is a standing feature of the market, not an edge case.
+
 **Concessive subscription**:
 A subscription bound at a firm order **below the subscriber's own price** — a follower writing at the lead's terms on the strength of who set them. The countable trace of a lead's mispricing propagating across a panel, emitted per year.
 _Avoid_: reading it as a discount given to the insured; the insured pays the firm order either way, and it is the follower's margin, not the price, that moves.

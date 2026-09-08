@@ -19,7 +19,7 @@ use rinsanity::{
     anchored_quote, attritional_aggregate_samples, catastrophe_aggregate_samples,
     coefficient_of_variation, demonstration_genome, demonstration_market, follower_weight, homogeneity_rows_to_csv,
     homogeneity_rows_to_json, reports_to_csv, reports_to_json, run_homogeneity_sweep,
-    AttritionalPeril, Broker, CatBeliefPopulation, CatastrophePeril, HomogeneitySweep,
+    AttritionalPeril, Broker, CatBeliefPopulation, CatastrophePeril, HomogeneitySweep, Inheritance,
     RelationshipOutcome, Rng,
     SyndicateId, YieldProcess, BASELINE_YIELD,
 };
@@ -30,6 +30,7 @@ rinsanity — emergent underwriting-cycle simulation
 USAGE:
     rinsanity cycle [--seed <u64>] [--years <usize>] [--yield-mean <f64>]
                     [--bias <f64>] [--spread <f64>] [--herding <f64>]
+                    [--mutation <f64>] [--selection <f64>] [--no-inheritance]
                     [--format csv|json] [--out <path>]
     rinsanity homogeneity [--seed <u64>] [--seeds <usize>] [--years <usize>]
                           [--bias <f64>] [--spread <f64>] [--herding <f64>]
@@ -53,6 +54,12 @@ cycle:
     --spread <f64>      heterogeneity spread of those cat models (default 0.0 —
                         every syndicate holds the same model)
     --herding <f64>     pin every syndicate's herding susceptibility
+    --mutation <f64>    mutation rate applied to an inherited genome at entry (#12):
+                        the fractional dispersion a child differs from its parent by
+    --selection <f64>   inheritance weighting — how sharply new capacity crowds onto
+                        the most profitable incumbents (0 imitates them uniformly)
+    --no-inheritance    draw every entrant from the fixed population prior instead,
+                        the control a converging genome distribution is read against
     --format csv|json   csv (header + rows) or json (array of objects) (default csv)
     --out    <path>     write to a file instead of stdout
 
@@ -126,6 +133,9 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
     let mut bias: f64 = 0.0;
     let mut spread: f64 = 0.0;
     let mut herding: Option<f64> = None;
+    let mut mutation: Option<f64> = None;
+    let mut selection: Option<f64> = None;
+    let mut no_inheritance = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -162,6 +172,20 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
                 herding = Some(raw.parse().map_err(|_| format!("invalid --herding '{raw}'"))?);
                 i += 2;
             }
+            "--mutation" => {
+                let raw = value(i)?;
+                mutation = Some(raw.parse().map_err(|_| format!("invalid --mutation '{raw}'"))?);
+                i += 2;
+            }
+            "--selection" => {
+                let raw = value(i)?;
+                selection = Some(raw.parse().map_err(|_| format!("invalid --selection '{raw}'"))?);
+                i += 2;
+            }
+            "--no-inheritance" => {
+                no_inheritance = true;
+                i += 1;
+            }
             "--format" => {
                 format = value(i)?.parse()?;
                 i += 2;
@@ -188,6 +212,21 @@ fn run_cycle(args: &[String]) -> Result<(), String> {
     }
     if let Some(h) = herding {
         market = market.with_herding_susceptibility(h);
+    }
+    // Selection over the genome (#12). The reference market evolves by default;
+    // the knobs override its evolutionary parameters, and --no-inheritance puts
+    // entry back on the fixed prior — the control the convergence read needs.
+    if no_inheritance {
+        market = market.with_inheritance(None);
+    } else if mutation.is_some() || selection.is_some() {
+        let base = market
+            .capital_supply()
+            .and_then(|s| s.inheritance)
+            .unwrap_or(Inheritance { mutation_rate: 0.0, selection_strength: 0.0 });
+        market = market.with_inheritance(Some(Inheritance {
+            mutation_rate: mutation.unwrap_or(base.mutation_rate),
+            selection_strength: selection.unwrap_or(base.selection_strength),
+        }));
     }
     if let Some(mean) = yield_mean {
         market = market.with_yield_process(YieldProcess { mean, initial: mean, ..BASELINE_YIELD });

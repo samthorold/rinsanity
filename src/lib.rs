@@ -1993,6 +1993,14 @@ pub struct SyndicateAgent {
     /// years: positive adverse, negative favourable. Included in `losses`, held
     /// separately so the current underwriting year's own result excludes it.
     pub development: f64,
+    /// The syndicate's **track record**: an exponentially-weighted mean of the
+    /// annual total-return signal it earned per unit of opening capital —
+    /// underwriting result plus investment income. It is the success measure
+    /// inheritance weights on (#12), so a genome that has actually made money for
+    /// several years is more likely to seed new capacity than one that had a
+    /// single lucky year. A fresh entrant carries no record at all (zero), so it
+    /// cannot be a parent until it has earned one.
+    pub realised_return: f64,
     /// The open **underwriting year accounts** (the 3-year account): one per year
     /// still inside its open period, each carrying its IBNR reserve and the result
     /// its final distribution is gated on. They survive `reset_year` — that is the
@@ -2019,6 +2027,7 @@ impl SyndicateAgent {
             ceded_premium: 0.0,
             treaty: None,
             development: 0.0,
+            realised_return: 0.0,
             accounts: Vec::new(),
         }
     }
@@ -2272,6 +2281,160 @@ impl GenomePopulation {
     }
 }
 
+/// The market's **genome distribution** at a point in time: the population mean of
+/// the traits selection acts on, and the width of the distribution around the
+/// hurdle rate. It is the reading #12 is judged on — a converged population holds
+/// its mean and keeps its width bounded, a diffusing one does not.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct GenomeDistribution {
+    mean_hurdle_rate: f64,
+    hurdle_rate_spread: f64,
+    mean_share_appetite: f64,
+    mean_reserving_bias: f64,
+    mean_herding_susceptibility: f64,
+}
+
+impl GenomeDistribution {
+    /// Read the distribution across the **solvent** population: a syndicate in
+    /// runoff has been culled and its genome no longer counts.
+    fn of(agents: &[SyndicateAgent], capitals: &[Syndicate]) -> Self {
+        let genomes: Vec<&SyndicateGenome> = agents
+            .iter()
+            .zip(capitals.iter())
+            .filter(|(_, capital)| capital.is_solvent())
+            .map(|(agent, _)| &agent.genome)
+            .collect();
+        if genomes.is_empty() {
+            return Self::default();
+        }
+        let mean = |f: fn(&SyndicateGenome) -> f64| genomes.iter().map(|g| f(g)).sum::<f64>() / genomes.len() as f64;
+        let mean_hurdle_rate = mean(|g| g.pricing.hurdle_rate);
+        let hurdles: Vec<f64> = genomes.iter().map(|g| g.pricing.hurdle_rate).collect();
+        Self {
+            mean_hurdle_rate,
+            hurdle_rate_spread: population_std(&hurdles, mean_hurdle_rate),
+            mean_share_appetite: mean(|g| g.avt.share_appetite),
+            mean_reserving_bias: mean(|g| g.reserving_bias),
+            mean_herding_susceptibility: mean(|g| g.herding_susceptibility),
+        }
+    }
+}
+
+/// How much of a syndicate's **track record** survives each year: the inertia of
+/// the exponentially-weighted mean of its total return on capital. High enough
+/// that inheritance reads a genome's sustained performance rather than its last
+/// roll of the dice, low enough that a syndicate whose luck has genuinely turned
+/// stops seeding new capacity within a cycle.
+const TRACK_RECORD_INERTIA: f64 = 0.7;
+
+/// The market's **evolutionary parameters** (#12): how new capacity inherits its
+/// genome from the incumbents that are making money, and how much variation
+/// mutation injects on the way in.
+///
+/// Selection needs both channels to converge. Insolvency culling alone only
+/// *prunes* — it removes the worst genomes but replaces them with nothing — and an
+/// entrant drawn from a fixed prior replenishes the distribution from an arbitrary
+/// source that no market outcome can move, so the population can never settle.
+/// Inheritance makes the replacement distribution a function of what actually
+/// worked, and mutation keeps enough variation for selection to keep acting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Inheritance {
+    /// Fractional dispersion mutation applies to an inherited trait: the child is
+    /// the parent's trait on `[1 ± mutation_rate]` (the reserving bias, a signed
+    /// error centred near zero, mutates additively). Zero is perfect copying.
+    pub mutation_rate: f64,
+    /// How sharply inheritance concentrates on the *most* profitable incumbents.
+    /// A parent is drawn with weight `exp(selection_strength · realised return)`,
+    /// so zero is uniform across the profitable pool and larger values crowd the
+    /// draw onto the best performers.
+    pub selection_strength: f64,
+}
+
+impl Inheritance {
+    /// Draw an entrant's genome by **success-weighted inheritance** from the
+    /// `incumbents` — each a genome and the realised total return it earned on its
+    /// capital — with mutation. Only *profitable* incumbents can be parents; when
+    /// none of them is, there is nothing for capital to imitate and the draw falls
+    /// back to the population `prior`.
+    pub fn draw(
+        &self,
+        incumbents: &[(SyndicateGenome, f64)],
+        prior: &GenomePopulation,
+        rng: &mut Rng,
+    ) -> SyndicateGenome {
+        let parents: Vec<&(SyndicateGenome, f64)> = incumbents.iter().filter(|(_, r)| *r > 0.0).collect();
+        if parents.is_empty() {
+            return prior.sample(rng);
+        }
+        // Softmax over the realised return: `exp(strength · return)` is positive
+        // whatever the return is and degenerates to a uniform draw at zero
+        // strength, so the knob spans "imitate anything that works" to "imitate
+        // only the best" without a discontinuity at either end.
+        let weights: Vec<f64> = parents.iter().map(|(_, r)| (self.selection_strength * r).exp()).collect();
+        let total: f64 = weights.iter().sum();
+        if !(total.is_finite() && total > 0.0) {
+            return prior.sample(rng);
+        }
+        let mut ticket = rng.uniform() * total;
+        let mut chosen = parents[parents.len() - 1].0;
+        for (parent, weight) in parents.iter().zip(&weights) {
+            ticket -= *weight;
+            if ticket <= 0.0 {
+                chosen = parent.0;
+                break;
+            }
+        }
+        self.mutate(chosen, rng)
+    }
+
+    /// Mutate an inherited genome: every **selectable** trait is perturbed within
+    /// `[1 ± mutation_rate]` of the parent's value, and nothing else moves. The
+    /// Monte-Carlo trial counts and return periods are numerical calibration, not
+    /// traits selection acts on, so they are carried across untouched.
+    fn mutate(&self, parent: SyndicateGenome, rng: &mut Rng) -> SyndicateGenome {
+        let rate = self.mutation_rate;
+        let mut jitter = |base: f64| base * (1.0 + rate * (2.0 * rng.uniform() - 1.0));
+        // The cat model mutates through the three quantities it *costs* risk with,
+        // exactly as a belief is drawn (#14): perturbing the tail index directly
+        // would not be load-neutral, so mutation would drift the believed cat load
+        // even with no selection acting on it.
+        let c = parent.cat_model;
+        let cat_model = cat_model_from_load(
+            jitter(c.annual_frequency),
+            jitter(c.min_damage_fraction),
+            jitter(c.believed_mean_damage()),
+        );
+        SyndicateGenome {
+            cat_model,
+            exposure: ExposurePolicy {
+                solvency_fraction: jitter(parent.exposure.solvency_fraction),
+                line_fraction: jitter(parent.exposure.line_fraction),
+                ..parent.exposure
+            },
+            pricing: PricingParams {
+                hurdle_rate: jitter(parent.pricing.hurdle_rate),
+                credibility_k: jitter(parent.pricing.credibility_k),
+                target_loss_ratio: jitter(parent.pricing.target_loss_ratio),
+                ..parent.pricing
+            },
+            avt: AvtParams {
+                headroom_responsiveness: jitter(parent.avt.headroom_responsiveness),
+                feedback_responsiveness: jitter(parent.avt.feedback_responsiveness),
+                share_appetite: jitter(parent.avt.share_appetite),
+            },
+            distribution: DistributionParams {
+                payout_fraction: jitter(parent.distribution.payout_fraction),
+                solvency_floor: jitter(parent.distribution.solvency_floor),
+            },
+            herding_susceptibility: jitter(parent.herding_susceptibility),
+            target_line: jitter(parent.target_line),
+            // Additive, like the population draw: a signed error centred near zero
+            // would never move under a fractional mutation.
+            reserving_bias: parent.reserving_bias + rate * (2.0 * rng.uniform() - 1.0),
+        }
+    }
+}
+
 /// The market's **capital-supply curve** (#8): how much fresh capital commits to
 /// the market at a given observable return, and how long it takes to trade.
 ///
@@ -2295,9 +2458,13 @@ pub struct CapitalSupply {
     /// The capital one new syndicate is founded with. Committed capital forms
     /// whole syndicates; a remainder too small to found one does not trade.
     pub entrant_capital: f64,
-    /// The distribution an entrant's genome is drawn from — the same population
-    /// the market was formed from.
+    /// The distribution an entrant's genome is drawn from when there is no
+    /// success to inherit from — the same population the market was formed from.
     pub population: GenomePopulation,
+    /// The market's **evolutionary parameters** (#12): success-weighted
+    /// inheritance with mutation. `None` is the pre-#12 behaviour — every entrant
+    /// drawn from the fixed `population` prior, which prunes but never converges.
+    pub inheritance: Option<Inheritance>,
 }
 
 /// The capital that commits to the market at an `observed_return`, read off the
@@ -2581,6 +2748,21 @@ pub struct YearReport {
     /// Capital released to providers this year. Only **closed** underwriting years
     /// distribute, so this is zero until the first account reaches RITC.
     pub distributions: f64,
+    /// The **genome distribution** at year-end, across the solvent population —
+    /// the traits selection acts on, so a long run's convergence toward its
+    /// attractor is legible from the emission itself (#12).
+    pub mean_hurdle_rate: f64,
+    /// Population standard deviation of the hurdle rate: the *width* of the genome
+    /// distribution, which is what tells a diffusing population from a converged
+    /// one.
+    pub hurdle_rate_spread: f64,
+    /// Mean share-appetite across the solvent population.
+    pub mean_share_appetite: f64,
+    /// Mean reserving bias across the solvent population — negative is a market
+    /// that has selected for optimistic reserving.
+    pub mean_reserving_bias: f64,
+    /// Mean herding susceptibility across the solvent population.
+    pub mean_herding_susceptibility: f64,
 }
 
 /// A bound tower for one insured, held through the loss phase: the asset it covers
@@ -2819,6 +3001,20 @@ impl Market {
         self
     }
 
+    /// Set (or clear) the market's **evolutionary parameters** (#12): how new
+    /// capacity inherits its genome from the incumbents that are making money.
+    ///
+    /// Clearing it (`None`) puts entry back on the fixed population prior, which
+    /// is what a *controlled* experiment on any other knob needs: with inheritance
+    /// live, an entrant's genome is a function of the run's own history, so the
+    /// population an arm is nominally holding fixed drifts underneath it.
+    pub fn with_inheritance(mut self, inheritance: Option<Inheritance>) -> Self {
+        if let Some(supply) = self.capital_supply.as_mut() {
+            supply.inheritance = inheritance;
+        }
+        self
+    }
+
     /// A syndicate's current **cat model** — its belief about the cat process, the
     /// thing the spread/bias knobs move. Never the truth.
     pub fn cat_model(&self, id: SyndicateId) -> CatModel {
@@ -2862,6 +3058,20 @@ impl Market {
     /// zero.
     pub fn relationship(&self, broker: BrokerId, syndicate: SyndicateId) -> f64 {
         self.brokers[broker.0].relationship(syndicate)
+    }
+
+    /// A syndicate's **genome** — the vector of selectable parameters selection
+    /// acts on. Read to observe how the population's genome distribution moves
+    /// over a long run (#12).
+    pub fn genome(&self, id: SyndicateId) -> SyndicateGenome {
+        self.agents[id.0].genome
+    }
+
+    /// A syndicate's **track record**: the exponentially-weighted mean total
+    /// return on capital it has earned, and the success measure inheritance
+    /// weights entrants' parents by (#12).
+    pub fn realised_return(&self, id: SyndicateId) -> f64 {
+        self.agents[id.0].realised_return
     }
 
     /// A syndicate's current AvT multiplier.
@@ -2926,8 +3136,25 @@ impl Market {
             forming.retain(|(ready_year, _)| *ready_year > *year);
             if supply.entrant_capital > 0.0 {
                 let count = (ready / supply.entrant_capital).floor() as usize;
+                // Success-weighted inheritance (#12): the pool capital can imitate
+                // is the SOLVENT incumbents and their track records — a syndicate
+                // in runoff has already been culled and cannot seed anything. With
+                // no inheritance wired, or with nothing in the market making
+                // money, the entrant falls back to the population prior.
+                let pool: Vec<(SyndicateGenome, f64)> = match supply.inheritance {
+                    Some(_) => agents
+                        .iter()
+                        .zip(capitals.iter())
+                        .filter(|(_, capital)| capital.is_solvent())
+                        .map(|(agent, _)| (agent.genome, agent.realised_return))
+                        .collect(),
+                    None => Vec::new(),
+                };
                 for _ in 0..count {
-                    let genome = supply.population.sample(rng);
+                    let genome = match supply.inheritance {
+                        Some(inheritance) => inheritance.draw(&pool, &supply.population, rng),
+                        None => supply.population.sample(rng),
+                    };
                     agents.push(SyndicateAgent::new(supply.entrant_capital, genome));
                     capitals.push(Syndicate::with_capital(supply.entrant_capital));
                     entrants += 1;
@@ -3245,6 +3472,16 @@ impl Market {
             }
             total_investment += income;
 
+            // The syndicate's own **total-return signal** for the year, per unit of
+            // the capital it opened with: underwriting result plus investment
+            // income. It rolls into the track record inheritance reads (#12) — a
+            // slow mean, so one lucky year does not make a genome the market copies.
+            if opening_capitals[i] > 0.0 {
+                let total_return = (agent.premium - paid + income) / opening_capitals[i];
+                agent.realised_return =
+                    TRACK_RECORD_INERTIA * agent.realised_return + (1.0 - TRACK_RECORD_INERTIA) * total_return;
+            }
+
             // --- The 3-year account rolls (#13) -------------------------------
             // Open years develop toward the true ultimate, years reaching RITC
             // close, and this year's claims split into settled + IBNR. Every
@@ -3356,6 +3593,10 @@ impl Market {
             }
         }
 
+        // The year's genome distribution across the surviving population: what
+        // culling and inheritance have left standing, read straight off the roster.
+        let genome = GenomeDistribution::of(agents, capitals);
+
         let mean_avt = if avt_values.is_empty() { 0.0 } else { avt_values.iter().sum::<f64>() / avt_values.len() as f64 };
         let avt_spread = population_std(&avt_values, mean_avt);
         let report = YearReport {
@@ -3386,6 +3627,11 @@ impl Market {
             reserve_development: total_development,
             outstanding_reserves: total_reserves,
             distributions: total_distributions,
+            mean_hurdle_rate: genome.mean_hurdle_rate,
+            hurdle_rate_spread: genome.hurdle_rate_spread,
+            mean_share_appetite: genome.mean_share_appetite,
+            mean_reserving_bias: genome.mean_reserving_bias,
+            mean_herding_susceptibility: genome.mean_herding_susceptibility,
         };
 
         *year += 1;
@@ -3400,14 +3646,14 @@ impl Market {
 
 impl YearReport {
     /// The CSV header matching [`csv_row`](Self::csv_row), column for column.
-    pub const CSV_HEADER: &'static str = "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,insolvencies,mean_headroom,cat_events,placements,gross_premium,incurred_losses,gross_incurred_losses,ceded_premium,reinsurance_recoveries,reinsurance_shortfall,cedents_short,solvent_reinsurers,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions";
+    pub const CSV_HEADER: &'static str = "year,mean_avt,avt_spread,rate_index,combined_ratio,solvent_count,entrants,insolvencies,mean_headroom,cat_events,placements,gross_premium,incurred_losses,gross_incurred_losses,ceded_premium,reinsurance_recoveries,reinsurance_shortfall,cedents_short,solvent_reinsurers,yield_rate,investment_income,reserve_development,outstanding_reserves,distributions,mean_hurdle_rate,hurdle_rate_spread,mean_share_appetite,mean_reserving_bias,mean_herding_susceptibility";
 
     /// The year's diagnostics as ordered `(column, value)` pairs — the single
     /// source of truth for column order and per-field formatting that both
     /// [`csv_row`](Self::csv_row) and [`reports_to_json`] render from, so the CSV
     /// and JSON emissions can never drift out of sync. Every value is a bare JSON
     /// number (no quoting needed); the keys match [`CSV_HEADER`](Self::CSV_HEADER).
-    fn columns(&self) -> [(&'static str, String); 24] {
+    fn columns(&self) -> [(&'static str, String); 29] {
         [
             ("year", self.year.to_string()),
             ("mean_avt", format!("{:.6}", self.mean_avt)),
@@ -3442,6 +3688,11 @@ impl YearReport {
             ("reserve_development", format!("{:.6}", self.reserve_development)),
             ("outstanding_reserves", format!("{:.6}", self.outstanding_reserves)),
             ("distributions", format!("{:.6}", self.distributions)),
+            ("mean_hurdle_rate", format!("{:.6}", self.mean_hurdle_rate)),
+            ("hurdle_rate_spread", format!("{:.6}", self.hurdle_rate_spread)),
+            ("mean_share_appetite", format!("{:.6}", self.mean_share_appetite)),
+            ("mean_reserving_bias", format!("{:.6}", self.mean_reserving_bias)),
+            ("mean_herding_susceptibility", format!("{:.6}", self.mean_herding_susceptibility)),
         ]
     }
 
@@ -3570,9 +3821,15 @@ pub fn demonstration_market(seed: u64) -> Market {
         marginal_return_slope: 0.0002,
         formation_lag: 3,
         entrant_capital: FOUNDING_CAPITAL,
-        // Entrants are drawn from the same population the founders were: the
-        // mid-population genome, jittered across the founders' own spread.
+        // The fallback prior, used only when nothing in the market is making
+        // money: the mid-population genome, jittered across the founders' spread.
         population: GenomePopulation::new(genome_of(1, 0.5), 0.25),
+        // Selection over the genome (#12): entrants inherit from the incumbents
+        // that are making money, with enough mutation to keep the population from
+        // collapsing to clones. The strength is scaled to the return on capital a
+        // syndicate actually earns (a few percent to a few tens of percent), so it
+        // discriminates across that range rather than saturating on it.
+        inheritance: Some(Inheritance { mutation_rate: 0.08, selection_strength: 8.0 }),
     })
     .with_yield_process(BASELINE_YIELD)
 }
@@ -3738,7 +3995,15 @@ pub fn run_homogeneity_arm(arm: &HomogeneityArm, seed: u64, years: usize, capita
         heterogeneity_spread: arm.heterogeneity_spread,
         shared_bias: arm.shared_bias,
     };
-    let mut market = demonstration_market(seed).with_capital_scale(capital_scale).with_cat_beliefs(beliefs);
+    // Inheritance is switched OFF for the sweep, deliberately: #14 is a controlled
+    // experiment in the belief knobs, and it needs the cat-belief population to
+    // govern founders and entrants alike. With success-weighted inheritance live an
+    // entrant's belief would come from whichever incumbent happened to prosper, so
+    // the arm's spread and bias would no longer be the only things that differ.
+    let mut market = demonstration_market(seed)
+        .with_capital_scale(capital_scale)
+        .with_inheritance(None)
+        .with_cat_beliefs(beliefs);
     if let Some(h) = arm.herding {
         market = market.with_herding_susceptibility(h);
     }
@@ -6089,6 +6354,7 @@ mod tests {
             formation_lag: 2,
             entrant_capital: 500.0,
             population: GenomePopulation::new(test_genome(0.5), 0.2),
+            inheritance: None,
         };
 
         assert_eq!(committed_capital(0.02, &supply), 0.0, "a return below the hurdle attracts no capital");
@@ -6346,6 +6612,7 @@ mod tests {
             formation_lag: lag,
             entrant_capital: 400.0,
             population: GenomePopulation::new(test_genome(0.5), 0.25),
+            inheritance: None,
         };
         let mut market = small_market(5).with_capital_supply(supply);
         let reports = market.run(12);
@@ -6375,6 +6642,7 @@ mod tests {
             formation_lag: 2,
             entrant_capital: 400.0,
             population: GenomePopulation::new(test_genome(0.5), 0.25),
+            inheritance: None,
         };
         let mut market = small_market(5).with_capital_supply(supply);
         let incumbents = market.roster_size();
@@ -6647,6 +6915,7 @@ mod tests {
             formation_lag: 1,
             entrant_capital: 400.0,
             population: GenomePopulation::new(test_genome(0.5), 0.25),
+            inheritance: None,
         };
         let high_yield = YieldProcess { mean: 0.08, persistence: 0.0, volatility: 0.0, initial: 0.08, seed: 3 };
 
@@ -7827,4 +8096,311 @@ mod tests {
             }
         }
     }
+
+    // --- Selection over the genome: inheritance + mutation (#12) -------------
+
+    #[test]
+    fn an_entrant_genome_is_inherited_from_a_profitable_incumbent_not_the_prior() {
+        // #12: new capacity adopts the parameters of incumbents that are making
+        // money — capital follows what works. With mutation switched off and a
+        // single profitable incumbent, the entrant is that incumbent's genome,
+        // NOT a draw from the population prior it would have come from under #8.
+        let winner = test_genome(0.9);
+        let prior = GenomePopulation::new(test_genome(0.2), 0.0);
+        let inheritance = Inheritance { mutation_rate: 0.0, selection_strength: 1.0 };
+        let mut rng = Rng::seeded(3);
+
+        let child = inheritance.draw(&[(winner, 0.15)], &prior, &mut rng);
+
+        assert_eq!(child, winner, "the entrant inherits the profitable incumbent's genome wholesale");
+    }
+    #[test]
+    fn a_loss_making_incumbent_is_never_a_parent_and_an_unprofitable_market_falls_back_to_the_prior() {
+        // #12: inheritance is success-weighted, so a genome that lost money cannot
+        // seed new capacity however common it is. And when NOTHING in the market is
+        // making money there is no success to imitate — the entrant comes off the
+        // population prior rather than copying a failure.
+        let winner = test_genome(0.9);
+        let loser = test_genome(0.2);
+        let centre = test_genome(0.35);
+        let prior = GenomePopulation::new(centre, 0.0);
+        let inheritance = Inheritance { mutation_rate: 0.0, selection_strength: 1.0 };
+        let mut rng = Rng::seeded(11);
+
+        let pool = [(loser, -0.2), (winner, 0.1), (loser, -0.05)];
+        for _ in 0..50 {
+            assert_eq!(inheritance.draw(&pool, &prior, &mut rng), winner, "only the profitable incumbent can be a parent");
+        }
+
+        let all_losing = [(loser, -0.2), (winner, -0.01)];
+        let child = inheritance.draw(&all_losing, &prior, &mut rng);
+        assert_eq!(child, centre, "with no profitable incumbent to imitate, the entrant comes off the prior");
+    }
+
+    #[test]
+    fn inheritance_weighting_controls_how_hard_the_draw_crowds_onto_the_best_performer() {
+        // #12: `selection_strength` is the market-level knob on how sharply capital
+        // chases the winners. At zero the profitable pool is imitated uniformly;
+        // raised, the draw crowds onto the incumbent with the strongest realised
+        // return — the same pool, a different selection pressure.
+        let strong = test_genome(0.9);
+        let weak = test_genome(0.4);
+        let prior = GenomePopulation::new(test_genome(0.1), 0.0);
+        let pool = [(weak, 0.02), (strong, 0.20)];
+
+        let share = |strength: f64| {
+            let inheritance = Inheritance { mutation_rate: 0.0, selection_strength: strength };
+            let mut rng = Rng::seeded(29);
+            (0..400).filter(|_| inheritance.draw(&pool, &prior, &mut rng) == strong).count() as f64 / 400.0
+        };
+
+        let flat = share(0.0);
+        let sharp = share(40.0);
+        assert!((flat - 0.5).abs() < 0.1, "zero selection strength imitates the profitable pool uniformly, got {flat}");
+        assert!(sharp > 0.9, "a strong weighting crowds the draw onto the best performer, got {sharp}");
+        assert!(sharp > flat, "raising the weighting concentrates selection: {sharp} !> {flat}");
+    }
+
+    #[test]
+    fn mutation_varies_the_whole_inherited_genome_without_moving_it_off_the_parent() {
+        // #12: inheritance without mutation is copying, and a population of clones
+        // gives selection nothing left to act on. Mutation perturbs EVERY selectable
+        // trait — pricing, exposure, AvT, distribution, herding, reserving bias and
+        // the cat model — by a bounded fraction around the parent's value, so the
+        // child resembles its parent without being it.
+        let parent = test_genome(0.6);
+        let prior = GenomePopulation::new(test_genome(0.1), 0.0);
+        let rate = 0.2;
+        let inheritance = Inheritance { mutation_rate: rate, selection_strength: 1.0 };
+        let mut rng = Rng::seeded(5);
+
+        let children: Vec<SyndicateGenome> = (0..200).map(|_| inheritance.draw(&[(parent, 0.1)], &prior, &mut rng)).collect();
+        assert!(children.iter().any(|c| *c != parent), "mutation makes a child differ from its parent");
+
+        let varies = |f: fn(&SyndicateGenome) -> f64| {
+            let values: Vec<f64> = children.iter().map(f).collect();
+            let lo = values.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            (lo, hi)
+        };
+        let within = |(lo, hi): (f64, f64), base: f64| {
+            assert!(lo < base && hi > base, "the trait mutates in both directions around {base}: [{lo}, {hi}]");
+            assert!(lo >= base - base.abs() * rate - 1e-9 && hi <= base + base.abs() * rate + 1e-9, "mutation stays bounded: [{lo}, {hi}] around {base}");
+        };
+        within(varies(|g| g.pricing.hurdle_rate), parent.pricing.hurdle_rate);
+        within(varies(|g| g.pricing.credibility_k), parent.pricing.credibility_k);
+        within(varies(|g| g.avt.share_appetite), parent.avt.share_appetite);
+        within(varies(|g| g.avt.headroom_responsiveness), parent.avt.headroom_responsiveness);
+        within(varies(|g| g.exposure.solvency_fraction), parent.exposure.solvency_fraction);
+        within(varies(|g| g.distribution.payout_fraction), parent.distribution.payout_fraction);
+        within(varies(|g| g.herding_susceptibility), parent.herding_susceptibility);
+        within(varies(|g| g.target_line), parent.target_line);
+        within(varies(|g| g.cat_model.annual_frequency), parent.cat_model.annual_frequency);
+
+        // The reserving bias is a signed error centred near zero, so it mutates
+        // ADDITIVELY — a fractional mutation of a zero bias would never move.
+        let (lo, hi) = varies(|g| g.reserving_bias);
+        assert!(lo < parent.reserving_bias && hi > parent.reserving_bias, "a zero reserving bias still mutates: [{lo}, {hi}]");
+        assert!(lo >= parent.reserving_bias - rate - 1e-9 && hi <= parent.reserving_bias + rate + 1e-9, "additive mutation stays bounded: [{lo}, {hi}]");
+
+        // Non-selectable numerical calibration is carried across, never mutated.
+        assert!(children.iter().all(|c| c.exposure.tail_trials == parent.exposure.tail_trials), "Monte-Carlo trial counts are calibration, not traits");
+    }
+
+    #[test]
+    fn wired_entry_draws_an_entrant_genome_from_the_incumbents_rather_than_the_prior() {
+        // #12 end-to-end: with inheritance wired, capacity that forms adopts the
+        // parameters of the incumbents that made money. The prior is deliberately
+        // set to a genome no incumbent holds, so an entrant that resembles the
+        // incumbents cannot have come off the prior.
+        let alien = SyndicateGenome { target_line: 0.9, ..test_genome(0.5) };
+        let supply = |inheritance| CapitalSupply {
+            hurdle_return: 0.002,
+            marginal_return_slope: 0.00001,
+            formation_lag: 2,
+            entrant_capital: 400.0,
+            population: GenomePopulation::new(alien, 0.0),
+            inheritance,
+        };
+
+        let mut inherited = small_market(5).with_capital_supply(supply(Some(Inheritance { mutation_rate: 0.05, selection_strength: 5.0 })));
+        let incumbents = inherited.roster_size();
+        inherited.run(10);
+        assert!(inherited.roster_size() > incumbents, "capacity forms");
+        for i in incumbents..inherited.roster_size() {
+            let line = inherited.genome(SyndicateId(i)).target_line;
+            assert!((line - 0.34).abs() < 0.34 * 0.06, "entrant {i} inherits the incumbents' target line, got {line}");
+        }
+
+        // Control: the same market with inheritance switched off replenishes from
+        // the fixed prior, which is exactly what #12 says cannot converge.
+        let mut from_prior = small_market(5).with_capital_supply(supply(None));
+        let incumbents = from_prior.roster_size();
+        from_prior.run(10);
+        assert!(from_prior.roster_size() > incumbents, "capacity forms in the control too");
+        for i in incumbents..from_prior.roster_size() {
+            let line = from_prior.genome(SyndicateId(i)).target_line;
+            assert!((line - 0.9).abs() < 1e-9, "without inheritance the entrant comes off the prior, got {line}");
+        }
+    }
+
+    #[test]
+    fn a_syndicates_track_record_starts_empty_and_accumulates_from_its_own_total_return() {
+        // #12: the success measure inheritance weights on is the syndicate's OWN
+        // total-return signal, accumulated slowly. A syndicate that has not traded
+        // a year yet has no record at all, so fresh capacity cannot seed further
+        // capacity off a track record it has not earned.
+        let supply = CapitalSupply {
+            hurdle_return: 0.002,
+            marginal_return_slope: 0.00001,
+            formation_lag: 2,
+            entrant_capital: 400.0,
+            population: GenomePopulation::new(test_genome(0.5), 0.2),
+            inheritance: Some(Inheritance { mutation_rate: 0.05, selection_strength: 8.0 }),
+        };
+        let mut market = small_market(5).with_capital_supply(supply);
+        let founders = market.roster_size();
+        for i in 0..founders {
+            assert_eq!(market.realised_return(SyndicateId(i)), 0.0, "a founder opens with no track record");
+        }
+
+        let mut entrant: Option<SyndicateId> = None;
+        for _ in 0..10 {
+            let report = market.step_year();
+            if report.entrants > 0 && entrant.is_none() {
+                let id = SyndicateId(market.roster_size() - 1);
+                assert_eq!(market.realised_return(id), 0.0, "an entrant's first year is its first record, not an inherited one");
+                entrant = Some(id);
+            }
+        }
+        let entrant = entrant.expect("capacity forms");
+        assert!(market.realised_return(entrant) != 0.0, "once it has traded, the entrant carries its own record");
+        assert!(
+            (0..founders).any(|i| market.realised_return(SyndicateId(i)) > 0.0),
+            "incumbents that made money carry a positive track record for capital to imitate"
+        );
+    }
+
+    /// The cross-sectional mean and dispersion of one genome trait across the
+    /// market's **solvent** syndicates — the genome distribution selection is
+    /// acting on, read at a point in time.
+    fn genome_distribution(market: &Market, trait_of: fn(&SyndicateGenome) -> f64) -> (f64, f64) {
+        let values: Vec<f64> = (0..market.roster_size())
+            .map(SyndicateId)
+            .filter(|&id| market.capital(id) > 0.0)
+            .map(|id| trait_of(&market.genome(id)))
+            .collect();
+        if values.is_empty() {
+            return (0.0, 0.0);
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        (mean, population_std(&values, mean))
+    }
+
+    #[test]
+    fn over_two_centuries_the_genome_distribution_settles_on_an_attractor_rather_than_diffusing() {
+        // #12, the whole point. Over a 200+ year horizon, insolvency culling and
+        // success-weighted inheritance together hold the genome distribution
+        // somewhere the market found for itself: the population mean is stationary
+        // between the last two half-centuries, and its dispersion is bounded rather
+        // than diffusing. The control is the SAME market replenishing entrants from
+        // the fixed prior — a distribution refilled from a source no market outcome
+        // can move, which is why culling alone only prunes.
+        let years = 205;
+        let evolutionary = demonstration_market(7).capital_supply().expect("the reference market has entry wired").inheritance;
+        assert!(evolutionary.is_some(), "the reference market evolves its genome by default (#12)");
+
+        // The traits are read together: selection acts on the WHOLE genome, so the
+        // claim is about the genome distribution, not one lucky parameter.
+        let traits: [(&str, fn(&SyndicateGenome) -> f64); 6] = [
+            ("hurdle rate", |g| g.pricing.hurdle_rate),
+            ("reserving bias", |g| g.reserving_bias),
+            ("herding susceptibility", |g| g.herding_susceptibility),
+            ("target line", |g| g.target_line),
+            ("payout fraction", |g| g.distribution.payout_fraction),
+            ("solvency fraction", |g| g.exposure.solvency_fraction),
+        ];
+
+        let track = |inheritance| {
+            let mut market = demonstration_market(7).with_inheritance(inheritance);
+            let mut path: Vec<Vec<(f64, f64)>> = Vec::with_capacity(years);
+            for _ in 0..years {
+                market.step_year();
+                path.push(traits.iter().map(|&(_, f)| genome_distribution(&market, f)).collect());
+            }
+            path
+        };
+        let evolved = track(evolutionary);
+        let replenished = track(None);
+
+        // The mean and the dispersion of one trait, averaged over a window of years.
+        let window = |path: &[Vec<(f64, f64)>], t: usize, from: usize, to: usize| {
+            let n = (to - from) as f64;
+            let mean = path[from..to].iter().map(|row| row[t].0).sum::<f64>() / n;
+            let dispersion = path[from..to].iter().map(|row| row[t].1).sum::<f64>() / n;
+            (mean, dispersion)
+        };
+
+        for (t, (name, _)) in traits.iter().enumerate() {
+            let (mid_mean, mid_spread) = window(&evolved, t, 105, 155);
+            let (late_mean, late_spread) = window(&evolved, t, 155, 205);
+            let (_, control_spread) = window(&replenished, t, 155, 205);
+
+            // Stationary: the last half-century sits where the one before it did.
+            assert!(
+                (late_mean - mid_mean).abs() < 0.15 * late_spread,
+                "{name} has settled by the end of the run: {mid_mean:.4} then {late_mean:.4}, against a distribution {late_spread:.4} wide"
+            );
+            // Not diffusing: mutation feeds variation in, selection takes it back
+            // out, and the width of the distribution stops moving.
+            assert!(
+                late_spread < mid_spread * 1.3 + 1e-9,
+                "{name} dispersion is bounded, not widening: {mid_spread:.4} then {late_spread:.4}"
+            );
+            // And it is genuinely SELECTED: a population that inherits from what
+            // worked is tighter than one refilled from the prior, because selection
+            // keeps removing the tails mutation keeps producing.
+            assert!(
+                late_spread < control_spread,
+                "{name} converges tighter than the fixed-prior control does: {late_spread:.4} !< {control_spread:.4}"
+            );
+        }
+
+        // The attractor is not the prior it was handed: with selection acting, the
+        // population settles at a materially lower hurdle rate than replenishment
+        // from the prior sustains — competitive pricing is what survives here.
+        let (evolved_hurdle, _) = window(&evolved, 0, 155, 205);
+        let (control_hurdle, _) = window(&replenished, 0, 155, 205);
+        assert!(
+            evolved_hurdle < control_hurdle * 0.97,
+            "the evolved population found its own hurdle rate {evolved_hurdle:.4}, below the prior-fed {control_hurdle:.4}"
+        );
+    }
+
+    #[test]
+    fn the_year_report_carries_the_genome_distribution_so_convergence_can_be_read() {
+        // #12 is closed by a human read of where the genome distribution goes, so
+        // the per-year emission has to carry it: the population mean of the traits
+        // selection acts on, and the width of the distribution around them.
+        let mut market = demonstration_market(4);
+        let report = market.step_year();
+
+        let solvent: Vec<SyndicateId> = (0..market.roster_size())
+            .map(SyndicateId)
+            .filter(|&id| market.capital(id) > 0.0)
+            .collect();
+        let mean = |f: fn(&SyndicateGenome) -> f64| {
+            solvent.iter().map(|&id| f(&market.genome(id))).sum::<f64>() / solvent.len() as f64
+        };
+        assert!((report.mean_hurdle_rate - mean(|g| g.pricing.hurdle_rate)).abs() < 1e-9, "the row carries the population's mean hurdle rate");
+        assert!((report.mean_share_appetite - mean(|g| g.avt.share_appetite)).abs() < 1e-9, "and its mean share-appetite");
+        assert!((report.mean_reserving_bias - mean(|g| g.reserving_bias)).abs() < 1e-9, "and its mean reserving bias");
+        assert!((report.mean_herding_susceptibility - mean(|g| g.herding_susceptibility)).abs() < 1e-9, "and its mean herding susceptibility");
+        assert!(report.hurdle_rate_spread > 0.0, "the founders are heterogeneous, so the distribution has width");
+
+        for column in ["mean_hurdle_rate", "hurdle_rate_spread", "mean_share_appetite", "mean_reserving_bias", "mean_herding_susceptibility"] {
+            assert!(YearReport::CSV_HEADER.split(',').any(|c| c == column), "{column} is emitted in the documented header");
+        }
+    }
+
 }

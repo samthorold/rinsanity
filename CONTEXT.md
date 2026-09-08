@@ -89,6 +89,20 @@ _Avoid_: calling a single syndicate's model error a "shared bias"; the bias is a
 **Believed annual cat load**:
 The expected catastrophe damage fraction per exposed asset per year *under a syndicate's own cat model* — frequency times the believed mean event damage. The one scalar the two knobs move: a shared bias `b` scales it by `(1 + b)³`, while the heterogeneity spread leaves its population average alone.
 
+**Track record**:
+A syndicate's accumulated success: the exponentially-weighted mean of its own total-return signal per unit of opening capital. It is the measure market selection reads — never a single year's result, and never a market-wide figure. A syndicate that has not yet traded a year has no track record at all.
+_Avoid_: conflating with a broker relationship score, which is reputation with a counterparty, not profitability.
+
+**Success-weighted inheritance**:
+The channel by which new capacity adopts the genome of incumbents that are making money: a parent is drawn from the *profitable* syndicates in proportion to its track record, and the entrant carries that genome. Capital follows what works. When nothing in the market is profitable there is no success to imitate and the entrant falls back to the genome population prior.
+_Avoid_: calling it "cloning" — the child is mutated, and the parent keeps trading.
+
+**Mutation**:
+The bounded perturbation applied to an inherited genome at entry, so a child resembles its parent without being it. Without it inheritance collapses the population to clones and selection has nothing left to act on.
+
+**Inheritance weighting**:
+The market-level knob on how sharply inheritance crowds onto the best performers: zero imitates the profitable pool uniformly, larger values concentrate the draw on the strongest track records. With the mutation rate, the market's two **evolutionary parameters**.
+
 **Float**:
 The premium a syndicate holds between writing business and paying claims on it, which earns the market yield while held.
 

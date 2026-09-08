@@ -307,3 +307,16 @@ Before any phenomenon counts as a finding, the substrate must pass its **diagnos
 - **Risk pooling (the central diagnostic)**: read on a pool of identical assets *and* on a **heterogeneous** pool (assets differing in size and in loss-proneness), because pooling is a property of independence, not of uniformity. An insurer's aggregate **attritional** loss is more predictable than any single insured's — the aggregate coefficient of variation falls as ~1/√N as the pool grows — **while the catastrophe component's CV does not compress with pool size**, because a cat is one shared occurrence across the zone. If both halves hold, the attritional/catastrophe distinction is physically real in the model; if either fails, the loss architecture is wrong and nothing built on it is trustworthy.
 
 Only once these hold is the macro behaviour above read as a result rather than an artifact. The quantitative reference ranges these and the phenomena are checked against (combined-ratio bimodality, effective ROL, retention, cat-loss/TIV, and so on) are the empirical targets in the domain material; matching them is downstream calibration, but the *form* of each diagnostic is fixed here.
+
+## Two test lanes — the same split, in the test suite
+
+The two tiers of behaviour above are also the split of the test suite, because they want opposite things from a test run. A **diagnostic invariant** is an exact instrument reading and wants to be instant; a **phenomenon experiment** asserts something about the model's emergent behaviour and wants many seeds and long horizons. Forced into one lane, the fast checks stop being fast and the experiments are held to one seed — and single-seed statistics in this model swing hard enough that a threshold passed on one seed is a seed, not a margin.
+
+- **Fast lane** — `cargo test`. Every unit test, every diagnostic invariant, every settlement and risk-pooling instrument reading, and the report/emission plumbing. This is the loop you run continuously while working.
+- **Slow lane** — `cargo test -- --ignored`. The multi-decade phenomenon experiments. Run before opening a PR, and whenever a change could plausibly move market behaviour.
+
+**The classification rule**: does the test step a market for years and assert on *emergent statistics*? Slow lane. Does it call a function and check its output, or step a market and check an invariant that must hold in every year regardless? Fast lane. A long-horizon run asserting only that the physics holds — settlement invariants, placed portions in bounds, the market still trading — stays in the fast lane; it is an instrument reading over a long window, not an experiment.
+
+Slow-lane tests carry `#[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]`. Both lanes must pass; the slow lane is not optional, only deferred.
+
+Because the experiments are off the fast lane's critical path, they are read over **seed panels** fixed in advance rather than a single trajectory — a panel chosen before the numbers are seen, with every seed in it counted. A claim that only survives on a hand-picked seed is not a finding.

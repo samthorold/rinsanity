@@ -4878,6 +4878,20 @@ fn population_std(values: &[f64], mean: f64) -> f64 {
 }
 
 #[cfg(test)]
+/// The suite runs in **two lanes**, mirroring the two tiers of behaviour the
+/// model is built on (see `docs/system-design/README.md`).
+///
+/// * **Fast lane** — `cargo test`. Unit tests and diagnostic invariants: exact
+///   instrument readings that must be instant, so they can be run continuously.
+/// * **Slow lane** — `cargo test -- --ignored`. The multi-decade phenomenon
+///   experiments, read over seed panels. Run before opening a PR.
+///
+/// The classification rule: does the test step a market for years and assert on
+/// *emergent statistics*? Slow lane. Does it call a function and check its
+/// output — or step a market and check an invariant that must hold in every year
+/// regardless? Fast lane. Slow-lane tests carry
+/// `#[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]`.
+/// Both lanes must pass; the slow lane is deferred, never skipped.
 mod tests {
     use super::*;
 
@@ -7472,6 +7486,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn the_broker_presented_loss_record_accumulates_with_the_risk_across_the_years() {
         // The loss record is a property of the RISK and travels with it: every
         // insured in the market accumulates one, year after year, whether or not
@@ -7829,7 +7844,25 @@ mod tests {
         assert!(cat_large > 0.85 * cat_small, "catastrophe CV must not compress with N: {cat_large} vs {cat_small}");
     }
 
+    /// The seed panel the cycle experiment is read over. Twelve contiguous seeds
+    /// fixed in advance — the reference seed the experiment has always used plus
+    /// the eleven after it — so the panel is the market's own distribution and not
+    /// a set chosen for the answer it gives.
+    const CYCLE_SEEDS: [u64; 12] = [2024, 2025, 2026, 2027, 2028, 2029, 2030, 2031, 2032, 2033, 2034, 2035];
+    /// The reference seed of the panel: the one the single-trajectory reads
+    /// (hard/soft phase, AvT swing, combined-ratio bimodality) are taken on.
+    const CYCLE_REFERENCE_SEED: u64 = CYCLE_SEEDS[0];
+    const CYCLE_YEARS: usize = 80;
+
+    /// How many times a run's rate index crosses its own mean — the countable
+    /// trace of an oscillation, as against a monotone drift.
+    fn mean_crossings(rate: &[f64]) -> usize {
+        let mean = rate.iter().sum::<f64>() / rate.len() as f64;
+        rate.windows(2).filter(|w| (w[0] - mean) * (w[1] - mean) < 0.0).count()
+    }
+
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn a_multi_decade_run_oscillates_in_rate_and_is_combined_ratio_bimodal() {
         // Criterion 4: over decades the market rate oscillates on a multi-year cycle
         // and the combined ratio is bimodal — benign years cluster low, cat years
@@ -7838,11 +7871,54 @@ mod tests {
         // Read over eighty years rather than sixty: the claim is about a
         // multi-year oscillation, and a longer window is more of the evidence for
         // it, not less.
-        let mut market = demonstration_market(2024);
-        let reports = market.run(80);
+        //
+        // The OSCILLATION half of the claim is read over a twelve-seed panel, not
+        // one trajectory. Crossing counts swing hard from seed to seed (#35's
+        // sweep), so a single-seed threshold asserts a seed rather than a margin:
+        // on this panel the reference seed happens to be the most oscillatory run
+        // in it, and the quietest crosses its mean once. The claim that survives
+        // that spread is distributional — the typical run oscillates, and almost
+        // every run does.
+        let panel: Vec<Vec<YearReport>> =
+            CYCLE_SEEDS.iter().map(|&seed| demonstration_market(seed).run(CYCLE_YEARS)).collect();
 
+        let mut crossings: Vec<usize> = panel
+            .iter()
+            .map(|reports| mean_crossings(&reports.iter().map(|r| r.rate_index).collect::<Vec<f64>>()))
+            .collect();
+        let panel_report: Vec<(u64, usize)> = CYCLE_SEEDS.iter().copied().zip(crossings.iter().copied()).collect();
+        crossings.sort_unstable();
+        let median = crossings[crossings.len() / 2];
+        let mean_crossings_per_run = crossings.iter().sum::<usize>() as f64 / crossings.len() as f64;
+        let oscillating = crossings.iter().filter(|&&c| c >= 3).count();
+
+        // The typical run oscillates on a multi-year cycle.
+        assert!(
+            median >= 4,
+            "the median run must oscillate: median {median} mean-crossings over {CYCLE_YEARS} years, panel {panel_report:?}"
+        );
+        assert!(
+            mean_crossings_per_run >= 4.0,
+            "and the panel average with it: {mean_crossings_per_run:.2}, panel {panel_report:?}"
+        );
+        // And oscillation is the rule rather than a minority of lucky runs. Three
+        // crossings over eighty years is the floor for calling a path oscillatory
+        // at all; the claim is that all but the odd quiet run clears it.
+        assert!(
+            oscillating >= 9,
+            "at least nine of twelve runs must oscillate, only {oscillating} cleared three crossings: panel {panel_report:?}"
+        );
+        // Nothing in the panel drifts monotonically off its own mean.
+        assert!(
+            crossings[0] >= 1,
+            "every run crosses its own mean at least once: panel {panel_report:?}"
+        );
+
+        // The single-trajectory reads — the shape of one run — stay on the
+        // reference seed, where they have always been taken.
+        let reference = CYCLE_SEEDS.iter().position(|&s| s == CYCLE_REFERENCE_SEED).expect("the reference seed is in the panel");
+        let reports = &panel[reference];
         let rate: Vec<f64> = reports.iter().map(|r| r.rate_index).collect();
-        let mean_rate = rate.iter().sum::<f64>() / rate.len() as f64;
 
         // A hard phase (rate above the technical floor) AND a soft phase (rate
         // competed below it) both appear — the market is not stuck on one side.
@@ -7854,14 +7930,6 @@ mod tests {
         assert!(hard > 1.04, "a hard phase emerges (rate above TP): max {hard}");
         assert!(soft < 0.97, "a soft phase emerges (rate below TP): min {soft}");
 
-        // Multi-year oscillation: the rate crosses its own mean many times rather
-        // than drifting monotonically.
-        let crossings = rate
-            .windows(2)
-            .filter(|w| (w[0] - mean_rate) * (w[1] - mean_rate) < 0.0)
-            .count();
-        assert!(crossings >= 6, "the rate oscillates on a multi-year cycle, only {crossings} mean-crossings");
-
         // The mean AvT itself spans soft and hard over the run.
         let mean_avt: Vec<f64> = reports.iter().map(|r| r.mean_avt).collect();
         let avt_hi = mean_avt.iter().cloned().fold(f64::MIN, f64::max);
@@ -7872,14 +7940,13 @@ mod tests {
         // distinct minority of cat years that spike well above unity.
         let mut crs: Vec<f64> = reports.iter().map(|r| r.combined_ratio).collect();
         crs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = crs[crs.len() / 2];
+        let median_cr = crs[crs.len() / 2];
         let max_cr = *crs.last().unwrap();
         let cat_years = crs.iter().filter(|&&c| c > 1.0).count();
-        assert!(median < 0.5, "benign years dominate (low median CR): {median}");
+        assert!(median_cr < 0.5, "benign years dominate (low median CR): {median_cr}");
         assert!(max_cr > 1.5, "cat years spike the CR well above unity: {max_cr}");
-        assert!((4..=24).contains(&cat_years), "cat years are a real minority, got {cat_years} of 60");
+        assert!((4..=24).contains(&cat_years), "cat years are a real minority, got {cat_years} of {CYCLE_YEARS}");
     }
-
 
     #[test]
     fn a_genome_drawn_from_the_population_varies_around_the_population_centre() {
@@ -7979,6 +8046,7 @@ mod tests {
 
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn a_multi_decade_run_grows_capacity_only_through_lagged_entry_and_re_softens() {
         // #6/#8 over decades in the reference market. Capacity is supplied by
         // endogenous entry alone: the roster grows ONLY in years lagged capital
@@ -8064,6 +8132,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn share_concentrates_on_the_survivors_of_a_capital_shock_and_erodes_as_entrants_build_relationships() {
         // #7 and #8 together, and the pair that a two-member panel could not
         // express: when a shared shock puts syndicates into runoff, the placement
@@ -8358,6 +8427,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn a_high_yield_regime_leaves_syndicates_softer_than_a_zero_yield_one() {
         // #9's mechanism, at the agent's own local state: investment income credits
         // capital, capital is what capacity headroom is measured against, and AvT
@@ -8419,6 +8489,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn a_high_yield_regime_lengthens_and_damps_the_cycle_against_a_low_yield_one() {
         // #9's headline claim, as a CONTROLLED experiment: the reference market,
         // the same seeds, every parameter identical — the ONLY difference is the
@@ -8710,6 +8781,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn optimistic_reserving_masks_the_bad_year_then_steps_the_combined_ratio_up() {
         // #13, other things equal: same seeds, same population, same everything —
         // only the reserving bias moves. Around each run's worst catastrophe year:
@@ -9237,6 +9309,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn a_shared_reinsurers_failure_topples_primaries_whose_gross_book_was_controlled() {
         // Reinsurance contagion (#11) through the market engine, as a controlled
         // experiment: the SAME market, the same seed, the same reinsurers in every
@@ -9490,9 +9563,12 @@ mod tests {
 
     /// Seeds a belief arm produced at least one insolvency at, over `SWEEP_YEARS`.
     const SWEEP_SEEDS: [u64; 2] = [1, 2];
-    /// A wider seed set for the systemic-risk contrast, where the claim is about a
-    /// *population* of runs rather than a single trajectory.
-    const FAILURE_SEEDS: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    /// The seed panel the systemic-risk contrast is read over. The claim is about
+    /// a *population* of runs rather than a single trajectory, so it is read over
+    /// twelve seeds fixed in advance — every seed in the panel counted, in both
+    /// the price-herded and the price-independent form of the experiment, so the
+    /// two are directly comparable.
+    const FAILURE_SEEDS: [u64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
     /// The seeds the price-herding sweep is read over. Wider than `SWEEP_SEEDS`,
     /// because the sweep's claim — that the price channel reaches the insolvency
     /// count — is about a population of runs.
@@ -9535,6 +9611,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn a_homogeneous_and_biased_market_fails_where_a_correctly_calibrated_one_never_does() {
         // The systemic-risk condition. Same seeds, same true cat process, same
         // insureds, same capital: only belief differs.
@@ -9542,7 +9619,11 @@ mod tests {
         // spread of seeds the biased market reaches the zero floor again and again
         // while the calibrated ones never do once.
         let biased = seeds_with_failure_over(&FAILURE_SEEDS, &belief_arm("homogeneous_biased", 0.02, -0.6, None));
-        assert!(biased >= 3, "the homogeneous, biased market reaches the zero floor repeatedly, on {biased}/{} seeds", FAILURE_SEEDS.len());
+        assert!(
+            biased >= 4,
+            "the homogeneous, biased market reaches the zero floor repeatedly, on {biased}/{} seeds",
+            FAILURE_SEEDS.len()
+        );
 
         // Homogeneity ALONE is harmless — this is the control that makes the claim
         // about shared *error*, not about agreement.
@@ -9555,27 +9636,30 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn the_belief_effect_survives_with_the_price_herding_channel_switched_off() {
         // #3 is convergence on a shared PRICE; #14 is convergence on a shared MODEL.
         // With herding susceptibility pinned at zero every follower quotes its own
         // blind price and anchors toward nobody — and the belief effect is untouched.
         //
-        // Read over the same wide seed set the systemic-risk claim itself uses, and
+        // Read over the WHOLE seed panel the systemic-risk claim itself uses, and
         // in the same form: the claim is that the biased market reaches the floor
         // repeatedly while the calibrated one never does, with the price channel
-        // removed entirely.
-        let seeds = &FAILURE_SEEDS[..6];
-        let biased = seeds_with_failure_over(seeds, &belief_arm("homogeneous_biased", 0.02, -0.6, Some(0.0)));
+        // removed entirely. Same panel, same threshold, same controls as the
+        // herded experiment — so "survives" is a like-for-like comparison of two
+        // failure rates rather than a floor the price-off arm only has to clear.
+        let biased = seeds_with_failure_over(&FAILURE_SEEDS, &belief_arm("homogeneous_biased", 0.02, -0.6, Some(0.0)));
         assert!(
-            biased >= 2,
+            biased >= 4,
             "the biased market still fails repeatedly with no price herding at all: {biased}/{}",
-            seeds.len()
+            FAILURE_SEEDS.len()
         );
-        let calibrated = seeds_with_failure_over(seeds, &belief_arm("homogeneous_calibrated", 0.02, 0.0, Some(0.0)));
+        let calibrated = seeds_with_failure_over(&FAILURE_SEEDS, &belief_arm("homogeneous_calibrated", 0.02, 0.0, Some(0.0)));
         assert_eq!(calibrated, 0, "and the calibrated market still never fails");
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn varying_price_herding_at_fixed_belief_moves_outcomes_without_reproducing_the_belief_effect() {
         // The other direction of the orthogonality claim. It used to read as
         // "herding changes nothing", which passed only because the channel was
@@ -9866,6 +9950,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow lane: phenomenon experiment — cargo test -- --ignored"]
     fn over_two_centuries_the_genome_distribution_settles_on_an_attractor_rather_than_diffusing() {
         // #12, the whole point. Over a 200+ year horizon, insolvency culling and
         // success-weighted inheritance together hold the genome distribution
@@ -10016,6 +10101,3 @@ mod tests {
     }
 
 }
-
-
-

@@ -148,6 +148,14 @@ How much of a layer's limit its panel actually subscribed. Below one is **partia
 A subscription bound at a firm order **below the subscriber's own price** — a follower writing at the lead's terms on the strength of who set them. The countable trace of a lead's mispricing propagating across a panel, emitted per year.
 _Avoid_: reading it as a discount given to the insured; the insured pays the firm order either way, and it is the follower's margin, not the price, that moves.
 
+**Fast lane / slow lane**:
+The two halves of the test suite. The **fast lane** (`cargo test`) is every unit test and **diagnostic invariant** — instrument readings that must be instant, so they can be run continuously. The **slow lane** (`cargo test -- --ignored`) is the **phenomenon experiments** — multi-decade runs read over seed panels, run before opening a PR. The split rule is the tier the test belongs to: a test that steps a market for years and asserts on *emergent statistics* is an experiment; one that checks a function's output, or an invariant that must hold in every year regardless, is an instrument reading.
+_Avoid_: reading the slow lane as optional — it is deferred, not skipped, and both lanes must pass.
+
+**Seed panel**:
+The set of seeds a phenomenon experiment is read over, **fixed in advance** and counted in full. A phenomenon's claim is about a population of runs, so it is stated distributionally over the panel — a median, a mean, or a count of seeds clearing a bar — never as a threshold one trajectory happens to pass.
+_Avoid_: widening or narrowing a panel after seeing the numbers; a claim that survives only on a chosen panel is not a finding.
+
 ## Flagged ambiguities
 
 - **"Phenomenon"** was historically used for both substrate checks (e.g. risk pooling, §5 #0) and genuine emergent market behaviours. Resolved: substrate checks are **diagnostic invariants**; only emergent market behaviours are **phenomena**.

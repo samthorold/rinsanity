@@ -100,6 +100,14 @@ The fractional half-width of the mean-preserving dispersion of the insured popul
 An asset's **own** propensity to attritional loss, as a multiple of the market attritional peril: `1.0` is exactly the population average, higher is a chronic loss-generator. Substrate truth on the same footing as the cat process — drawn at market construction, fixed for the asset's life, and read by nothing but the peril that strikes the asset. No agent sees it; the **loss record** is its observable trace, and inferring one from the other is what experience rating (#9) is.
 _Avoid_: reading it as a "quality" score pricing may consult; the moment an agent can read it, experience rating has nothing left to discover.
 
+**Band-shedding**:
+An insured dropping the worst value-for-money band from its tower while continuing to buy the rest — the ordinary response to a price it cannot afford, and the one a surcharged risk makes long before it declines outright. Distinct from a **decline**, which is buying nothing at all; a reading taken off declines alone is blind to it.
+_Avoid_: calling band-shedding an "exit" — the risk is still in the market, just carrying more of its own loss.
+
+**Selection gap**:
+The difference between the burning cost of the pool an **unrated** market takes on and the pool the **rated** market takes on, at the same seed and the same population. The effect size phenomenon #9 is claimed on. Positive is rating leaving the worse risks behind. Because both arms see the same risks, none of it can be heterogeneity.
+_Avoid_: reading a rated pool's burning cost on its own as self-selection; without the control arm it is a statement about the population, not about rating.
+
 **Track record**:
 A syndicate's accumulated success: the exponentially-weighted mean of its own total-return signal per unit of opening capital. It is the measure market selection reads — never a single year's result, and never a market-wide figure. A syndicate that has not yet traded a year has no track record at all.
 _Avoid_: conflating with a broker relationship score, which is reputation with a counterparty, not profitability.
